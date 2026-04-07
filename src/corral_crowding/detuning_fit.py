@@ -71,11 +71,11 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
     # Combine all prefactors
     prefactors = {**intra_prefactors, **inter_prefactors}
 
-    # === Hilbert Space 1: Three Qubit System === #
-    q = destroy(2)
-    q1 = tensor(q, qeye(2), qeye(2))  # First qubit (Main interaction)
-    q2 = tensor(qeye(2), q, qeye(2))  # Second qubit (Main interaction)
-    q3 = tensor(qeye(2), qeye(2), q)  # Spectator qubit
+    # === Hilbert Space 1: Three Qutrit System === #
+    q = destroy(3)
+    q1 = tensor(q, qeye(3), qeye(3))  # First qutrit (Main interaction)
+    q2 = tensor(qeye(3), q, qeye(3))  # Second qutrit (Main interaction)
+    q3 = tensor(qeye(3), qeye(3), q)  # Spectator qutrit
     q1dag = q1.dag()
     q2dag = q2.dag()
     q3dag = q3.dag()
@@ -91,13 +91,13 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
         "qubit-sub (inter)": (q1dag + q1, ideal_gate_qubits),
     }
 
-    # === Hilbert Space 2: Two Qubits + SNAIL System === #
+    # === Hilbert Space 2: Two Qutrits + SNAIL System === #
     n_dim_snail = 8  # 8-Level SNAIL Mode
-    qs = destroy(2)  # Qubit part of SNAIL system
+    qs = destroy(3)  # Qubit part of SNAIL system
     s = destroy(n_dim_snail)  # SNAIL oscillator
-    qs1 = tensor(qs, qeye(2), qeye(n_dim_snail))  # First qubit
-    qs2 = tensor(qeye(2), qs, qeye(n_dim_snail))  # Second qubit
-    s1 = tensor(qeye(2), qeye(2), s)  # SNAIL mode
+    qs1 = tensor(qs, qeye(3), qeye(n_dim_snail))  # First qutrit
+    qs2 = tensor(qeye(3), qs, qeye(n_dim_snail))  # Second qubit
+    s1 = tensor(qeye(3), qeye(3), s)  # SNAIL mode
     qs1dag = qs1.dag()
     qs2dag = qs2.dag()
     s1dag = s1.dag()

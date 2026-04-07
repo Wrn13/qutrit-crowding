@@ -20,9 +20,8 @@ dependencies = [
     "cplex",
     "docplex",
     "matplotlib",
-    "SciencePlots",
-    "LovelyPlots",
-
+    "scienceplots",
+    "lovelyplots",
 ]
 
 [project.optional-dependencies]
