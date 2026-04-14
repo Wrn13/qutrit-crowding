@@ -5,12 +5,16 @@ from corral_crowding.module_graph import QuantumModuleGraph
 
 
 class QutritModuleGraph(QuantumModuleGraph):
-    """Extension of 2 qutrit Module Graph for Qutrits in various topologies."""
+    """Extension of 2 Qubit Module Graph for Qutrits in various topologies."""
 
-    def __init__(self, num_qutrits):
+    def __init__(self, num_qutrits, edge_type, edges: list[tuple[str, str, str, str]] = None):
         self.G = nx.Graph()
         self.num_qutrits = num_qutrits  # Default for topology setup
-        self._add_edges()
+        if edge_type == "all-to-all":
+            self._add_edges()
+        else:
+            for u, v, interaction, color in edges:
+                self.G.add_edge(u, v, interaction=interaction, color=color)
 
     def _add_edges(self):
         for i in range(self.num_qutrits):
@@ -33,8 +37,8 @@ class QutritModuleGraph(QuantumModuleGraph):
         }
         for i, freq in enumerate(qutrit_frequencies):
             interaction_freqs["qutrit-ge"][f"Q{i}"] = freq
-            interaction_freqs["qutrit-ef"][f"Q{i}*"] = freq + alpha[i]
-            interaction_freqs["qutrit-gf"][f"Q{i}*"] = 2*freq + alpha[i]
+            interaction_freqs["qutrit-ef"][f"Q{i}"] = freq + alpha[i]
+            interaction_freqs["qutrit-gf"][f"Q{i}"] = 2*freq + alpha[i]
             interaction_freqs["qutrit-sub"][f"Q{i}"] = freq / 2
         interaction_freqs["snail-resonance"]["SNAIL"] = snail_frequency
         interaction_freqs["snail-sub"]["SNAIL"] = snail_frequency / 2

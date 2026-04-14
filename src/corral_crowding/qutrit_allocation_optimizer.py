@@ -9,8 +9,8 @@ from scipy.optimize import minimize
 from scipy.stats import gmean
 from tqdm import tqdm
 
-from corral_crowding.detuning_fit import compute_infidelity_parameters, decay_fit
-from corral_crowding.module_graph import QuantumModuleGraph
+from corral_crowding.qutrit_detuning_fit import compute_infidelity_parameters, decay_fit
+from corral_crowding.qutrit_module_graph import QutritModuleGraph
 from corral_crowding.speedlimit_fit import (
     lifetime_decay_fit,
     speedlimit_infidelity_params,
@@ -25,7 +25,7 @@ class GateFidelityOptimizer:
         eta,
         g3,
         alpha=0.12,  # 120Mhz
-        anharmonicities=[-0.12, -0.12, -0.12],
+        anharmonicities=None,
         min_bare_space_ghz=0.2,  # 200mhz
         T_1=120e-6,
         qubit_bounds=(3.3, 5.7),
@@ -40,11 +40,11 @@ class GateFidelityOptimizer:
         self.min_bare_space_ghz = min_bare_space_ghz
         self.qubit_bounds = qubit_bounds
         self.snail_bounds = snail_bounds
-        self.module_graph = module
+        self.module_graph:QutritModuleGraph = module
         self.best_frequencies = None
         self.best_cost = np.inf
         self.drop_k = drop_k
-        self.anharmonicities = anharmonicities
+        self.anharmonicities = anharmonicities if anharmonicities is not None else [-1*alpha] * self.module_graph.num_qutrits
 
         detuning_list = np.linspace(50, 1000, 64)
         self.infidelity_params, _ = compute_infidelity_parameters(
@@ -107,67 +107,86 @@ class GateFidelityOptimizer:
         )
         return gate_infidelity, gate_infidelity_with_lifetime
 
-    def _compute_bare_infidelity(self, edge, interaction_data, label):
-        # for each qubit-resonance, add penality of 1 if closer than min_bare_space_ghz to
-        # any of the other bare resonances (qubit-resonance or snail-resonance)
-        driven_freq = interaction_data[label][edge]
-        cost = lambda freq: 1.0 - freq / self.min_bare_space_ghz
-        gate_infidelity = sum(
-            (
-                cost(np.abs(driven_freq - spec_freq))
-                if np.abs(driven_freq - spec_freq) < self.min_bare_space_ghz
-                else 0
-            )
-            for spectator_edge, spec_freq in interaction_data[label].items()
-            if spectator_edge != edge
-        )
+    # def _compute_bare_infidelity(self, edge, interaction_data, label):
+    #     # for each qubit-resonance, add penality of 1 if closer than min_bare_space_ghz to
+    #     # any of the other bare resonances (qubit-resonance or snail-resonance)
+    #     driven_freq = interaction_data[label][edge]
+    #     qutrit_resonances = ["qutrit-ge", "qutrit-ef", "qutrit-gf"]
+    #     cost = lambda freq: 1.0 - freq / self.min_bare_space_ghz
+    #     gate_infidelity = 0
+    #     for resonance in qutrit_resonances:
+    #         gate_infidelity += 0.5 * sum(
+    #             (
+    #                 cost(np.abs(driven_freq - spec_freq))
+    #                 if np.abs(driven_freq - spec_freq) < self.min_bare_space_ghz
+    #                 else 0
+    #             )
+    #             for spectator_edge, spec_freq in interaction_data[resonance].items()
+    #             if spectator_edge != edge
+    #         )
 
-        gate_infidelity += sum(
-            (
-                cost(np.abs(driven_freq - spec_freq))
-                if np.abs(driven_freq - spec_freq) < self.min_bare_space_ghz
-                else 0
-            )
-            for spec_freq in interaction_data["snail-resonance"].values()
-        )
-        return gate_infidelity
+    #     gate_infidelity += sum(
+    #         (
+    #             cost(np.abs(driven_freq - spec_freq))
+    #             if np.abs(driven_freq - spec_freq) < self.min_bare_space_ghz
+    #             else 0
+    #         )
+    #         for spec_freq in interaction_data["snail-resonance"].values()
+    #     )
+    #     return gate_infidelity
 
-    def compute_total_infidelity(self, frequencies, anharmonicities):
+    def compute_total_infidelity(self, frequencies):
+
         qutrit_frequencies, snail_frequency = frequencies[:-1], frequencies[-1]
         interaction_data = self.module_graph.get_interaction_frequencies(
-            qutrit_frequencies, anharmonicities, snail_frequency
+            qutrit_frequencies, self.anharmonicities, snail_frequency
         )
         two_qutrit_crowding = [
             self._compute_gate_infidelity(edge, interaction_data)[1]
             for edge in interaction_data["qutrit-qutrit"]
         ]
-        # two_qubit_crowding = sum(two_qubit_crowding[self.drop_k :])
         two_qutrit_crowding = sum(
             sorted(two_qutrit_crowding, reverse=True)[self.drop_k :]
         )
 
-        one_qutrit_crowding_ge = sum(
-            self._compute_bare_infidelity(edge, interaction_data, "qutrit-ge")
-            for edge in interaction_data["qutrit-ge"]
-        )
-        one_qutrit_crowding_ef = sum(
-            self._compute_bare_infidelity(edge, interaction_data, "qutrit-ef")
-            for edge in interaction_data["qutrit-ef"]
-        )
+        # --- Bare infidelity: single pass over unique pairs ---
+        cost = lambda freq: 1.0 - freq / self.min_bare_space_ghz
+        qutrit_resonances = ["qutrit-ge", "qutrit-ef", "qutrit-gf"]
 
-        one_qutrit_crowding_gf = sum(
-            self._compute_bare_infidelity(edge, interaction_data, "qutrit-gf")
-            for edge in interaction_data["qutrit-gf"]
-        )
+        # Flatten all qutrit bare frequencies into one list
+        bare_entries = [
+            (label, edge, freq)
+            for label in qutrit_resonances
+            for edge, freq in interaction_data[label].items()
+        ]
 
-        one_qutrit_crowding = (
-            one_qutrit_crowding_ge + one_qutrit_crowding_ef + one_qutrit_crowding_gf
-        )
+        snail_freqs = list(interaction_data["snail-resonance"].values())
 
-        return two_qutrit_crowding, one_qutrit_crowding
+        one_qutrit_crowding = 0.0
 
-    def optimize_frequencies(self, anharmonicities, attempts=128):
-        qubit_count = self.module_graph.num_qubits
+        for i in range(len(bare_entries)):
+            label_i, edge_i, freq_i = bare_entries[i]
+
+            # Qutrit-qutrit resonances: only check j > i to avoid double counting
+            for j in range(i + 1, len(bare_entries)):
+                label_j, edge_j, freq_j = bare_entries[j]
+                if edge_i == edge_j:
+                    continue
+                d = np.abs(freq_i - freq_j)
+                if d < self.min_bare_space_ghz:
+                    one_qutrit_crowding += cost(d)
+
+            # Qutrit-snail: each (qutrit_freq, snail_freq) pair is unique
+            for sf in snail_freqs:
+                d = np.abs(freq_i - sf)
+                if d < self.min_bare_space_ghz:
+                    one_qutrit_crowding += cost(d)
+
+        return two_qutrit_crowding + one_qutrit_crowding
+
+
+    def optimize_frequencies(self, attempts=128):
+        qubit_count = self.module_graph.num_qutrits
         self.best_cost = np.inf
         for _ in tqdm(range(attempts)):
             initial_guess = np.append(
@@ -177,13 +196,14 @@ class GateFidelityOptimizer:
                 np.random.uniform(self.snail_bounds[0], self.snail_bounds[1]),
             )
             result = minimize(
-                lambda f: self.compute_total_infidelity(f, anharmonicities),
+                lambda f: self.compute_total_infidelity(f),
                 initial_guess,
                 bounds=[self.qubit_bounds] * qubit_count + [self.snail_bounds],
                 method="Nelder-Mead",
+                tol=1e-6
             )
             temp_result = np.mean(
-                self.get_final_infidelities(anharmonicities, result.x)
+                self.get_final_infidelities(result.x)
             )
             if temp_result < self.best_cost:
                 self.best_cost = temp_result
@@ -192,7 +212,7 @@ class GateFidelityOptimizer:
         print(best_result.message)
         return self.best_frequencies, self.best_cost
 
-    def get_final_infidelities(self, anharmonicities, freqs=None):
+    def get_final_infidelities(self, freqs=None):
         if freqs is None:
             if self.best_frequencies is None:
                 print("No optimized frequencies available.")
@@ -207,7 +227,7 @@ class GateFidelityOptimizer:
             temp_freqs[-1],
         )
         interaction_data = self.module_graph.get_interaction_frequencies(
-            qubit_frequencies, anharmonicities, snail_frequency
+            qubit_frequencies, self.anharmonicities, snail_frequency
         )
         gate_infidelities = {
             edge: self._compute_gate_infidelity(edge, interaction_data)[1]
@@ -229,7 +249,7 @@ class GateFidelityOptimizer:
             self.best_frequencies[-1],
         )
         interaction_data = self.module_graph.get_interaction_frequencies(
-            qubit_frequencies, snail_frequency
+            qubit_frequencies, self.anharmonicities, snail_frequency
         )
 
         if not self.use_lifetime:
@@ -241,14 +261,14 @@ class GateFidelityOptimizer:
 
         gate_infidelities = {
             edge: self._compute_gate_infidelity(edge, interaction_data)
-            for edge in list(interaction_data["qubit-qubit"])
+            for edge in list(interaction_data["qutrit-qutrit"])
         }
 
         for edge, (
             infidelity_no_lifetime,
             infidelity_with_lifetime,
         ) in gate_infidelities.items():
-            freq = interaction_data["qubit-qubit"][edge]
+            freq = interaction_data["qutrit-qutrit"][edge]
             print(
                 f"  Gate {edge}: {freq:.6f} GHz → "
                 f"fidelity (no lifetime loss): {1 - infidelity_no_lifetime:.6e}, "
@@ -270,5 +290,5 @@ class GateFidelityOptimizer:
 
         self.module_graph.plot_graph(qubit_frequencies, snail_frequency)
         self.module_graph.plot_interaction_frequencies(
-            qubit_frequencies, snail_frequency
+            qubit_frequencies, self.anharmonicities, snail_frequency
         )

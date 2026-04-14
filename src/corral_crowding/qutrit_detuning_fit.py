@@ -58,46 +58,46 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
     """Generates (a, b, c) infidelity parameters dynamically from QuTiP simulations."""
     # Compute prefactors
     intra_prefactors = {
-        "snail-qubit": 6 * eta * lambdaq * g3,
-        "qubit-sub": 3 * eta**2 * lambdaq * g3,
-        "qubit-qubit": 6 * eta * lambdaq**2 * g3,
+        "snail-qutrit": 6 * eta * lambdaq * g3,
+        "qutrit-sub": 3 * eta**2 * lambdaq * g3,
+        "qutrit-qutrit": 6 * eta * lambdaq**2 * g3,
     }
 
     inter_prefactors = {
-        "snail-qubit (inter)": 6 * eta * lambdaq**3 * g3,
-        "qubit-sub (inter)": 3 * eta**2 * lambdaq**3 * g3,
+        "snail-qutrit (inter)": 6 * eta * lambdaq**3 * g3,
+        "qutrit-sub (inter)": 3 * eta**2 * lambdaq**3 * g3,
     }
 
     # Combine all prefactors
     prefactors = {**intra_prefactors, **inter_prefactors}
 
-    # === Hilbert Space 1: Three Qubit System === #
-    q = destroy(2)
-    q1 = tensor(q, qeye(2), qeye(2))  # First qubit (Main interaction)
-    q2 = tensor(qeye(2), q, qeye(2))  # Second qubit (Main interaction)
-    q3 = tensor(qeye(2), qeye(2), q)  # Spectator qubit
+    # === Hilbert Space 1: Three Qutrit System === #
+    q = destroy(3)
+    q1 = tensor(q, qeye(3), qeye(3))  # First qutrit (Main interaction)
+    q2 = tensor(qeye(3), q, qeye(3))  # Second qutrit (Main interaction)
+    q3 = tensor(qeye(3), qeye(3), q)  # Spectator qutrit
     q1dag = q1.dag()
     q2dag = q2.dag()
     q3dag = q3.dag()
 
     # Intended gate (always between q1 and q2)
-    intended_term_qubits = q1dag * q2 + q1 * q2dag
-    ideal_gate_qubits = (-1.0j * (np.pi / 2) * intended_term_qubits).expm()
+    intended_term_qutrits = q1dag * q2 + q1 * q2dag
+    ideal_gate_qutrits = (-1.0j * (np.pi / 2) * intended_term_qutrits).expm()
 
-    # Spectator terms for qubit system
-    spectator_ops_qubits = {
-        "qubit-qubit": (q1dag * q3 + q1 * q3dag, ideal_gate_qubits),
-        "qubit-sub": (q3dag + q3, ideal_gate_qubits),
-        "qubit-sub (inter)": (q1dag + q1, ideal_gate_qubits),
+    # Spectator terms for qutrit system
+    spectator_ops_qutrits = {
+        "qutrit-qutrit": (q1dag * q3 + q1 * q3dag, ideal_gate_qutrits),
+        "qutrit-sub": (q3dag + q3, ideal_gate_qutrits),
+        "qutrit-sub (inter)": (q1dag + q1, ideal_gate_qutrits),
     }
 
-    # === Hilbert Space 2: Two Qubits + SNAIL System === #
+    # === Hilbert Space 2: Two Qutrits + SNAIL System === #
     n_dim_snail = 8  # 8-Level SNAIL Mode
-    qs = destroy(2)  # Qubit part of SNAIL system
+    qs = destroy(3)  # qutrit part of SNAIL system
     s = destroy(n_dim_snail)  # SNAIL oscillator
-    qs1 = tensor(qs, qeye(2), qeye(n_dim_snail))  # First qubit
-    qs2 = tensor(qeye(2), qs, qeye(n_dim_snail))  # Second qubit
-    s1 = tensor(qeye(2), qeye(2), s)  # SNAIL mode
+    qs1 = tensor(qs, qeye(3), qeye(n_dim_snail))  # First qutrit
+    qs2 = tensor(qeye(3), qs, qeye(n_dim_snail))  # Second qutrit
+    s1 = tensor(qeye(3), qeye(3), s)  # SNAIL mode
     qs1dag = qs1.dag()
     qs2dag = qs2.dag()
     s1dag = s1.dag()
@@ -108,20 +108,20 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
 
     # Spectator terms for SNAIL system
     spectator_ops_snail = {
-        "snail-qubit": (qs1dag * s1 + qs1 * s1dag, ideal_gate_snail),
-        "snail-qubit (inter)": (qs1dag * s1 + qs1 * s1dag, ideal_gate_snail),
+        "snail-qutrit": (qs1dag * s1 + qs1 * s1dag, ideal_gate_snail),
+        "snail-qutrit (inter)": (qs1dag * s1 + qs1 * s1dag, ideal_gate_snail),
     }
 
     # Compute infidelity curves and fit (a, b, c)
     infidelity_params = {}
     fidelity_results = {}
 
-    # Compute for qubit-based spectators
-    for key in spectator_ops_qubits:
-        spectator_term, gate_target = spectator_ops_qubits[key]
+    # Compute for qutrit-based spectators
+    for key in spectator_ops_qutrits:
+        spectator_term, gate_target = spectator_ops_qutrits[key]
         fidelity_results[key] = simulate_infidelity(
             detuning_list,
-            intended_term_qubits,
+            intended_term_qutrits,
             gate_target,
             prefactors[key],
             spectator_term,
