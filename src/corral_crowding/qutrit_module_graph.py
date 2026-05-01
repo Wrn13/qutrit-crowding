@@ -83,6 +83,36 @@ class QutritModuleGraph(QuantumModuleGraph):
         )
         plt.show()
 
+    def plot_graph(self, qutrit_frequencies, snail_frequency, fidelities):
+        pos = nx.spring_layout(self.G, seed=42)
+        labels = {
+            node: (
+                f"{node}\n{qutrit_frequencies[int(node[1:])]:.2f} GHz"
+                if node.startswith("Q")
+                else f"SNAIL\n{snail_frequency:.2f} GHz"
+            )
+            for node in self.G.nodes
+        }
+        node_colors = [
+            "green" if node.startswith("Q") else "red" for node in self.G.nodes
+        ]
+        plt.figure(figsize=(2, 2))
+        nx.draw(
+            self.G,
+            pos,
+            with_labels=True,
+            node_color=node_colors,
+            edgecolors="black",
+            width=2,
+        )
+        nx.draw_networkx_edges(
+            self.G,
+            pos,
+            edge_color=[self.G.edges[e]["color"] for e in self.G.edges],
+            width=2,
+        )
+        plt.show()
+
     def plot_interaction_frequencies(self, qutrit_frequencies, qutrit_anharmonicities, snail_frequency):
         all_freqs = list(qutrit_frequencies) + [snail_frequency]
         interaction_freqs = self.get_interaction_frequencies(
