@@ -15,6 +15,7 @@ def simulate_infidelity(
         spectator_amplitude = (2 * prefactor) / (2 * np.pi * detuning * 1e6)
         H = (np.pi / 2) * intended_term + spectator_amplitude * spectator_term
         U_t_f = (-1.0j * H).expm()
+        print(U_t_f)
         fidelity = 1 - average_gate_fidelity(U_t_f, ideal_gate)
         infidelity_list.append(fidelity)
 
@@ -141,3 +142,5 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
         infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
 
     return infidelity_params, fidelity_results
+
+# %%

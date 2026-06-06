@@ -30,7 +30,7 @@ class QutritModuleGraph(QuantumModuleGraph):
             "snail-qutrit": {},
             "qutrit-ge": {},
             "qutrit-ef": {},
-            "qutrit-gf": {},
+            #"qutrit-gf": {},
             "snail-resonance": {},
             "qutrit-sub": {},
             "snail-sub": {},
@@ -38,7 +38,7 @@ class QutritModuleGraph(QuantumModuleGraph):
         for i, freq in enumerate(qutrit_frequencies):
             interaction_freqs["qutrit-ge"][f"Q{i}"] = freq
             interaction_freqs["qutrit-ef"][f"Q{i}"] = freq + alpha[i]
-            interaction_freqs["qutrit-gf"][f"Q{i}"] = 2*freq + alpha[i]
+            #interaction_freqs["qutrit-gf"][f"Q{i}"] = 2*freq + alpha[i]
             interaction_freqs["qutrit-sub"][f"Q{i}"] = freq / 2
         interaction_freqs["snail-resonance"]["SNAIL"] = snail_frequency
         interaction_freqs["snail-sub"]["SNAIL"] = snail_frequency / 2
@@ -83,27 +83,22 @@ class QutritModuleGraph(QuantumModuleGraph):
         )
         plt.show()
 
-    def plot_graph(self, qutrit_frequencies, snail_frequency, fidelities):
+    def plot_graph(self, qutrit_frequencies, snail_frequency, fidelities:dict[tuple[str,str],float]):
+        newG = self.G.copy()
+        self.G = newG
+        self.G.remove_node("SNAIL")
+
         pos = nx.spring_layout(self.G, seed=42)
-        labels = {
-            node: (
-                f"{node}\n{qutrit_frequencies[int(node[1:])]:.2f} GHz"
-                if node.startswith("Q")
-                else f"SNAIL\n{snail_frequency:.2f} GHz"
-            )
-            for node in self.G.nodes
-        }
-        node_colors = [
-            "green" if node.startswith("Q") else "red" for node in self.G.nodes
-        ]
+        
+        weights = fidelities.values()
         plt.figure(figsize=(2, 2))
         nx.draw(
             self.G,
             pos,
-            with_labels=True,
-            node_color=node_colors,
-            edgecolors="black",
-            width=2,
+            node_size = 500,
+            node_color='white',
+            edgecolors='#333333',
+            linewidth=1.5,
         )
         nx.draw_networkx_edges(
             self.G,
@@ -111,7 +106,34 @@ class QutritModuleGraph(QuantumModuleGraph):
             edge_color=[self.G.edges[e]["color"] for e in self.G.edges],
             width=2,
         )
+        nx.draw_networkx_labels(self.G,pos,fontsize=7, font_color='#333333')
+        nx.draw_networkx_edge_labels(self.G, pos, edge_labels = fidelities, font_size=7)
         plt.show()
+
+
+# for ax, name in zip(axes, topo_names):
+#     G, pos = subgraphs[name]
+#     edge_items  = list(G.edges(data=True))
+#     weights     = [d['weight'] for _, _, d in edge_items]
+#     norm        = lambda w: (w - vmin) / (vmax - vmin + 1e-9)
+#     edge_colors = [cmap(norm(w)) for w in weights]
+#     edge_widths = [1.5 + 4 * norm(w) for w in weights]
+
+#     nx.draw_networkx_nodes(G, pos, node_size=500, node_color='white',
+#                            edgecolors='#333333', linewidths=1.5, ax=ax)
+#     nx.draw_networkx_edges(G, pos, edgelist=[(u, v) for u, v, _ in edge_items],
+#                            edge_color=edge_colors, width=edge_widths, ax=ax)
+#     nx.draw_networkx_labels(G, pos, font_size=7, font_color='#333333', ax=ax)
+
+#     edge_labels = {(u, v): f"{d['weight']:.3f}" for u, v, d in edge_items}
+#     diag_labels  = {(u, v): lbl for (u, v), lbl in edge_labels.items()
+#                     if pos[u][1] != pos[v][1] and pos[u][0] != pos[v][0]}
+#     axial_labels = {(u, v): lbl for (u, v), lbl in edge_labels.items()
+#                     if (u, v) not in diag_labels}
+#     nx.draw_networkx_edge_labels(G, pos, edge_labels=axial_labels, font_size=7, ax=ax)
+#     nx.draw_networkx_edge_labels(G, pos, edge_labels=diag_labels,
+#                                  font_size=7, label_pos=0.3, ax=ax)
+
 
     def plot_interaction_frequencies(self, qutrit_frequencies, qutrit_anharmonicities, snail_frequency):
         all_freqs = list(qutrit_frequencies) + [snail_frequency]
@@ -124,34 +146,43 @@ class QutritModuleGraph(QuantumModuleGraph):
             ax.set_xlim(0, max_freq)
             ax.get_yaxis().set_visible(False)
             added_labels = set()
+            cmap = plt.get_cmap('jet', 7)
             color_map = {
-                "qutrit-qutrit": "blue",
-                "qutrit-ge": "green",
-                "qutrit-ef": "teal",
-                "qutrit-gf": "lime",
-                "snail-qutrit": "orange",
-                "qutrit-sub": "gray",
-                "snail-sub": "magenta",
-                "snail-resonance": "red",
+                "qutrit-qutrit": cmap(0),
+                "qutrit-ge": cmap(1),
+                "qutrit-ef": cmap(2),
+                "snail-qutrit": cmap(3),
+                "qutrit-sub": cmap(4),
+                "snail-sub": cmap(5),
+                "snail-resonance": cmap(6),
             }
             legend_labels = {
                 "qutrit-qutrit": "Two-qutrit Gates",
                 "qutrit-ge": "Qutrit g-e Transition",
                 "qutrit-ef": "Qutrit e-f Transition",
-                "qutrit-gf": "Qutrit g-f Transition",
                 "snail-qutrit": "SNAIL Qutrit Difference",
                 "qutrit-sub": "Qutrit Subharmonic",
                 "snail-sub": "SNAIL Subharmonic",
                 "snail-resonance": "SNAIL Mode",
             }
+
+            linestyles = {
+                "qutrit-qutrit": "-",
+                "qutrit-ge": "-",
+                "qutrit-ef": ":",
+                "snail-qutrit": "--",
+                "qutrit-sub": ":",
+                "snail-sub": ":",
+                "snail-resonance": "-",
+            }
             for interaction_type, freqs in interaction_freqs.items():
                 if not freqs:
                     continue
                 color = color_map.get(interaction_type, "black")
-                if interaction_type in {"snail-resonance", "qutrit-resonance"}:
-                    linestyle = "-"
-                else:
-                    linestyle = (0, (2.1, 1.4))  # fine dashed line
+                # if interaction_type in {"snail-resonance", "qutrit-resonance"}:
+                linestyle = linestyles[interaction_type]
+                # else:
+                #     linestyle = (0, (2.1, 1.4))  # fine dashed line
                 label = (
                     legend_labels[interaction_type]
                     if interaction_type not in added_labels
@@ -175,7 +206,6 @@ class QutritModuleGraph(QuantumModuleGraph):
             legend_order = [
                 "Qutrit g-e Transition",
                 "Qutrit e-f Transition",
-                "Qutrit g-f Transition",
                 "SNAIL Mode",
                 "Two-qutrit Gates",
                 "Qutrit Subharmonic",
