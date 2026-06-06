@@ -3,10 +3,14 @@ import networkx as nx
 
 
 class QuantumModuleGraph:
-    def __init__(self, num_qubits):
+    def __init__(self, num_qubits, edges=None):
         self.G = nx.Graph()
         self.num_qubits = num_qubits  # Default for topology setup
-        self._add_edges()
+        if edges is None:
+            self._add_edges()
+        else:
+            for u, v, interaction, color in edges:
+                self.G.add_edge(u, v, interaction=interaction, color=color)
 
     def _add_edges(self):
         for i in range(self.num_qubits):
