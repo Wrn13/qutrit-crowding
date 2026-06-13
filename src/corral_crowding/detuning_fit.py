@@ -81,21 +81,6 @@ def simulate_drag_infidelity(
  
     return np.array(infidelity_list)
 
-# def decay_fit(detuning, a, b, c, d):
-#     """Power law function for fitting infidelity curves."""
-#     return a * ((detuning + d) ** -b) + c
-
-
-# def fit_infidelity(detuning_list, infidelity_list):
-#     """Fits the simulated infidelity data to the power-law model.
-
-#     Returns:
-#         - Best-fit parameters (a, b, c)
-#     """
-#     p0 = [1, 2, 0, 0]  # Initial guess
-#     params, _ = curve_fit(decay_fit, detuning_list, infidelity_list, p0=p0)
-#     return params
-
 import numpy as np
 from scipy.optimize import curve_fit
 
