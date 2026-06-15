@@ -58,37 +58,69 @@ import numpy as np
 
 # ---------------------------------------------------------------------------
 # Default device + simulation configuration (override with --device cfg.json).
-# Frequencies / anharmonicities in GHz; the runner converts to rad/ns.
+# Frequencies / anharmonicities / g3 / g4 in GHz; runner converts to rad/ns.
+#
+# Two spectator CHANNELS (select via the --channels sweep axis):
+#   "qubit_qubit" : target pair (0,1) + a third transmon (2) as spectator.
+#   "qubit_snail" : target pair (0,1) + an explicit SNAIL mode (index 2) carrying
+#                   a cubic g3 (+ optional quartic g4) self-Hamiltonian -- NOT a
+#                   transmon Duffing Kerr.
+# Spectator edge is (anchor=1, free=2). We sweep the spectator TRANSITION
+# FREQUENCY Delta_rs = w_anchor - w_free broadly; wherever it crosses an order
+# m*w_d of the pump comb, that spectator lights up. The pump frequency
+# w_d = w_0 - w_1 (the target) is held fixed, so only the free mode moves.
+#
+# General spectators come from the multi-tone pump COMB: a real SNAIL pump is
+# not a pure cos(w_d t) -- the cubic/quartic mix it into harmonics (m=2,3 ...)
+# and subharmonics (m=1/2 ...). `pump_tones` lists [mult, amp] pairs; the m=1
+# tone drives the iSWAP. DRAG (when on) targets whichever order is nearest the
+# swept Delta_rs, suppressing that spectator.
 # ---------------------------------------------------------------------------
 DEFAULT_CONFIG = {
-    "freqs_GHz":   [5.00, 4.60, 4.35],   # base frequencies; index `free` is overwritten per point
-    "anh_GHz":     [-0.20, -0.20, -0.20],
-    "levels":      3,
-    "target_edge": [0, 1],               # (p, q): resonantly pumped iSWAP
-    "spectator_edge": [1, 2],            # (anchor, free) on the device graph
-    "spectator_anchor": 1,               # fixed-frequency endpoint of spectator edge
-    "spectator_free":   2,               # endpoint whose frequency encodes delta_s
-    "target_eta":  1.0,                  # pump participation of the target edge
-    "static_g_GHz": 0.0,                 # static exchange on both edges (usually 0 here)
-    "t_g_ns":      40.0,                 # gate length
-    "n_tlist":     200,                  # output sampling (solver is adaptive)
-    "envelope":    "raised_cosine",      # or "gaussian_flat"
+    # target pair (transmons 0 and 1)
+    "pair_freqs_GHz": [5.00, 4.60],
+    "pair_anh_GHz":   [-0.20, -0.20],
+    "pair_levels":    3,
+    # spectator transmon (qubit_qubit channel)
+    "spec_transmon_anh_GHz": -0.20,
+    "spec_transmon_levels":  3,
+    # explicit SNAIL (qubit_snail channel): cubic + quartic, NOT a Duffing Kerr.
+    # Defaults to a (cheap) linear spectator; set g3/g4 to include nonlinearity.
+    "snail_g3_GHz":   0.0,
+    "snail_g4_GHz":   0.0,
+    "snail_levels":   4,
+    "snail_self_rwa": True,   # keep slow cubic + static g4 Kerr; drop >=2*w_s terms
+    # pump comb: [multiplier, relative amplitude]; m=1 drives the iSWAP
+    "pump_tones": [[1.0, 1.0], [2.0, 0.5]],
+    # topology / drive
+    "target_edge": [0, 1],
+    "spectator_anchor": 1,
+    "target_eta":  1.0,
+    "static_g_GHz": 0.0,
+    # pulse / solver
+    "t_g_ns":      40.0,
+    "n_tlist":     200,
+    "envelope":    "raised_cosine",
 }
 
-# Default sweep axes (override on the CLI with --deltas/--etas/--drags).
-DEFAULT_DELTAS_GHz = [-0.30, -0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20, 0.30]
-DEFAULT_ETAS = [0.3, 0.6, 0.9]
+# Default sweep axes (override with --channels/--specfreqs/--etas/--drags).
+DEFAULT_CHANNELS = ["qubit_qubit", "qubit_snail"]
+# Broad spectator-transition-frequency sweep (GHz). With w_d=0.4 this crosses the
+# fundamental (m=1, 0.40) and second harmonic (m=2, 0.80) of the comb.
+DEFAULT_SPECFREQS_GHz = [round(0.20 + 0.025 * k, 3) for k in range(29)]  # 0.20..0.90
+DEFAULT_ETAS = [0.6, 0.9]
 DEFAULT_DRAGS = [False, True]
 
 TWO_PI = 2.0 * np.pi
-_DELTA_EPS_GHz = 1e-6  # below this |delta_s| DRAG is undefined (resonant spectator)
+_DELTA_EPS_GHz = 5e-4   # below this beat DRAG is singular (near-resonant spectator)
+_CHANNELS = ("qubit_qubit", "qubit_snail")
 
 
 @dataclass
 class Point:
-    """Parameters for a single run of solver."""
     index: int
-    delta_s_GHz: float
+    channel: str
+    spec_freq_GHz: float   # spectator transition frequency Delta_rs = w_anchor - w_free
     eta: float
     drag: bool
 
@@ -96,15 +128,30 @@ class Point:
 # ---------------------------------------------------------------------------
 # Grid construction (deterministic, QuTiP-free)
 # ---------------------------------------------------------------------------
-def build_grid(deltas, etas, drags) -> List[Point]:
-    """Cartesian product with a stable ordering: delta (outer) -> eta -> drag."""
+def build_grid(channels, specfreqs, etas, drags) -> List[Point]:
+    """Cartesian product, stable order: channel -> spec_freq -> eta -> drag."""
     pts, k = [], 0
-    for d in deltas:
-        for e in etas:
-            for g in drags:
-                pts.append(Point(index=k, delta_s_GHz=float(d), eta=float(e), drag=bool(g)))
-                k += 1
+    for ch in channels:
+        if ch not in _CHANNELS:
+            raise ValueError(f"unknown channel {ch!r}; choose from {_CHANNELS}")
+        for sf in specfreqs:
+            for e in etas:
+                for g in drags:
+                    pts.append(Point(index=k, channel=ch, spec_freq_GHz=float(sf),
+                                     eta=float(e), drag=bool(g)))
+                    k += 1
     return pts
+
+
+def _nearest_order(delta_rs_GHz, w_d_GHz, tones):
+    """Return (mult*, beat*_GHz) for the comb tone whose m*w_d is closest to
+    the spectator transition frequency Delta_rs."""
+    best = None
+    for (m, _amp) in tones:
+        beat = delta_rs_GHz - m * w_d_GHz
+        if best is None or abs(beat) < abs(best[1]):
+            best = (m, beat)
+    return best
 
 
 def write_grid(outdir, config, points: List[Point]) -> str:
@@ -126,82 +173,106 @@ def load_grid(outdir):
 # Single-point computation (imports QuTiP lazily, so prepare/collect stay light)
 # ---------------------------------------------------------------------------
 def run_point(pt: Point, config: dict) -> dict:
-    from corral_crowding.snail_parametric_sim import (  # noqa: WPS433 (deliberate lazy import)
-        SNAILProcessor, Edge, PumpSpec, RaisedCosine, GaussianFlat,
+    from snail_parametric_sim import (  # noqa: WPS433 (deliberate lazy import)
+        SNAILProcessor, Edge, PumpSpec, PumpTone
     )
+    from envelope import RaisedCosine, GaussianFlat
 
     t0 = time.time()
     p, q = config["target_edge"]
-    anchor = config["spectator_anchor"]
-    free = config["spectator_free"]
+    anchor = config["spectator_anchor"]      # a target-pair qubit (default q = 1)
+    free = 2                                 # third mode is always the spectator/free node
 
-    freqs = np.array(config["freqs_GHz"], dtype=float) * TWO_PI
-    anh = np.array(config["anh_GHz"], dtype=float) * TWO_PI
+    # --- assemble the three modes for this channel -------------------------
+    freqs = list(np.array(config["pair_freqs_GHz"], dtype=float))
+    anh = list(np.array(config["pair_anh_GHz"], dtype=float))
+    lvls = [config["pair_levels"], config["pair_levels"]]
+    snail_modes = None
+
+    if pt.channel == "qubit_qubit":
+        anh.append(config["spec_transmon_anh_GHz"])
+        lvls.append(config["spec_transmon_levels"])
+    elif pt.channel == "qubit_snail":
+        anh.append(0.0)                           # SNAIL has NO Duffing Kerr
+        lvls.append(config["snail_levels"])
+        snail_modes = {free: {"g3": config["snail_g3_GHz"] * TWO_PI,
+                              "g4": config["snail_g4_GHz"] * TWO_PI}}
+    else:
+        raise ValueError(f"unknown channel {pt.channel!r}")
+    freqs.append(0.0)  # placeholder; overwritten below to realize Delta_rs
+
+    freqs = np.array(freqs) * TWO_PI
+    anh = np.array(anh) * TWO_PI
     g_static = config["static_g_GHz"] * TWO_PI
 
-    w_d = freqs[p] - freqs[q]                  # fixed by target edge
-    delta_s = pt.delta_s_GHz * TWO_PI
-    freqs[free] = freqs[anchor] - w_d - delta_s  # realize requested beat
+    w_d = freqs[p] - freqs[q]                       # fixed by target edge
+    w_d_GHz = w_d / TWO_PI
+    # sweep the spectator TRANSITION FREQUENCY Delta_rs = w_anchor - w_free
+    freqs[free] = freqs[anchor] - pt.spec_freq_GHz * TWO_PI
 
     edges = [
         Edge(p, q, g=g_static, eta=config["target_eta"]),
         Edge(anchor, free, g=g_static, eta=pt.eta),
     ]
-    proc = SNAILProcessor(freqs, anh, edges, levels=config["levels"])
+    proc = SNAILProcessor(freqs, anh, edges, levels=lvls,
+                          snail_modes=snail_modes,
+                          snail_self_rwa=config.get("snail_self_rwa", True))
 
-    # DRAG against a resonant spectator (delta_s == 0) is singular: skip it.
+    # --- pump comb + nearest-order DRAG targeting --------------------------
+    tones_cfg = config["pump_tones"]                # [[mult, amp], ...]
+    mult_star, beat_GHz = _nearest_order(pt.spec_freq_GHz, w_d_GHz, tones_cfg)
+
     use_drag = pt.drag
     status = "ok"
-    if pt.drag and abs(pt.delta_s_GHz) < _DELTA_EPS_GHz:
-        use_drag = False
+    if pt.drag and abs(beat_GHz) < _DELTA_EPS_GHz:
+        use_drag = False                            # DRAG singular at the resonance
         status = "drag_skipped_resonant_spectator"
+
+    tones = []
+    for (m, amp) in tones_cfg:
+        on = bool(use_drag and m == mult_star)
+        tones.append(PumpTone(mult=float(m), amp=float(amp), drag=on,
+                              delta_drag=(beat_GHz * TWO_PI if on else None)))
 
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else GaussianFlat
     env = EnvCls(amp=1.0, t_g=config["t_g_ns"])
-    proc.set_pump(PumpSpec(
-        target_edge=(p, q), envelope=env, w_d=w_d,
-        drag=use_drag, delta_drag=(delta_s if use_drag else None),
-    ))
+    proc.set_pump(PumpSpec(target_edge=(p, q), envelope=env, w_d=w_d, tones=tones))
 
     tlist = np.linspace(0.0, config["t_g_ns"], config["n_tlist"])
 
-    # (a) single-trajectory spectator diagnostic: excite the driven transmon p.
+    # (a) single-trajectory spectator diagnostic: excite driven transmon p,
+    #     measure mean occupation of the free/spectator mode (qubit OR SNAIL).
     occ0 = [0] * proc.N
     occ0[p] = 1
     res = proc.evolve(proc.fock(occ0), tlist)
     pops = np.abs(res.states[-1].full().ravel()) ** 2
-    n_spec = 0.0
-    for idx in range(proc.D):
-        # decode occupation of `free` from flat index
-        rem, occ = idx, []
-        for _ in range(proc.N):
-            rem, r = divmod(rem, proc.d)
-            occ.append(r)
-        occ = occ[::-1]
-        n_spec += pops[idx] * occ[free]
+    n_spec = proc.mean_occupation(pops, free)
     occ_t = [0] * proc.N
-    occ_t[q] = 1                      # target transfer p->q in single-excitation manifold
+    occ_t[q] = 1
     p_transfer = float(pops[proc.fock_index(occ_t)])
 
-    # (b) two-qubit gate metric on the target pair (4 trajectories).
+    # (b) two-qubit gate metric on the target pair (4 trajectories). Leakage
+    #     captures population lost to the spectator/SNAIL out of {|0>,|1>}^2.
     F_avg, leakage, U_proj = proc.iswap_fidelity(tlist)
 
     return {
         "index": pt.index,
-        "delta_s_GHz": pt.delta_s_GHz,
+        "channel": pt.channel,
+        "spec_freq_GHz": pt.spec_freq_GHz,
         "eta": pt.eta,
         "drag": bool(pt.drag),
         "drag_applied": bool(use_drag),
+        "nearest_mult": float(mult_star),
+        "beat_GHz": float(beat_GHz),
         "status": status,
-        "w_d_GHz": w_d / TWO_PI,
-        "w_free_GHz": freqs[free] / TWO_PI,
+        "w_d_GHz": w_d_GHz,
+        "w_free_GHz": float(freqs[free] / TWO_PI),
         "F_avg": F_avg,
         "leakage": leakage,
         "n_spec": n_spec,
         "p_transfer": p_transfer,
-        "U_proj": U_proj,
         "t_g_ns": config["t_g_ns"],
-        "levels": config["levels"],
+        "U_proj": U_proj,
         "wall_s": time.time() - t0,
     }
 
@@ -236,9 +307,10 @@ def collect(outdir: str):
         idx_stack.append(meta["index"])
 
     rows.sort(key=lambda r: r["index"])
-    cols = ["index", "delta_s_GHz", "eta", "drag", "drag_applied", "status",
+    cols = ["index", "channel", "spec_freq_GHz", "eta", "drag", "drag_applied",
+            "nearest_mult", "beat_GHz", "status",
             "F_avg", "leakage", "n_spec", "p_transfer",
-            "w_d_GHz", "w_free_GHz", "t_g_ns", "levels", "wall_s"]
+            "w_d_GHz", "w_free_GHz", "t_g_ns", "wall_s"]
     csv_path = os.path.join(outdir, "summary.csv")
     with open(csv_path, "w") as f:
         f.write(",".join(cols) + "\n")
@@ -279,7 +351,8 @@ def main():
     ap.add_argument("--index", type=int, help="point index (mode=point)")
     ap.add_argument("--grid", help="path to grid.json (default: <outdir>/grid.json)")
     ap.add_argument("--nproc", type=int, default=4, help="processes for mode=local")
-    ap.add_argument("--deltas", help="comma list of delta_s in GHz (overrides default)")
+    ap.add_argument("--channels", help="comma list: qubit_qubit,qubit_snail")
+    ap.add_argument("--specfreqs", help="comma list of spectator transition freqs Delta_rs in GHz")
     ap.add_argument("--etas", help="comma list of spectator eta (overrides default)")
     ap.add_argument("--drags", help="comma list of bools, e.g. false,true")
     args = ap.parse_args()
@@ -290,10 +363,11 @@ def main():
             config.update(json.load(f))
 
     if args.mode == "prepare":
-        deltas = _parse_list(args.deltas, float) or DEFAULT_DELTAS_GHz
+        channels = _parse_list(args.channels, str) or DEFAULT_CHANNELS
+        specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
         etas = _parse_list(args.etas, float) or DEFAULT_ETAS
         drags = _bool_list(args.drags) or DEFAULT_DRAGS
-        points = build_grid(deltas, etas, drags)
+        points = build_grid(channels, specfreqs, etas, drags)
         path = write_grid(args.outdir, config, points)
         m = len(points)
         print(f"Wrote {m} points -> {path}")

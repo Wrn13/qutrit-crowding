@@ -85,6 +85,7 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
+from envelope import Envelope, RaisedCosine
 
 import numpy as np
 
@@ -98,76 +99,6 @@ except ImportError as exc:  # pragma: no cover - explicit, not silent
 
 TWO_PI = 2.0 * np.pi
 
-
-# ---------------------------------------------------------------------------
-# Pulse envelopes (each knows its own analytic derivative -- required for DRAG)
-# ---------------------------------------------------------------------------
-class Envelope:
-    """Base class. `value(t)` is Omega(t); `deriv(t)` is d/dt Omega(t).
-
-    Envelopes MUST satisfy value(0) == value(t_g) == 0 for the DRAG
-    integration-by-parts argument (Eq. 3) to hold cleanly.
-    """
-
-    def __init__(self, amp: float, t_g: float):
-        self.amp = float(amp)
-        self.t_g = float(t_g)
-
-    def value(self, t: float) -> float:  # pragma: no cover - interface
-        raise NotImplementedError
-
-    def deriv(self, t: float) -> float:  # pragma: no cover - interface
-        raise NotImplementedError
-
-    def area(self, n: int = 4000) -> float:
-        """integral_0^{t_g} Omega(t) dt  (trapezoid; used for iSWAP normalization)."""
-        ts = np.linspace(0.0, self.t_g, n)
-        return float(np.trapezoid([self.value(t) for t in ts], ts))
-
-
-class RaisedCosine(Envelope):
-    r"""Hann / raised-cosine: Omega(t) = (amp/2)(1 - cos(2 pi t / t_g)).
-
-    Analytic area over [0, t_g] is amp * t_g / 2. Spectrally clean (good for
-    adiabatic spectator suppression); the obvious default for parametric gates.
-    """
-
-    def value(self, t):
-        if t <= 0.0 or t >= self.t_g:
-            return 0.0
-        return 0.5 * self.amp * (1.0 - np.cos(TWO_PI * t / self.t_g))
-
-    def deriv(self, t):
-        if t <= 0.0 or t >= self.t_g:
-            return 0.0
-        return 0.5 * self.amp * (TWO_PI / self.t_g) * np.sin(TWO_PI * t / self.t_g)
-
-
-class GaussianFlat(Envelope):
-    r"""Truncated Gaussian, baseline-subtracted so it vanishes at the endpoints.
-
-    Omega(t) = amp * (G(t) - G(0)) / (1 - G(0)),  G(t) = exp(-(t - t_g/2)^2 / (2 sigma^2))
-    """
-
-    def __init__(self, amp, t_g, sigma_frac: float = 0.25):
-        super().__init__(amp, t_g)
-        self.sigma = sigma_frac * t_g
-        self._g0 = np.exp(-((0.0 - t_g / 2) ** 2) / (2 * self.sigma**2))
-        self._norm = 1.0 / (1.0 - self._g0)
-
-    def _G(self, t):
-        return np.exp(-((t - self.t_g / 2) ** 2) / (2 * self.sigma**2))
-
-    def value(self, t):
-        if t <= 0.0 or t >= self.t_g:
-            return 0.0
-        return self.amp * (self._G(t) - self._g0) * self._norm
-
-    def deriv(self, t):
-        if t <= 0.0 or t >= self.t_g:
-            return 0.0
-        dG = -((t - self.t_g / 2) / self.sigma**2) * self._G(t)
-        return self.amp * dG * self._norm
 
 
 # ---------------------------------------------------------------------------
@@ -197,15 +128,49 @@ class Edge:
 
 
 @dataclass
-class PumpSpec:
-    """Configuration of the single flux pump that drives the target iSWAP."""
+class PumpTone:
+    r"""One tone of the flux-pump comb at angular frequency ``mult * w_d``.
 
-    target_edge: tuple  # (p, q): which edge to drive resonantly
-    envelope: Envelope
-    w_d: Optional[float] = None  # pump (angular) frequency; default = Delta_pq
+    A real SNAIL pump is not a pure cos(w_d t): the cubic/quartic nonlinearity
+    mixes the strong pump up into harmonics (mult = 2, 3, ... from g3, g4) and,
+    via higher-order/degenerate processes, subharmonics (mult = 1/2, ...). Each
+    tone can independently drive a spectator transition that sits near
+    ``mult * w_d``, so a comb of tones + a broad detuning sweep maps the full
+    spectator ladder.
+
+    mult       : frequency multiplier m (1.0 = fundamental that drives the iSWAP)
+    amp        : relative amplitude c_m (the m=1 tone is what gets normalized)
+    drag       : apply a DRAG quadrature on THIS tone
+    delta_drag : beat to cancel, delta = Delta_rs - mult*w_d  [rad/ns]
+    """
+
+    mult: float
+    amp: float = 1.0
     drag: bool = False
-    delta_drag: Optional[float] = None  # spectator beat delta_s = Delta_rs - w_d
-    normalize_iswap: bool = True  # rescale envelope.amp so pulse area = pi/eta_pq
+    delta_drag: Optional[float] = None
+
+
+@dataclass
+class PumpSpec:
+    """Configuration of the single flux pump (a comb of tones) driving the iSWAP.
+
+    Backward compatible: leaving `tones=None` and setting `drag`/`delta_drag`
+    builds a single fundamental tone (mult=1) carrying that DRAG, exactly like
+    the original single-tone behavior.
+    """
+
+    target_edge: tuple                       # (p, q): edge driven resonantly by m=1
+    envelope: Envelope
+    w_d: Optional[float] = None              # base pump frequency; default = Delta_pq
+    tones: Optional[list] = None             # list[PumpTone]; default -> one m=1 tone
+    drag: bool = False                       # legacy: DRAG on the fundamental
+    delta_drag: Optional[float] = None       # legacy: its beat
+    normalize_iswap: bool = True             # scale envelope so the m=1 tone -> full iSWAP
+
+    def resolved_tones(self) -> list:
+        if self.tones is not None:
+            return list(self.tones)
+        return [PumpTone(mult=1.0, amp=1.0, drag=self.drag, delta_drag=self.delta_drag)]
 
 
 # ---------------------------------------------------------------------------
@@ -222,8 +187,27 @@ class SNAILProcessor:
         Duffing anharmonicities alpha_i [rad/ns] (negative for transmons).
     edges : sequence of Edge
         Coupling graph. Provide static g and/or pump participation eta per edge.
-    levels : int
-        Truncation per transmon (>= 3 to capture |2> leakage).
+        An edge may connect any two modes, transmon-transmon OR transmon-SNAIL.
+    levels : int | sequence of int
+        Truncation PER MODE. Pass an int to broadcast to every mode, or a
+        per-mode sequence (e.g. [3, 3, 4] for two transmons + a 4-level SNAIL).
+        Use >= 3 on transmons to capture |2> leakage; SNAIL modes that are
+        parasitically driven usually want >= 4.
+    snail_index : int, optional
+        Index of the mode that is the SNAIL (purely a *label*: a SNAIL is just
+        another Kerr-anharmonic bosonic mode here, with `anharmonicities[snail]`
+        playing the role of the SNAIL Kerr). Used by diagnostics to report
+        qubit-SNAIL leakage distinctly. The model treats it on equal footing.
+
+    Modeling note (qubit-SNAIL spectators)
+    --------------------------------------
+    When the SNAIL is carried explicitly, the *target* iSWAP is still the
+    calibrated effective transmon-transmon coupling (eta on the target edge),
+    while a transmon-SNAIL edge with nonzero eta represents the SAME flux pump
+    parasitically driving a transmon<->SNAIL conversion at beat
+    delta = (w_r - w_snail) - w_d. This "augmented effective" model isolates the
+    qubit-SNAIL residual channel (matching the SW channel decomposition) without
+    re-deriving the gate from the bare g3 three-wave term.
     """
 
     def __init__(
@@ -231,31 +215,59 @@ class SNAILProcessor:
         frequencies: Sequence[float],
         anharmonicities: Sequence[float],
         edges: Sequence[Edge],
-        levels: int = 3,
+        levels=3,
+        snail_index: Optional[int] = None,
+        snail_modes: Optional[dict] = None,
+        snail_self_rwa: bool = True,
     ):
         self.w = np.asarray(frequencies, dtype=float)
         self.alpha = np.asarray(anharmonicities, dtype=float)
         self.N = self.w.size
         if self.alpha.size != self.N:
             raise ValueError("frequencies and anharmonicities length mismatch.")
-        if levels < 2:
-            raise ValueError("levels must be >= 2 (>= 3 recommended for leakage).")
-        self.d = int(levels)
+
+        if np.isscalar(levels):
+            self.dims = [int(levels)] * self.N
+        else:
+            self.dims = [int(x) for x in levels]
+            if len(self.dims) != self.N:
+                raise ValueError("per-mode `levels` length must equal number of modes.")
+        if any(d < 2 for d in self.dims):
+            raise ValueError("every mode needs levels >= 2 (>= 3 recommended).")
+
+        # SNAIL modes: {index: {"g3":..., "g4":...}} in rad/ns. These carry a
+        # cubic (+quartic) self-Hamiltonian instead of the transmon Duffing Kerr;
+        # their entry in `anharmonicities` is ignored (the SNAIL has no alpha/2
+        # a^d a^d a a term -- its leading nonlinearity is the three-wave g3).
+        self.snail_modes = dict(snail_modes or {})
+        self.snail_self_rwa = bool(snail_self_rwa)
+        for s in self.snail_modes:
+            if not (0 <= s < self.N):
+                raise ValueError(f"snail_modes index {s} out of range.")
+            if self.alpha[s] != 0.0:
+                warnings.warn(
+                    f"mode {s} is a SNAIL: its anharmonicities[{s}] (Duffing Kerr) "
+                    "is ignored; nonlinearity comes from g3/g4."
+                )
+        if snail_index is None and len(self.snail_modes) == 1:
+            snail_index = next(iter(self.snail_modes))
+        self.snail_index = snail_index
+        if snail_index is not None and not (0 <= snail_index < self.N):
+            raise ValueError("snail_index out of range.")
+
         self.edges = list(edges)
         for e in self.edges:
             if not (0 <= e.i < self.N and 0 <= e.j < self.N):
-                raise ValueError(f"Edge {e} references a nonexistent transmon.")
+                raise ValueError(f"Edge {e} references a nonexistent mode.")
 
-        self.dims = [self.d] * self.N
-        self.D = self.d**self.N
+        self.D = int(np.prod(self.dims))
 
-        # tensored ladder operators a_i (built once)
-        a_single = qt.destroy(self.d)
-        ident = qt.qeye(self.d)
+        # tensored ladder operators a_i (built once); per-mode truncation.
+        idents = [qt.qeye(d) for d in self.dims]
         self.a = []
         for i in range(self.N):
-            ops = [ident] * self.N
-            ops[i] = a_single
+            ops = list(idents)
+            ops[i] = qt.destroy(self.dims[i])
             self.a.append(qt.tensor(ops))
         self.ad = [op.dag() for op in self.a]
 
@@ -269,15 +281,66 @@ class SNAILProcessor:
 
     # -- static (rotating-frame-invariant) part -----------------------------
     def _static_hamiltonian(self) -> qt.Qobj:
-        """The anharmonic Kerr term; the only time-independent piece of Eq. (1)."""
+        r"""Time-independent piece in the rotating frame:
+          * transmon modes: Duffing Kerr  (alpha/2) a^d a^d a a
+          * SNAIL modes:    the number-conserving part of g4 (b+b^d)^4, i.e.
+                            g4 (6 b^d2 b^2 + 12 b^d b);  the cubic g3 (b+b^d)^3
+                            has NO static part (it is added time-dependently).
+        The constant 3*g4 is dropped (global phase). The 12*g4 b^d b piece is a
+        small SNAIL-frequency renormalization, kept for fidelity.
+        """
         H0 = 0 * self.a[0]
         for i in range(self.N):
-            H0 += 0.5 * self.alpha[i] * (self.ad[i] * self.ad[i] * self.a[i] * self.a[i])
+            if i in self.snail_modes:
+                g4 = self.snail_modes[i].get("g4", 0.0)
+                if g4 != 0.0:
+                    b, bd = self.a[i], self.ad[i]
+                    H0 += g4 * (6 * (bd * bd * b * b) + 12 * (bd * b))
+            else:
+                H0 += 0.5 * self.alpha[i] * (self.ad[i] * self.ad[i] * self.a[i] * self.a[i])
         return H0
+
+    def _snail_self_terms(self) -> list:
+        r"""Rotating-frame time-dependent SNAIL self-Hamiltonian terms.
+
+        From the frame transform b -> b e^{-i w_s t}, the cubic/quartic split by
+        photon-number change Delta n, each band rotating at Delta n * w_s:
+
+          g3 (b+b^d)^3 :  T+1 e^{i w_s t} + T+3 e^{3i w_s t} + h.c.,
+                          T+1 = 3 b^d2 b + 3 b^d,   T+3 = b^d3
+          g4 (b+b^d)^4 :  (static, in H0) + Q+2 e^{2i w_s t} + Q+4 e^{4i w_s t} + h.c.,
+                          Q+2 = 4 b^d3 b + 6 b^d2,  Q+4 = b^d4
+
+        With snail_self_rwa=True (default) only the slowest, leading terms are
+        kept: the cubic T+1 (rotates at w_s) and the static g4 Kerr. The dropped
+        bands rotate at >= 2 w_s (~8-18 GHz here) and are far off-resonant, so
+        their leading effect is a small static shift already implicit at this
+        order. Keeping them (rwa=False) is exact but forces the integrator to
+        resolve up to 4 w_s, raising the step count several-fold.
+        """
+        terms = []
+        for s, nl in self.snail_modes.items():
+            g3 = nl.get("g3", 0.0)
+            g4 = nl.get("g4", 0.0)
+            ws = self.w[s]
+            b, bd = self.a[s], self.ad[s]
+            if g3 != 0.0:
+                T1 = 3 * (bd * bd * b) + 3 * bd          # Delta n = +1
+                terms += _rotating_pair(g3 * T1, ws)     # +/- w_s
+                if not self.snail_self_rwa:
+                    T3 = bd * bd * bd                    # Delta n = +3
+                    terms += _rotating_pair(g3 * T3, 3 * ws)
+            if g4 != 0.0 and not self.snail_self_rwa:
+                Q2 = 4 * (bd * bd * bd * b) + 6 * (bd * bd)   # Delta n = +2
+                Q4 = bd * bd * bd * bd                        # Delta n = +4
+                terms += _rotating_pair(g4 * Q2, 2 * ws)
+                terms += _rotating_pair(g4 * Q4, 4 * ws)
+        return terms
 
     # -- pump ---------------------------------------------------------------
     def set_pump(self, pump: PumpSpec) -> None:
-        """Attach the parametric pump and (optionally) normalize it to a full iSWAP."""
+        """Attach the parametric pump (a comb of tones) and normalize the m=1
+        tone to a full iSWAP."""
         p, q = pump.target_edge
         edge = self._find_edge(p, q)
         if edge is None or edge.eta == 0.0:
@@ -287,21 +350,27 @@ class SNAILProcessor:
         if pump.w_d is None:
             pump.w_d = self.delta(p, q)  # resonant drive of the p<->q exchange
 
+        tones = pump.resolved_tones()
+        # fundamental tone (mult ~ 1) amplitude sets the iSWAP normalization
+        fund = min(tones, key=lambda t: abs(t.mult - 1.0))
         if pump.normalize_iswap:
-            # need  integral g_eff dt = pi/2  with g_eff = eta_pq Omega/2
-            #   => integral Omega dt = pi / eta_pq
-            target_area = np.pi / edge.eta
+            if abs(fund.mult - 1.0) > 1e-9 or fund.amp == 0.0:
+                raise ValueError(
+                    "normalize_iswap needs a fundamental tone (mult=1, amp!=0)."
+                )
+            # resonant rate on target = eta_pq * amp_1 * Omega/2 -> area = pi/(eta amp_1)
+            target_area = np.pi / (edge.eta * fund.amp)
             current_area = pump.envelope.area()
             if current_area == 0.0:
                 raise ValueError("Envelope has zero area; cannot normalize.")
             pump.envelope.amp *= target_area / current_area
 
-        if pump.drag and (pump.delta_drag is None or pump.delta_drag == 0.0):
-            raise ValueError(
-                "DRAG enabled but delta_drag (spectator beat = Delta_rs - w_d) "
-                "is unset or zero. Set it to the detuning of the spectator edge "
-                "you intend to suppress."
-            )
+        for t in tones:
+            if t.drag and (t.delta_drag is None or t.delta_drag == 0.0):
+                raise ValueError(
+                    f"DRAG on tone mult={t.mult} needs a nonzero delta_drag "
+                    "(= Delta_rs - mult*w_d, the spectator beat to cancel)."
+                )
         self._pump = pump
 
     def _find_edge(self, i: int, j: int) -> Optional[Edge]:
@@ -312,19 +381,27 @@ class SNAILProcessor:
         return None
 
     def _pump_waveform(self) -> Callable[[float], float]:
-        """Return p(t) of Eq. (4). Variables bound by closure-safe default args."""
+        r"""Multi-tone comb p(t) = sum_m amp_m Omega cos(m w_d t)
+                            - sum_{m in drag} amp_m (Omega'/delta_m) sin(m w_d t).
+        Tone data bound via default args (closure-safe)."""
         if self._pump is None:
             return lambda t: 0.0
         env = self._pump.envelope
         w_d = self._pump.w_d
-        drag = self._pump.drag
-        dd = self._pump.delta_drag
+        tones = self._pump.resolved_tones()
+        # pre-extract to plain tuples so the closure captures immutables
+        spec = tuple((float(t.mult), float(t.amp), bool(t.drag),
+                      float(t.delta_drag) if t.delta_drag else 0.0) for t in tones)
 
-        def p(t, _env=env, _wd=w_d, _drag=drag, _dd=dd):
-            v = _env.value(t) * np.cos(_wd * t)
-            if _drag:
-                v -= (_env.deriv(t) / _dd) * np.sin(_wd * t)
-            return v
+        def p(t, _env=env, _wd=w_d, _spec=spec):
+            val = _env.value(t)
+            dval = _env.deriv(t)
+            out = 0.0
+            for (m, c, drag, dd) in _spec:
+                out += c * val * np.cos(m * _wd * t)
+                if drag:
+                    out -= c * (dval / dd) * np.sin(m * _wd * t)
+            return out
 
         return p
 
@@ -356,6 +433,9 @@ class SNAILProcessor:
             H.append([self.ad[e.i] * self.a[e.j], c_forward])
             H.append([self.ad[e.j] * self.a[e.i], c_backward])
 
+        # SNAIL cubic/quartic self-terms (time-dependent in the rotating frame)
+        H.extend(self._snail_self_terms())
+
         return H
 
     # -- dissipation (optional; for mesolve) --------------------------------
@@ -380,17 +460,29 @@ class SNAILProcessor:
     def collapse_operators(self) -> list:
         return list(self._c_ops)
 
-    # -- Fock index helpers -------------------------------------------------
+    # -- Fock index helpers (mixed-radix over per-mode dims) ----------------
     def fock_index(self, occupation: Sequence[int]) -> int:
-        """Flat index of a Fock state given per-transmon occupation."""
+        """Flat index of a Fock state given per-mode occupation."""
         if len(occupation) != self.N:
-            raise ValueError("occupation length must equal N.")
+            raise ValueError("occupation length must equal number of modes.")
         k = 0
-        for n in occupation:
-            if not (0 <= n < self.d):
+        for n, d in zip(occupation, self.dims):
+            if not (0 <= n < d):
                 raise ValueError("occupation out of range for given levels.")
-            k = k * self.d + n
+            k = k * d + n
         return k
+
+    def decode_index(self, k: int) -> list:
+        """Inverse of fock_index: flat index -> per-mode occupation list."""
+        occ = []
+        for d in reversed(self.dims):
+            k, r = divmod(k, d)
+            occ.append(r)
+        return occ[::-1]
+
+    def mean_occupation(self, probs: np.ndarray, mode: int) -> float:
+        """<n_mode> from a flat population vector (length D)."""
+        return float(sum(probs[k] * self.decode_index(k)[mode] for k in range(self.D)))
 
     def fock(self, occupation: Sequence[int]) -> qt.Qobj:
         psi = qt.basis(self.D, self.fock_index(occupation))
@@ -407,7 +499,7 @@ class SNAILProcessor:
         return qt.sesolve(H, psi0, tlist, options=opts)
 
     # -- gate metrics on the target pair ------------------------------------
-    def iswap_fidelity(self, tlist: np.ndarray, options=None):
+    def iswap_fidelity(self, tlist: np.ndarray, options=None, fit_virtual_z: bool = True):
         r"""Average gate fidelity vs. the ideal iSWAP on the target pair, with
         spectators initialized in |0>. Returns (F_avg, leakage, U_proj).
 
@@ -419,22 +511,27 @@ class SNAILProcessor:
             F_avg = ( |Tr(U_id^d U_proj)|^2 + Tr(U_proj^d U_proj) ) / ( d (d+1) ),  d = 4
             leakage = 1 - Tr(U_proj^d U_proj) / d
 
-        Z-frame note: a parametric beam-splitter realizes iSWAP up to single-qubit
-        Z rotations (AC-Stark/frame). We greedily fit those two virtual-Z phases
-        before scoring, since they are free in software (McKay et al., PRA 96,
-        022330 (2017)). Pass `fit_virtual_z=False` via the module if you want the
-        bare comparison.
+        Virtual-Z (fit_virtual_z=True, default): a parametric beam-splitter
+        realizes iSWAP only up to single-qubit Z rotations, because the rotating
+        frame accumulates deterministic per-qubit phases (AC-Stark / Lamb shift,
+        the pump-vs-transition frame offset, Bloch-Siegert). Those phases are
+        corrected for FREE in software by redefining the phase reference of
+        subsequent pulses (McKay et al., PRA 96, 022330 (2017)), so the physically
+        meaningful score is the fidelity to iSWAP modulo local Z. We therefore
+        right-multiply U_proj by diag(1, e^{i phi_q}, e^{i phi_p}, e^{i(phi_p+phi_q)})
+        and maximize over (phi_p, phi_q) before scoring. Set fit_virtual_z=False
+        to score the bare propagator (penalizes those calibratable phases).
+        Note: the Z fit only removes single-qubit *phase*; entangling-angle error,
+        population/swap error, and leakage are unaffected and still count.
         """
         if self._pump is None:
             raise RuntimeError("No pump set; nothing to characterize.")
         if self._c_ops:
             warnings.warn("iswap_fidelity uses unitary evolution; collapse ops ignored.")
         p, q = self._pump.target_edge
-        others = [k for k in range(self.N) if k not in (p, q)]
 
-        # computational basis of the pair, spectators in |0>
+        # computational basis of the pair, spectators (incl. any SNAIL) in |0>
         comp = [(0, 0), (0, 1), (1, 0), (1, 1)]
-        cols = []
         cols_idx = []
         for (bp, bq) in comp:
             occ = [0] * self.N
@@ -442,7 +539,7 @@ class SNAILProcessor:
             cols_idx.append(self.fock_index(occ))
 
         H = self.hamiltonian()
-        opts = _default_options()
+        opts = options or _default_options()
         U_proj = np.zeros((4, 4), dtype=complex)
         for col, idx in enumerate(cols_idx):
             psi0 = qt.basis(self.D, idx)
@@ -454,7 +551,7 @@ class SNAILProcessor:
 
         d = 4
         U_id = _ideal_iswap()
-        U_scored = _fit_virtual_z(U_proj, U_id)
+        U_scored = _fit_virtual_z(U_proj, U_id) if fit_virtual_z else U_proj
         overlap = np.abs(np.trace(U_id.conj().T @ U_scored)) ** 2
         trUU = np.real(np.trace(U_scored.conj().T @ U_scored))
         F_avg = (overlap + trUU) / (d * (d + 1))
@@ -465,10 +562,22 @@ class SNAILProcessor:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+def _rotating_pair(op_plus: "qt.Qobj", omega: float) -> list:
+    """Given a raising-type operator A (Delta n > 0) and its rotation rate omega,
+    return the QuTiP terms [A e^{i omega t}, A^d e^{-i omega t}] whose sum is
+    Hermitian. Coefficients bound via default args (closure-safe)."""
+    def c_up(t, args=None, _w=omega):
+        return np.exp(1j * _w * t)
+
+    def c_dn(t, args=None, _w=omega):
+        return np.exp(-1j * _w * t)
+
+    return [[op_plus, c_up], [op_plus.dag(), c_dn]]
+
+
 def _default_options():
     """High-accuracy solver options across QuTiP 4/5 (counter-rotating terms
-    demand tight tolerances).
-    """
+    demand tight tolerances)."""
     try:  # QuTiP 5
         return {"atol": 1e-11, "rtol": 1e-9, "nsteps": 200000, "max_step": 0.05}
     except Exception:  # pragma: no cover
@@ -476,7 +585,7 @@ def _default_options():
 
 
 def _ideal_iswap() -> np.ndarray:
-    """Ideal iSWAP in basis {|00>,|01>,|10>,|11>}."""
+    """iSWAP in basis {|00>,|01>,|10>,|11>}."""
     U = np.eye(4, dtype=complex)
     U[1, 1] = 0
     U[2, 2] = 0
@@ -487,19 +596,34 @@ def _ideal_iswap() -> np.ndarray:
 
 def _fit_virtual_z(U: np.ndarray, U_id: np.ndarray) -> np.ndarray:
     """Right-multiply by diag virtual-Z phases on each qubit to best match U_id.
-    Coarse 1-D phase grid per qubit (free single-qubit Z, McKay et al. 2017).
-    """
-    best = U
-    best_score = -1.0
-    grid = np.linspace(0, TWO_PI, 73, endpoint=False)
-    for pa in grid:
-        for pb in grid:
-            Z = np.diag([1, np.exp(1j * pb), np.exp(1j * pa), np.exp(1j * (pa + pb))])
-            cand = Z @ U
-            score = np.abs(np.trace(U_id.conj().T @ cand)) ** 2
-            if score > best_score:
-                best_score, best = score, cand
-    return best
+    Free single-qubit Z (McKay et al. 2017). Coarse grid then local refinement so
+    the recovered phase is not resolution-limited for high-fidelity gates."""
+    def Z(pa, pb):
+        return np.diag([1.0, np.exp(1j * pb), np.exp(1j * pa), np.exp(1j * (pa + pb))])
+
+    def score(pa, pb):
+        return np.abs(np.trace(U_id.conj().T @ (Z(pa, pb) @ U))) ** 2
+
+    best = (0.0, 0.0)
+    best_s = -1.0
+    coarse = np.linspace(0, TWO_PI, 48, endpoint=False)
+    for pa in coarse:
+        for pb in coarse:
+            s = score(pa, pb)
+            if s > best_s:
+                best_s, best = s, (pa, pb)
+    # local refinement around the coarse optimum
+    span = TWO_PI / 48
+    for _ in range(3):
+        fa = np.linspace(best[0] - span, best[0] + span, 21)
+        fb = np.linspace(best[1] - span, best[1] + span, 21)
+        for pa in fa:
+            for pb in fb:
+                s = score(pa, pb)
+                if s > best_s:
+                    best_s, best = s, (pa, pb)
+        span /= 10.0
+    return Z(*best) @ U
 
 
 # ===========================================================================
@@ -522,7 +646,7 @@ if __name__ == "__main__":
     w_d = proc.delta(0, 1)                 # = 2*pi*0.40 GHz
     delta_s = proc.delta(1, 2) - w_d       # spectator beat = 2*pi*(0.25-0.40) GHz
 
-    t_g = 12.0                              # ns (fast pulse: DRAG matters here)
+    t_g = 100.0                              # ns (fast pulse: DRAG matters here)
     tlist = np.linspace(0, t_g, 600)
 
     def run(drag):
@@ -550,3 +674,28 @@ if __name__ == "__main__":
         proc.set_pump(PumpSpec((0, 1), env, w_d=w_d, drag=drag, delta_drag=delta_s))
         F, leak, _ = proc.iswap_fidelity(tlist)
         print(f"  {'DRAG ON ' if drag else 'DRAG OFF'}:  F_avg(iSWAP) = {F:.4f}   leakage = {leak:.4f}")
+
+    # -----------------------------------------------------------------------
+    # Demo 2: explicit SNAIL (cubic g3, NOT a transmon Kerr) as a spectator,
+    # driven at the SECOND HARMONIC of a 2-tone pump comb. DRAG targets m=2.
+    # -----------------------------------------------------------------------
+    print("\nSNAIL + 2-tone comb (2nd-harmonic spectator):")
+    fs = np.array([5.00, 4.60, 3.95]) * GHz          # SNAIL near 2*w_d below qubit 1
+    anh2 = np.array([-0.20, -0.20, 0.00]) * GHz       # SNAIL slot anharmonicity unused
+    edges2 = [Edge(0, 1, eta=1.0), Edge(1, 2, eta=0.9)]
+    snail = {2: {"g3": 0.03 * GHz, "g4": 0.0}}        # cubic three-wave; no Duffing
+    procS = SNAILProcessor(fs, anh2, edges2, levels=[3, 3, 4],
+                           snail_modes=snail, snail_self_rwa=True)
+    w_d2 = procS.delta(0, 1)
+    beat2 = procS.delta(1, 2) - 2 * w_d2              # beat against the m=2 tone
+    comb = [PumpTone(1.0, 1.0), PumpTone(2.0, 0.5)]   # fundamental + 2nd harmonic
+    for drag in (False, True):
+        tones = [PumpTone(1.0, 1.0),
+                 PumpTone(2.0, 0.5, drag=drag, delta_drag=(beat2 if drag else None))]
+        procS.set_pump(PumpSpec((0, 1), RaisedCosine(amp=1.0, t_g=t_g),
+                                w_d=w_d2, tones=tones))
+        res = procS.evolve(procS.fock([1, 0, 0]), tlist)
+        pops = np.abs(res.states[-1].full().ravel()) ** 2
+        nS = procS.mean_occupation(pops, 2)
+        print(f"  {'DRAG ON ' if drag else 'DRAG OFF'} (m=2):  "
+              f"<n_snail> = {nS:.5f}   beat(m=2)/2pi = {beat2/GHz:+.3f} GHz")
