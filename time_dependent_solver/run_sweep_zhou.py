@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-r"""
-run_sweep_zhou.py
+r"""run_sweep_zhou.py.
 =================
 
 Batch driver for ``zhou_coupler.ZhouCoupler`` -- the dressed-mode (first-
@@ -66,7 +65,7 @@ Workflow (identical CLI shape to run_sweep.py)
 
 Modes 'prepare' and 'collect' do NOT import the solver; 'point'/'local' import
 ``zhou_coupler`` lazily.
-"""
+"""  # noqa: D205
 from __future__ import annotations
 
 # Pin BLAS/OpenMP to one thread BEFORE numpy is imported, so many single-point
@@ -111,10 +110,10 @@ DEFAULT_CONFIG = {
     "spec_levels_sub":   3,          # "qubit_sub" channel
     "anchor":            1,          # spectator freq measured below qubit b
     # pulse / solver
-    "t_g_ns":   60.0,
+    "t_g_ns":   500.0,
     "n_tlist":  240,
     "envelope": "raised_cosine",
-    "integrate": True,               # set False for the instant analytic map only
+    "integrate": False,               # set False for the instant analytic map only
     "rtol": 1e-7, "atol": 1e-9, "max_step": 0.05,
 }
 
@@ -421,6 +420,7 @@ def main():
                 res = fut.result()
                 save_point(res, args.outdir)
                 print(f"[{done}/{len(points)}] idx={res['index']:>4} "
+                      
                       f"drag={res['drag_applied']} beat={res['beat_GHz']:+.3f} "
                       f"g_spec={res['g_spec_eff_MHz']:.3f}MHz F={res['F_avg']}")
         print(f"Local sweep done: {len(points)} points in {time.time()-t0:.1f}s")

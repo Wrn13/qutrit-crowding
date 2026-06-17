@@ -1,5 +1,4 @@
-"""
-zhou_coupler.py
+"""zhou_coupler.py.
 ===============
 
 Charge-pumped parametric coupler in the dressed-mode framework of
@@ -55,22 +54,20 @@ Conventions
   >= 3 levels to keep it an oscillator/transmon (then leakage is captured).
 * The coupler S is kept as a dynamical mode (it can be virtually/really excited
   -- the qubit-coupler spectator channel is therefore automatic).
-
-This module is numpy/scipy only so it is self-contained and testable; call
-`to_qutip_hamiltonian()` for a QobjEvo that plugs into a QuTiP solver.
-"""
+"""  # noqa: D205
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Callable
+from envelope import Envelope, RaisedCosine, ConstantPulse, GaussianFlat
 
 import numpy as np
 from scipy.integrate import solve_ivp
 
-from envelope import Envelope, ConstantPulse, RaisedCosine, GaussianFlat
-
 TWO_PI = 2.0 * np.pi
+
 
 # ---------------------------------------------------------------------------
 # Pump tones
@@ -304,9 +301,11 @@ class ZhouCoupler:
     # -- the dressed flux and the Hamiltonian -------------------------------
     def dressed_flux(self, t: float) -> np.ndarray:
         r"""X(t) = s e^{-i w_s t} + sum_i lambda_is a_i e^{-i w_i t}
-                   + sum_p eta_p(t) e^{-i w_p t} + h.c.   (Hermitian)."""
-        X = (self.a[self.coupler] * np.exp(-1j * self.w[self.coupler] * t)
-             + self.ad[self.coupler] * np.exp(1j * self.w[self.coupler] * t))
+                   + sum_p eta_p(t) e^{-i w_p t} + h.c.   (Hermitian).
+        The coupler (lambda=1) is included in _static_components, so it is NOT
+        added separately here -- doing both would double-count it.
+        """  # noqa: D205
+        X = np.zeros((self.D, self.D), dtype=complex)
         for (op, freq, amp) in self._static_components:
             X = X + amp * op * np.exp(1j * freq * t)
         for tone in self._pumps:
@@ -330,6 +329,82 @@ class ZhouCoupler:
             H = H + g * powers[n]
         return H
 
+    # -- rotating-wave (average-Hamiltonian) reduction ---------------------
+    def rwa_terms(self, cutoff_GHz: float):
+        r"""Expand sum_n g_n X(t)^n into terms grouped by net carrier frequency
+        Omega = sum_i (+/- w_i) + sum_p (+/- w_p), KEEPING only |Omega| <= 2 pi
+        cutoff. Each retained group is (Omega, pump_signature, O) with a constant
+        operator O = sum over orderings of (prod lambda) * (operator product); the
+        pump amplitudes eta_p(t) are attached at evaluation time (so envelope and
+        DRAG are exact). Dropping |Omega| > cutoff removes the GHz carriers, so the
+        retained H_rwa(t) varies only on the slow beat + envelope timescale --
+        this is the controlled RWA / average-Hamiltonian reduction.
+
+        Returns a list of (Omega_float, pump_sig_tuple, O_matrix).
+        """  # noqa: D205
+        cut = abs(cutoff_GHz) * TWO_PI
+        # letters of X(t): (operator, signed_freq, const_amp, pump_key).
+        # signed_freq is chosen so the term's time factor exp(-i signed_freq t)
+        # matches dressed_flux: annihilation a_i ~ e^{-i w_i t} (so +w_i here),
+        # creation a_i^dag ~ e^{+i w_i t} (-w_i); pump eta ~ e^{-i w_p t} (+w_p),
+        # eta* ~ e^{+i w_p t} (-w_p).
+        letters = []
+        for i in range(self.N):
+            if self.lam[i] == 0.0:
+                continue
+            letters.append((self.a[i], +self.w[i], self.lam[i], None))
+            letters.append((self.ad[i], -self.w[i], self.lam[i], None))
+        for ti, tone in enumerate(self._pumps):
+            wp = tone.w_p_GHz * TWO_PI
+            letters.append((self.Id, +wp, 1.0, (ti, False)))   # eta  e^{-i wp t}
+            letters.append((self.Id, -wp, 1.0, (ti, True)))    # eta* e^{+i wp t}
+
+        groups: Dict[tuple, list] = {}   # key -> [O_accum, Omega_exact]
+        for n, g in self.gn.items():
+            for combo in itertools.product(letters, repeat=n):
+                Omega = 0.0
+                for c in combo:
+                    Omega += c[1]
+                if abs(Omega) > cut:
+                    continue
+                amp = 1.0
+                O = None
+                pump_sig = []
+                for (op, om, a, pk) in combo:
+                    amp *= a
+                    O = op if O is None else O @ op
+                    if pk is not None:
+                        pump_sig.append(pk)
+                key = (round(Omega, 6), tuple(sorted(pump_sig)))
+                contrib = (g * amp) * O
+                if key in groups:
+                    groups[key][0] = groups[key][0] + contrib
+                else:
+                    groups[key] = [contrib, Omega]   # keep the exact Omega
+        return [(val[1], key[1], val[0]) for key, val in groups.items()]
+
+    def _H_rwa(self, t: float, terms) -> np.ndarray:
+        H = np.zeros((self.D, self.D), dtype=complex)
+        # cache eta_p(t) per tone for this time
+        etas = [self._eta(tone, t) for tone in self._pumps]
+        for (Omega, pump_sig, O) in terms:
+            f = np.exp(-1j * Omega * t)
+            for (ti, conj) in pump_sig:
+                f *= np.conj(etas[ti]) if conj else etas[ti]
+            H = H + f * O
+        return H
+
+    def _solver_callable(self, method: str, rwa_cutoff_GHz: float):
+        """Return (H_of_t, suggested_max_step) for the chosen integration method."""
+        if method == "full":
+            return self.hamiltonian_matrix, np.inf
+        if method == "rwa":
+            terms = self.rwa_terms(rwa_cutoff_GHz)
+            # ~8 samples per period of the fastest retained oscillation
+            max_step = 0.125 / max(rwa_cutoff_GHz, 1e-6)
+            return (lambda t: self._H_rwa(t, terms)), max_step
+        raise ValueError(f"unknown method {method!r}; use 'full' or 'rwa'.")
+
     # -- analytic effective-rate estimator (Eq. 62) ------------------------
     def effective_rate(self, modes: Sequence[int], n: int,
                         C: Optional[int] = None, eta: Optional[float] = None) -> float:
@@ -337,7 +412,8 @@ class ZhouCoupler:
         `modes` lists the participating non-coupler modes (with multiplicity);
         k = n - len(modes) is the number of pump quanta. Pass C explicitly for
         non-standard processes; default uses the multinomial count for distinct
-        single-mode + pump factors."""
+        single-mode + pump factors.
+        """  # noqa: D205
         gn = self.gn.get(n)
         if gn is None:
             raise ValueError(f"no g_{n} defined.")
@@ -364,17 +440,29 @@ class ZhouCoupler:
         return abs(self._eta(tone, tone.envelope.t_g / 2.0))
 
     # -- evolution (dense scipy; no QuTiP needed) ---------------------------
-    def evolve(self, psi0: np.ndarray, t_span, rtol=1e-9, atol=1e-11, max_step=np.inf):
-        sol = solve_ivp(lambda t, y: -1j * (self.hamiltonian_matrix(t) @ y),
+    def evolve(self, psi0: np.ndarray, t_span, method="full", rwa_cutoff_GHz=0.75,
+               rtol=1e-9, atol=1e-11, max_step=np.inf):
+        H_of_t, ms = self._solver_callable(method, rwa_cutoff_GHz)
+        if max_step is np.inf:
+            max_step = ms
+        sol = solve_ivp(lambda t, y: -1j * (H_of_t(t) @ y),
                         (float(t_span[0]), float(t_span[-1])), psi0,
                         t_eval=t_span, rtol=rtol, atol=atol, max_step=max_step,
                         method="RK45")
         return sol
 
-    def propagator_columns(self, a: int, b: int, t_g: float,
-                           rtol=1e-9, atol=1e-11, max_step=np.inf) -> np.ndarray:
+    def propagator_columns(self, a: int, b: int, t_g: float, method="full",
+                           rwa_cutoff_GHz=0.75, rtol=1e-9, atol=1e-11,
+                           max_step=np.inf) -> np.ndarray:
         """4x4 projection of the realized propagator onto the (a,b) computational
-        subspace, all other modes initialized in |0> (Pedersen/Wood convention)."""
+        subspace, all other modes initialized in |0> (Pedersen/Wood convention).
+        method='full' integrates the exact g_n X(t)^n; method='rwa' integrates the
+        rotating-wave-reduced Hamiltonian (far cheaper for realistic frequencies).
+        The RWA term list is built ONCE and reused across the four columns.
+        """  # noqa: D205
+        H_of_t, ms = self._solver_callable(method, rwa_cutoff_GHz)
+        if max_step is np.inf:
+            max_step = ms
         comp = [(0, 0), (0, 1), (1, 0), (1, 1)]
         idx = []
         for (ba, bb) in comp:
@@ -385,7 +473,7 @@ class ZhouCoupler:
         for col, k0 in enumerate(idx):
             psi0 = np.zeros(self.D, dtype=complex)
             psi0[k0] = 1.0
-            sol = solve_ivp(lambda t, y: -1j * (self.hamiltonian_matrix(t) @ y),
+            sol = solve_ivp(lambda t, y: -1j * (H_of_t(t) @ y),
                             (0.0, t_g), psi0, rtol=rtol, atol=atol,
                             max_step=max_step, method="RK45")
             psif = sol.y[:, -1]
@@ -394,11 +482,14 @@ class ZhouCoupler:
         return U
 
     def iswap_fidelity(self, a: int, b: int, t_g: float, fit_virtual_z: bool = True,
-                       **kw):
+                       method="full", rwa_cutoff_GHz=0.75, **kw):
         """Average gate fidelity vs ideal iSWAP on (a,b), leakage-aware
         (Pedersen PLA 367, 47 (2007); Wood & Gambetta PRA 97, 032306 (2018)),
-        single-qubit virtual-Z fitted out by default."""
-        U_proj = self.propagator_columns(a, b, t_g, **kw)
+        single-qubit virtual-Z fitted out by default. Pass method='rwa' for the
+        fast rotating-wave solver.
+        """  # noqa: D205
+        U_proj = self.propagator_columns(a, b, t_g, method=method,
+                                         rwa_cutoff_GHz=rwa_cutoff_GHz, **kw)
         d = 4
         U_id = _ideal_iswap()
         U_s = _fit_virtual_z(U_proj, U_id) if fit_virtual_z else U_proj
@@ -408,21 +499,102 @@ class ZhouCoupler:
         leak = 1.0 - trUU / d
         return float(F), float(leak), U_proj
 
-    # -- QuTiP export (lazy import; plugs into existing solver tooling) -----
-    def to_qutip_hamiltonian(self):
-        """Return a QuTiP QobjEvo H(t) = sum_n g_n X(t)^n for use with QuTiP
-        solvers. Imported lazily so this module has no hard QuTiP dependency."""
+    # -- QuTiP export: exact, full-Hamiltonian, FAST (sparse list form) -----
+    def to_qutip_hamiltonian(self, cutoff_GHz: float = np.inf, sparse: bool = True):
+        r"""sum_n g_n X(t)^n as a QuTiP list-format QobjEvo  [[O_j, c_j(t)], ...],
+        with CONSTANT operators O_j (sparse CSR by default) and scalar coefficients
+        c_j(t) = exp(-i Omega_j t) * prod_p eta_p(t)^(...). The g_n and participation
+        factors are baked into O_j.
+
+        Because the operators are built ONCE, QuTiP's compiled solver does sparse
+        matrix-vector products each step instead of rebuilding the dense X^n -- this
+        is the fast path, and with cutoff_GHz=inf (the default) it prunes NOTHING:
+        sum_j c_j(t) O_j reproduces hamiltonian_matrix(t) exactly. Pass a finite
+        cutoff only if you deliberately want the RWA-reduced model.
+
+        Feed the result to qt.sesolve for the closed-system gate, or to qt.mesolve
+        with collapse operators (T1/T2, coupler loss) for a hardware-faithful
+        open-system run -- the latter is what 'running on hardware' actually adds
+        on top of Zhou's unitary Hamiltonian.
+        """  # noqa: D205
         import qutip as qt
+        import cmath
+        import scipy.sparse as sp
 
         dims = [self.dims, self.dims]
+        pumps = list(self._pumps)
 
-        def H_func(t, args=None):
-            return qt.Qobj(self.hamiltonian_matrix(t), dims=dims)
+        def make_coeff(Om, sig):
+            def c(t, args=None):
+                val = cmath.exp(-1j * Om * t)
+                for (ti, conj) in sig:
+                    e = self._eta(pumps[ti], t)
+                    val = val * (e.conjugate() if conj else e)
+                return val
+            return c
 
+        H = []
+        for (Omega, pump_sig, O) in self.rwa_terms(cutoff_GHz):
+            mat = sp.csr_matrix(O) if sparse else np.asarray(O, dtype=complex)
+            Oq = qt.Qobj(mat, dims=dims)
+            if abs(Omega) < 1e-9 and not pump_sig:
+                H.append(Oq)                         # genuinely static term
+            else:
+                H.append([Oq, make_coeff(float(Omega), tuple(pump_sig))])
         try:
-            return qt.QobjEvo(H_func)          # QuTiP 5 accepts a callable
+            return qt.QobjEvo(H)
         except Exception:
-            return H_func                       # QuTiP 4: pass callable as H
+            return H                                  # QuTiP 4: pass list to solver
+
+    def iswap_fidelity_qutip(self, a: int, b: int, t_g: float,
+                             fit_virtual_z: bool = True,
+                             atol: float = 1e-10, rtol: float = 1e-8,
+                             nsteps: int = 500000):
+        """Leakage-aware iSWAP fidelity on (a,b) via QuTiP's compiled sesolve on the
+        EXACT full Hamiltonian (no term pruning). Mirrors iswap_fidelity's metric.
+        NOT exercised in this build sandbox (QuTiP is not installed here) -- run on
+        a QuTiP node and cross-check one point against iswap_fidelity(method='full').
+
+        Open-system ('what hardware achieves'): build collapse operators with the
+        embedded ladder ops (e.g. sqrt(1/T1)*qt.Qobj(self.a[i]) for relaxation,
+        sqrt(1/(2*Tphi))*qt.Qobj(2*self.ad[i]@self.a[i]) for dephasing), propagate
+        the SUPEROPERATOR with U = qt.propagator(self.to_qutip_hamiltonian(),
+        [0, t_g], c_ops=...), restrict to the computational subspace, and use
+        qt.average_gate_fidelity. Do not feed mesolve density matrices into the
+        state-vector path below -- that conflates rho with psi.
+        """  # noqa: D205
+        import qutip as qt
+
+        H = self.to_qutip_hamiltonian()
+        try:
+            opts = qt.Options(atol=atol, rtol=rtol, nsteps=nsteps)   # QuTiP 4
+        except AttributeError:
+            opts = {"atol": atol, "rtol": rtol, "nsteps": nsteps}    # QuTiP 5 dict
+
+        comp = [(0, 0), (0, 1), (1, 0), (1, 1)]
+        idx = []
+        for (ba, bb) in comp:
+            occ = [0] * self.N
+            occ[a], occ[b] = ba, bb
+            idx.append(self.fock_index(occ))
+
+        U = np.zeros((4, 4), dtype=complex)
+        for col, k0 in enumerate(idx):
+            arr = np.zeros(self.D, dtype=complex); arr[k0] = 1.0
+            psi0 = qt.Qobj(arr.reshape(-1, 1), dims=[self.dims, [1] * self.N])
+            res = qt.sesolve(H, psi0, [0.0, t_g], options=opts)
+            psif = res.states[-1].full().ravel()
+            for row, kr in enumerate(idx):
+                U[row, col] = psif[kr]
+
+        d = 4
+        U_id = _ideal_iswap()
+        U_s = _fit_virtual_z(U, U_id) if fit_virtual_z else U
+        overlap = np.abs(np.trace(U_id.conj().T @ U_s)) ** 2
+        trUU = np.real(np.trace(U_s.conj().T @ U_s))
+        F = (overlap + trUU) / (d * (d + 1))
+        leak = 1.0 - trUU / d
+        return float(F), float(leak), U
 
 
 # ---------------------------------------------------------------------------

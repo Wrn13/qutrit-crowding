@@ -171,7 +171,7 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
             prefactors[key],
             spectator_term,
         )
-        infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
+        #infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
 
     # Compute for SNAIL-based spectators
     for key in spectator_ops_snail:
@@ -183,7 +183,7 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
             prefactors[key],
             spectator_term,
         )
-        infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
+        #infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
 
     return infidelity_params, fidelity_results
 
