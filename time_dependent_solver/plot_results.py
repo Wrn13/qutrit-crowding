@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-r"""
-plot_results.py
+r"""plot_results.py.
 ===============
 
 Read a sweep result directory (``summary.csv`` + ``combined.npz`` produced by
@@ -30,13 +29,13 @@ Usage
     python plot_results.py --outdir results_zhou/ --figdir figs/ --usetex
     # one figure only:
     python plot_results.py --outdir results_zhou/ --only heatmap --metric leakage
-"""
+"""  # noqa: D205
 from __future__ import annotations
 
 import argparse
 import csv
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import matplotlib as mpl
@@ -61,8 +60,19 @@ _BOOL_COLS = {"drag", "drag_applied"}
 # Style
 # ---------------------------------------------------------------------------
 def set_literature_style(usetex: bool = False) -> None:
-    """Tight, paper-style Matplotlib defaults: inward minor ticks on all spines,
-    Computer-Modern math, hairline axes."""
+    """Apply tight, paper-style Matplotlib rcParams: inward minor ticks on all
+    spines, Computer-Modern math, hairline axes, constrained layout.
+
+    Parameters
+    ----------
+    usetex : bool, default False
+        If True, render text with a system LaTeX install (requires TeX +
+        amsmath); otherwise mathtext is used and no LaTeX is needed.
+
+    Returns:
+    -------
+    None
+    """  # noqa: D205
     mpl.rcParams.update({
         "figure.dpi": 130, "savefig.dpi": 600, "savefig.bbox": "tight",
         "font.size": 9, "font.family": "sans-serif",
@@ -98,8 +108,20 @@ def _panel_label(ax, text: str) -> None:
 # Data loading
 # ---------------------------------------------------------------------------
 def load_summary(outdir: str) -> Dict[str, np.ndarray]:
-    """Parse <outdir>/summary.csv into column arrays. Empty cells -> NaN
-    (floats) so analytic-only rows coexist with full rows."""
+    """Parse ``<outdir>/summary.csv`` into column arrays.
+
+    Parameters
+    ----------
+    outdir : str
+        Sweep directory containing summary.csv.
+
+    Returns:
+    -------
+    dict[str, ndarray]
+        One array per column. Numeric columns are floats with empty cells -> NaN
+        (so analytic-only rows coexist with full rows), boolean columns are bool,
+        and the rest are object (string) arrays.
+    """
     path = os.path.join(outdir, "summary.csv")
     with open(path, newline="") as f:
         rows = list(csv.DictReader(f))
@@ -121,7 +143,18 @@ def load_summary(outdir: str) -> Dict[str, np.ndarray]:
 
 
 def series_column(data: Dict[str, np.ndarray]) -> str:
-    """Name of the swept series variable: 'lam_spec' (Zhou) or 'eta' (effective)."""
+    """Return the name of the swept series variable.
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns.
+
+    Returns:
+    -------
+    str
+        'lam_spec' (Zhou driver) or 'eta' (effective-model driver).
+    """
     if "lam_spec" in data:
         return "lam_spec"
     if "eta" in data:
@@ -130,6 +163,18 @@ def series_column(data: Dict[str, np.ndarray]) -> str:
 
 
 def has_full_metrics(data: Dict[str, np.ndarray]) -> bool:
+    """Whether the sweep contains integrated results.
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns.
+
+    Returns:
+    -------
+    bool
+        True if an ``F_avg`` column with at least one finite value is present.
+    """
     return "F_avg" in data and np.isfinite(data["F_avg"]).any()
 
 
@@ -146,7 +191,24 @@ def _resonance_GHz(data: Dict[str, np.ndarray]) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Figure 1: infidelity vs spectator frequency
 # ---------------------------------------------------------------------------
-def fig_infidelity_vs_frequency(data, figsize=None):
+def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
+                                figsize: Optional[Tuple[float, float]] = None) -> "plt.Figure":
+    """Figure 1: gate infidelity 1 - F vs spectator frequency (log-y), one panel
+    per channel, DRAG off (dashed/open) vs on (solid/filled), coloured by the
+    swept participation.
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns; must contain finite ``F_avg``.
+    figsize : tuple(float, float), optional
+        Figure size in inches; a channel-count-dependent default is used if None.
+
+    Returns:
+    -------
+    matplotlib.figure.Figure
+        The assembled figure.
+    """  # noqa: D205
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     lams = sorted(np.unique(data[scol]))
@@ -207,7 +269,24 @@ def fig_infidelity_vs_frequency(data, figsize=None):
 # ---------------------------------------------------------------------------
 # Figure 2: leakage / occupation vs spectator frequency
 # ---------------------------------------------------------------------------
-def fig_leakage_vs_frequency(data, figsize=None):
+def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
+                             figsize: Optional[Tuple[float, float]] = None) -> "plt.Figure":
+    """Figure 2: leakage and spectator/coupler occupation vs spectator frequency
+    (log-y), for the largest swept participation, DRAG off vs on.
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns; uses whichever of leakage / n_spec / n_coupler
+        are present and finite.
+    figsize : tuple(float, float), optional
+        Figure size in inches; a channel-count-dependent default is used if None.
+
+    Returns:
+    -------
+    matplotlib.figure.Figure
+        The assembled figure.
+    """  # noqa: D205
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     # one representative participation (largest) keeps the panel readable
@@ -275,7 +354,26 @@ def _edges(c):
     return np.concatenate([[c[0] - (mid[0] - c[0])], mid, [c[-1] + (c[-1] - mid[-1])]])
 
 
-def fig_collision_heatmap(data, metric="F_avg", figsize=None):
+def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
+                          figsize: Optional[Tuple[float, float]] = None) -> "plt.Figure":
+    """Figure 3: 2D collision map of a metric over (spectator frequency,
+    participation), one panel per (channel, DRAG) with a shared colour scale.
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns.
+    metric : str, default "F_avg"
+        Column to map. "F_avg" is shown as log10(1 - F); any other column is shown
+        as log10(metric).
+    figsize : tuple(float, float), optional
+        Figure size in inches; a panel-count-dependent default is used if None.
+
+    Returns:
+    -------
+    matplotlib.figure.Figure
+        The assembled figure.
+    """  # noqa: D205
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     drags = [d for d in (False, True) if (data["drag"] == d).any()]
@@ -322,7 +420,24 @@ def fig_collision_heatmap(data, metric="F_avg", figsize=None):
 # ---------------------------------------------------------------------------
 # Figure 4: analytic collision predictor (works for analytic-only sweeps)
 # ---------------------------------------------------------------------------
-def fig_analytic_map(data, figsize=None):
+def fig_analytic_map(data: Dict[str, np.ndarray],
+                     figsize: Optional[Tuple[float, float]] = None) -> Optional["plt.Figure"]:
+    """Figure 4: analytic collision predictor -- the Eq.-62 exchange rate
+    g_spec_eff and the "danger ratio" g_spec/|beat| vs spectator frequency.
+    Available even for an analytic-only sweep (``--no-integrate``).
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns; requires ``g_spec_eff_MHz``.
+    figsize : tuple(float, float), optional
+        Figure size in inches; default (7.2, 3.0) if None.
+
+    Returns:
+    -------
+    matplotlib.figure.Figure or None
+        The figure, or None if the analytic rate column is absent.
+    """  # noqa: D205
     scol = series_column(data)
     if "g_spec_eff_MHz" not in data:
         return None
@@ -374,7 +489,12 @@ def _save(fig, figdir, name, fmts):
     return paths
 
 
-def main():
+def main() -> None:
+    """Command-line entry point: load a sweep directory and render the applicable
+    figures. A full sweep yields Figs 1-4; an analytic-only sweep yields Fig 4.
+    Run ``--help`` for the option list (``--outdir``, ``--figdir``, ``--only``,
+    ``--metric``, ``--format``, ``--usetex``).
+    """  # noqa: D205
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--outdir", required=True, help="sweep result dir (has summary.csv)")

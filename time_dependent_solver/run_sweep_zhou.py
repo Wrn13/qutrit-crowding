@@ -48,13 +48,19 @@ Two metrics per point
 * ANALYTIC (always, free -- no integration): nearest collision order m, its beat
   detuning, and the Eq.-62 effective rate g_spec_eff together with the target
   rate g_iswap_eff. This alone is the frequency-allocation collision map.
-* FULL (config ``integrate=true``, default): integrate the dressed-mode
-  Hamiltonian g_n X(t)^n and report the leakage-aware iSWAP fidelity on (a,b)
-  plus the spectator and coupler occupations. This is the non-perturbative check
-  and is EXPENSIVE -- the dense, fast-oscillating X^n forces small steps and the
-  Hilbert space is d_a*d_b*d_S*d_spec. For broad first passes set
-  ``integrate=false`` (or --no-integrate) and read the analytic map; reserve full
-  integration for a handful of flagged points, ideally as a SLURM array.
+* FULL (config ``integrate=true``, default): evolve the EXACT dressed-mode
+  Hamiltonian sum_n g_n X(t)^n with QuTiP's compiled solver and report the
+  leakage-aware iSWAP fidelity on (a,b) plus the spectator and coupler
+  occupations. For broad first passes set ``integrate=false`` (or
+  --no-integrate) for the instant analytic map.
+
+Solver
+------
+Time evolution uses QuTiP exclusively: ``zhou_coupler`` builds the exact
+Hamiltonian as a sparse list-format QobjEvo (no terms pruned) and drives it
+through ``qt.sesolve``. QuTiP must therefore be importable wherever
+``integrate`` is True; the analytic ``--no-integrate`` path needs only
+numpy/scipy. Tune the integrator with ``rtol``/``atol`` and ``nsteps``.
 
 Workflow (identical CLI shape to run_sweep.py)
 ----------------------------------------------
@@ -82,7 +88,7 @@ import json
 import sys
 import time
 from dataclasses import asdict, dataclass
-from typing import List
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -98,23 +104,23 @@ DEFAULT_CONFIG = {
     # target qubits a, b
     "qubit_freqs_GHz": [5.00, 4.60],
     "qubit_levels":    3,            # >=3 so target-pair leakage is captured
-    "lam_a":           0.08,         # participation lambda_as = g_as/Delta_as
-    "lam_b":           0.08,         # participation lambda_bs = g_bs/Delta_bs
+    "lam_a":           0.20,         # participation lambda_as = g_as/Delta_as
+    "lam_b":           0.20,         # participation lambda_bs = g_bs/Delta_bs
     # coupler S (the SNAIL)
     "coupler_freq_GHz": 7.00,
     "coupler_levels":   5,
-    "g3_GHz":           0.06,        # measured cubic (engine of every process)
+    "g3_GHz":           0.10,        # measured cubic (engine of every process)
     "g4_GHz":           0.0,         # optional quartic (four-wave mixing)
     # spectator mode
     "spec_levels_qubit": 2,          # "qubit_qubit" channel
     "spec_levels_sub":   3,          # "qubit_sub" channel
     "anchor":            1,          # spectator freq measured below qubit b
     # pulse / solver
-    "t_g_ns":   500.0,
-    "n_tlist":  240,
+    "t_g_ns":   60.0,
     "envelope": "raised_cosine",
-    "integrate": False,               # set False for the instant analytic map only
-    "rtol": 1e-7, "atol": 1e-9, "max_step": 0.05,
+    "integrate": True,               # set False for the instant analytic map only
+    "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
+    "nsteps": 500000,                # max internal solver steps between outputs
 }
 
 # Default sweep axes (override with --channels/--specfreqs/--lams).
@@ -128,6 +134,22 @@ DEFAULT_DRAGS = [False, True]
 
 @dataclass
 class Point:
+    """One sweep point (a single coupler configuration to simulate).
+
+    Attributes:
+    ----------
+    index : int
+        Position in the grid; also the output filename suffix.
+    channel : str
+        Spectator channel, "qubit_qubit" or "qubit_sub".
+    spec_freq_GHz : float
+        Spectator transition frequency Delta = w_b - w_spec (GHz).
+    lam_spec : float
+        Spectator participation lambda_spec = g_spec,s / Delta_spec,s.
+    drag : bool
+        Whether the first-order DRAG quadrature is requested for this point.
+    """
+
     index: int
     channel: str
     spec_freq_GHz: float    # Delta = w_b - w_spec
@@ -138,22 +160,58 @@ class Point:
 # ---------------------------------------------------------------------------
 # Grid construction (deterministic, solver-free)
 # ---------------------------------------------------------------------------
-def build_grid(channels, specfreqs, lams, drags) -> List[Point]:
-    """Cartesian product, stable order: channel -> spec_freq -> lam_spec -> drag."""
-    pts, k = [], 0
-    for ch in channels:
-        if ch not in _CHANNELS:
-            raise ValueError(f"unknown channel {ch!r}; choose from {_CHANNELS}")
-        for sf in specfreqs:
+def build_grid(channels: Sequence[str], specfreqs: Sequence[float],
+               lams: Sequence[float], drags: Sequence[bool]) -> List[Point]:
+    """Build the Cartesian sweep grid in a stable order.
+
+    Parameters
+    ----------
+    channels : sequence of str
+        Spectator channels; each must be one of ("qubit_qubit", "qubit_sub").
+    specfreqs : sequence of float
+        Spectator frequencies Delta = w_b - w_spec (GHz).
+    lams : sequence of float
+        Spectator participations lambda_spec.
+    drags : sequence of bool
+        DRAG on/off settings.
+
+    Returns:
+    -------
+    list of Point
+        Points ordered channel -> spec_freq -> lam_spec -> drag, indexed 0..M-1.
+    """
+    points: List[Point] = []
+    index = 0
+    for channel in channels:
+        if channel not in _CHANNELS:
+            raise ValueError(f"unknown channel {channel!r}; choose from {_CHANNELS}")
+        for spec_freq in specfreqs:
             for lam in lams:
-                for g in drags:
-                    pts.append(Point(index=k, channel=ch, spec_freq_GHz=float(sf),
-                                     lam_spec=float(lam), drag=bool(g)))
-                    k += 1
-    return pts
+                for drag in drags:
+                    points.append(Point(index=index, channel=channel,
+                                        spec_freq_GHz=float(spec_freq),
+                                        lam_spec=float(lam), drag=bool(drag)))
+                    index += 1
+    return points
 
 
-def write_grid(outdir, config, points: List[Point]) -> str:
+def write_grid(outdir: str, config: Dict[str, Any], points: List[Point]) -> str:
+    """Write the grid and resolved config to ``<outdir>/grid.json``.
+
+    Parameters
+    ----------
+    outdir : str
+        Output directory; a ``points/`` subdirectory is created.
+    config : dict
+        The resolved device/simulation configuration to persist.
+    points : list of Point
+        The grid to serialise.
+
+    Returns:
+    -------
+    str
+        Path to the written grid.json.
+    """
     os.makedirs(os.path.join(outdir, "points"), exist_ok=True)
     path = os.path.join(outdir, "grid.json")
     with open(path, "w") as f:
@@ -162,7 +220,19 @@ def write_grid(outdir, config, points: List[Point]) -> str:
     return path
 
 
-def load_grid(outdir):
+def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
+    """Load the config and points from ``<outdir>/grid.json``.
+
+    Parameters
+    ----------
+    outdir : str
+        Directory containing grid.json.
+
+    Returns:
+    -------
+    (dict, list of Point)
+        The persisted config and the reconstructed points.
+    """
     with open(os.path.join(outdir, "grid.json")) as f:
         blob = json.load(f)
     return blob["config"], [Point(**p) for p in blob["points"]]
@@ -171,9 +241,25 @@ def load_grid(outdir):
 # ---------------------------------------------------------------------------
 # Single-point computation (imports zhou_coupler lazily)
 # ---------------------------------------------------------------------------
-def run_point(pt: Point, config: dict) -> dict:
-    from zhou_coupler import ZhouCoupler, PumpTone
-    from envelope import ConstantPulse, RaisedCosine
+def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute one sweep point: the analytic collision prediction always, and the
+    full QuTiP gate simulation when ``config['integrate']`` is True.
+
+    Parameters
+    ----------
+    pt : Point
+        The grid point (channel, spectator frequency, participation, DRAG flag).
+    config : dict
+        Resolved device/simulation configuration (see DEFAULT_CONFIG). Imports
+        ``zhou_coupler`` (and, for the full path, QuTiP) lazily.
+
+    Returns:
+    -------
+    dict
+        Result row with analytic fields (beat, eta_peak, effective rates, ...) and,
+        if integrated, F_avg / leakage / occupations / the 4x4 ``U_proj``.
+    """  # noqa: D205
+    from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse
 
     t0 = time.time()
     a, b, coupler, spec = 0, 1, 2, 3
@@ -261,16 +347,14 @@ def run_point(pt: Point, config: dict) -> dict:
         out["wall_s"] = time.time() - t0
         return out
 
-    # --- FULL non-perturbative integration ---------------------------------
+    # --- FULL non-perturbative evolution (QuTiP, exact Hamiltonian) -------
     t_g = float(config["t_g_ns"])
-    solver = dict(rtol=float(config["rtol"]), atol=float(config["atol"]),
-                  max_step=float(config["max_step"]))
+    solver = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
+                  nsteps=int(config.get("nsteps", 500000)))
 
-    # (a) spectator diagnostic: excite qubit a, watch where population goes.
+    # (a) spectator diagnostic: excite qubit a, see where population ends up.
     occ0 = [0, 0, 0, 0]; occ0[a] = 1
-    tlist = np.linspace(0.0, t_g, int(config["n_tlist"]))
-    sol = cpl.evolve(cpl.basis_state(occ0), tlist, **solver)
-    pops = np.abs(sol.y[:, -1]) ** 2
+    pops = np.abs(cpl.evolve_state(occ0, t_g, **solver)) ** 2
     occ_b = [0, 0, 0, 0]; occ_b[b] = 1
     out["n_spec"] = float(cpl.mean_occupation(pops, spec))
     out["n_coupler"] = float(cpl.mean_occupation(pops, coupler))
@@ -287,7 +371,22 @@ def run_point(pt: Point, config: dict) -> dict:
     return out
 
 
-def save_point(result: dict, outdir: str):
+def save_point(result: Dict[str, Any], outdir: str) -> str:
+    """Persist one result row to ``<outdir>/points/point_XXXXX.npz``.
+
+    Parameters
+    ----------
+    result : dict
+        A row from `run_point`; its ``U_proj`` (if any) is stored separately and
+        the remaining scalar metadata is JSON-encoded.
+    outdir : str
+        Output directory (its ``points/`` subdirectory must exist).
+
+    Returns:
+    -------
+    str
+        Path to the written .npz file.
+    """
     path = os.path.join(outdir, "points", f"point_{result['index']:05d}.npz")
     U = result.pop("U_proj", None)
     if U is None:
@@ -301,7 +400,20 @@ def save_point(result: dict, outdir: str):
 # ---------------------------------------------------------------------------
 # Collection -> summary.csv + combined.npz
 # ---------------------------------------------------------------------------
-def collect(outdir: str):
+def collect(outdir: str) -> None:
+    """Gather all per-point .npz files into ``summary.csv`` and ``combined.npz``.
+
+    Parameters
+    ----------
+    outdir : str
+        Sweep directory containing ``points/point_*.npz``.
+
+    Returns:
+    -------
+    None
+        Writes ``<outdir>/summary.csv`` (one row per point, sorted by index) and
+        ``<outdir>/combined.npz`` (stacked 4x4 propagators).
+    """
     files = sorted(glob.glob(os.path.join(outdir, "points", "point_*.npz")))
     if not files:
         print("No point_*.npz found; nothing to collect.", file=sys.stderr)
@@ -334,18 +446,51 @@ def collect(outdir: str):
 # ---------------------------------------------------------------------------
 # Modes / CLI
 # ---------------------------------------------------------------------------
-def _parse_list(s, cast):
+def _parse_list(s: Optional[str], cast: Callable[[str], Any]) -> Optional[List[Any]]:
+    """Parse a comma-separated CLI string into a list via `cast`, or None if empty.
+
+    Parameters
+    ----------
+    s : str or None
+        Raw comma-separated argument (e.g. "0.2,0.25,0.3").
+    cast : callable
+        Element constructor (e.g. float, str).
+
+    Returns:
+    -------
+    list or None
+        The parsed list, or None when `s` is falsy (use the caller's default).
+    """
     return [cast(x) for x in s.split(",")] if s else None
 
 
-def _bool_list(s):
+def _bool_list(s: Optional[str]) -> Optional[List[bool]]:
+    """Parse a comma-separated string of booleans (e.g. "false,true").
+
+    Parameters
+    ----------
+    s : str or None
+        Raw argument; tokens in {1,true,t,yes,on} (case-insensitive) are True.
+
+    Returns:
+    -------
+    list of bool or None
+        The parsed flags, or None when `s` is falsy.
+    """
     if not s:
         return None
     return [tok.strip().lower() in ("1", "true", "t", "yes", "on")
             for tok in s.split(",")]
 
 
-def main():
+def main() -> None:
+    """Command-line entry point.
+
+    Subcommands: ``prepare`` (write grid.json), ``point`` (run one --index),
+    ``local`` (run the whole grid with a process pool, then collect), and
+    ``collect`` (gather points into summary.csv / combined.npz). Run
+    ``--help`` for the full option list.
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("mode", choices=["prepare", "point", "local", "collect"])
@@ -420,7 +565,6 @@ def main():
                 res = fut.result()
                 save_point(res, args.outdir)
                 print(f"[{done}/{len(points)}] idx={res['index']:>4} "
-                      
                       f"drag={res['drag_applied']} beat={res['beat_GHz']:+.3f} "
                       f"g_spec={res['g_spec_eff_MHz']:.3f}MHz F={res['F_avg']}")
         print(f"Local sweep done: {len(points)} points in {time.time()-t0:.1f}s")
