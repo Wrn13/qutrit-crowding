@@ -6,6 +6,7 @@ from typing import Callable
 import numpy as np
 # numpy>=2 renamed trapz -> trapezoid; fall back only if needed (trapz is gone in 2.x).
 _trapezoid: Callable[..., float] = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+TWO_PI = 2.0 * np.pi
 
 class Envelope:
     """Base class for a real pump-amplitude envelope eps(t) on [0, t_g].
