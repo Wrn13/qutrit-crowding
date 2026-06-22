@@ -845,12 +845,21 @@ class ZhouCoupler:
     def _sesolve_final(self, H: Any, start_index: int, t_g: float,
                        options: Any) -> np.ndarray:
         """Closed-system evolve a single computational-basis ket to t_g and return
-        the final state vector (numpy)."""
+        the final state vector (numpy).
+
+        The interval [0, t_g] is subdivided into ~5 ns chunks so the solver's
+        per-interval internal-step cap (nsteps) is not exhausted on long or stiff
+        gates -- otherwise zvode raises "Excess work done on this call". Output
+        spacing does not change the result: sesolve integrates continuously through
+        the intermediate points and only the final state is returned.
+        """
         import qutip as qt
         vector = np.zeros(self.dim, dtype=complex)
         vector[start_index] = 1.0
         psi0 = qt.Qobj(vector.reshape(-1, 1), dims=[self.dims, [1] * self.n_modes])
-        result = qt.sesolve(H, psi0, [0.0, t_g], options=options)
+        n_out = int(np.clip(np.ceil(t_g / 5.0), 1, 4000)) + 1   # ~one output / 5 ns
+        tlist = np.linspace(0.0, t_g, n_out)
+        result = qt.sesolve(H, psi0, tlist, options=options)
         return result.states[-1].full().ravel()
 
     def evolve_state(self, init_occupations: Sequence[int], t_g: float,
