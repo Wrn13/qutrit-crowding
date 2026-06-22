@@ -104,12 +104,12 @@ DEFAULT_CONFIG = {
     # target qubits a, b
     "qubit_freqs_GHz": [5.00, 4.60],
     "qubit_levels":    3,            # >=3 so target-pair leakage is captured
-    "lam_a":           0.20,         # participation lambda_as = g_as/Delta_as
-    "lam_b":           0.20,         # participation lambda_bs = g_bs/Delta_bs
+    "lam_a":           0.10,         # participation lambda_as = g_as/Delta_as
+    "lam_b":           0.10,         # participation lambda_bs = g_bs/Delta_bs
     # coupler S (the SNAIL)
     "coupler_freq_GHz": 7.00,
     "coupler_levels":   5,
-    "g3_GHz":           0.10,        # measured cubic (engine of every process)
+    "g3_GHz":           0.06,        # measured cubic (engine of every process)
     "g4_GHz":           0.0,         # optional quartic (four-wave mixing)
     # spectator mode
     "spec_levels_qubit": 2,          # "qubit_qubit" channel
@@ -118,6 +118,8 @@ DEFAULT_CONFIG = {
     # pulse / solver
     "t_g_ns":   60.0,
     "envelope": "raised_cosine",
+    "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_iswap.py)
+    "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
     "integrate": True,               # set False for the instant analytic map only
     "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
     "nsteps": 500000,                # max internal solver steps between outputs
@@ -136,7 +138,7 @@ DEFAULT_DRAGS = [False, True]
 class Point:
     """One sweep point (a single coupler configuration to simulate).
 
-    Attributes:
+    Attributes
     ----------
     index : int
         Position in the grid; also the output filename suffix.
@@ -175,7 +177,7 @@ def build_grid(channels: Sequence[str], specfreqs: Sequence[float],
     drags : sequence of bool
         DRAG on/off settings.
 
-    Returns:
+    Returns
     -------
     list of Point
         Points ordered channel -> spec_freq -> lam_spec -> drag, indexed 0..M-1.
@@ -207,7 +209,7 @@ def write_grid(outdir: str, config: Dict[str, Any], points: List[Point]) -> str:
     points : list of Point
         The grid to serialise.
 
-    Returns:
+    Returns
     -------
     str
         Path to the written grid.json.
@@ -228,7 +230,7 @@ def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
     outdir : str
         Directory containing grid.json.
 
-    Returns:
+    Returns
     -------
     (dict, list of Point)
         The persisted config and the reconstructed points.
@@ -253,12 +255,12 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         Resolved device/simulation configuration (see DEFAULT_CONFIG). Imports
         ``zhou_coupler`` (and, for the full path, QuTiP) lazily.
 
-    Returns:
+    Returns
     -------
     dict
         Result row with analytic fields (beat, eta_peak, effective rates, ...) and,
         if integrated, F_avg / leakage / occupations / the 4x4 ``U_proj``.
-    """  # noqa: D205
+    """
     from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse
 
     t0 = time.time()
@@ -269,7 +271,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float) * TWO_PI)
     ws = config["coupler_freq_GHz"] * TWO_PI
     w_p = abs(wb - wa)                              # iSWAP pump = |detuning| (fixed)
-    w_p_GHz = w_p / TWO_PI
+    w_p_GHz = w_p / TWO_PI + float(config.get("wp_offset_GHz", 0.0))   # calibrated offset
     w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
     freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
@@ -314,6 +316,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                           drag=use_drag,
                           delta_drag_GHz=(beat_GHz if use_drag else None)),
                  normalize_iswap=(a, b))
+    # calibrated amplitude correction (1.0 = raw analytic pi/2 normalization)
+    cpl.scale_pump_amplitude(float(config.get("amp_scale", 1.0)))
 
     # --- ANALYTIC collision prediction (free; Eq. 62) ---------------------
     # For a single-tone, pure-g3 (n=3) coupler the spectator's only collision in
@@ -382,7 +386,7 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
     outdir : str
         Output directory (its ``points/`` subdirectory must exist).
 
-    Returns:
+    Returns
     -------
     str
         Path to the written .npz file.
@@ -408,7 +412,7 @@ def collect(outdir: str) -> None:
     outdir : str
         Sweep directory containing ``points/point_*.npz``.
 
-    Returns:
+    Returns
     -------
     None
         Writes ``<outdir>/summary.csv`` (one row per point, sorted by index) and
@@ -456,7 +460,7 @@ def _parse_list(s: Optional[str], cast: Callable[[str], Any]) -> Optional[List[A
     cast : callable
         Element constructor (e.g. float, str).
 
-    Returns:
+    Returns
     -------
     list or None
         The parsed list, or None when `s` is falsy (use the caller's default).
@@ -472,7 +476,7 @@ def _bool_list(s: Optional[str]) -> Optional[List[bool]]:
     s : str or None
         Raw argument; tokens in {1,true,t,yes,on} (case-insensitive) are True.
 
-    Returns:
+    Returns
     -------
     list of bool or None
         The parsed flags, or None when `s` is falsy.
