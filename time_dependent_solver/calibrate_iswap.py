@@ -1,5 +1,4 @@
-"""
-calibrate_iswap.py
+"""calibrate_iswap.py.
 ==================
 
 Per-device calibration of the SNAIL iSWAP pump, to be run ONCE before a spectator
@@ -34,7 +33,7 @@ over run_sweep_zhou.DEFAULT_CONFIG). QuTiP is required (the calibration integrat
 the exact Hamiltonian), so run it on a compute node; see snail_calibrate.slurm.
 The pure search logic (`maximize_1d`) needs only numpy and is unit-testable
 without QuTiP.
-"""
+"""  # noqa: D205
 
 from __future__ import annotations
 

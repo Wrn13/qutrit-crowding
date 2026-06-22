@@ -1,4 +1,5 @@
-"""zhou_coupler.py.
+"""
+zhou_coupler.py
 ===============
 
 Charge-pumped parametric coupler in the dressed-mode framework of
@@ -65,7 +66,7 @@ analytic estimators stay importable and testable without QuTiP. The dense
 `hamiltonian_matrix` is retained only as a lightweight correctness oracle (the
 self-test below, and a one-point cross-check against `iswap_fidelity` on a QuTiP
 node); it is not part of the production solve path.
-"""  # noqa: D205
+"""
 
 from __future__ import annotations
 
@@ -73,12 +74,13 @@ import itertools
 from dataclasses import dataclass
 from math import factorial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-from envelope import Envelope, RaisedCosine, ConstantPulse
+
 import numpy as np
 
 TWO_PI: float = 2.0 * np.pi
 
-
+# numpy>=2 renamed trapz -> trapezoid; fall back only if needed (trapz is gone in 2.x).
+_trapezoid: Callable[..., float] = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
 
 # --- type aliases (documented shapes used throughout) ----------------------
 # A "letter" of X(t): (operator, signed_frequency_rad, constant_amplitude,
@@ -91,6 +93,83 @@ FluxLetter = Tuple[np.ndarray, float, float, Optional[Tuple[int, bool]]]
 # operator). pump_signature is the sorted tuple of (tone_index, is_conjugate)
 # pump factors carried by the term.
 HamiltonianTerm = Tuple[float, Tuple[Tuple[int, bool], ...], np.ndarray]
+
+
+# ===========================================================================
+# Pump envelopes  (real shape eps(t) on [0, t_g]; peak scale carried in `amp`)
+# ===========================================================================
+class Envelope:
+    """Base class for a real pump-amplitude envelope eps(t) on [0, t_g].
+
+    Subclasses implement `value` and `deriv`; `area` integrates eps over the gate
+    (subclasses with closed forms override it).
+
+    Parameters
+    ----------
+    amp : float
+        Peak amplitude. Carries |eps| in rad/ns, or directly |eta| when the
+        owning PumpTone has ``is_eta=True``.
+    t_g : float
+        Gate duration in ns; the envelope is supported on [0, t_g].
+    """
+
+    def __init__(self, amp: float, t_g: float) -> None:
+        self.amp: float = float(amp)
+        self.t_g: float = float(t_g)
+
+    def value(self, t: float) -> float:
+        """Envelope amplitude at time `t` (ns). Subclasses must implement."""
+        raise NotImplementedError
+
+    def deriv(self, t: float) -> float:
+        """Time derivative d eps/dt at time `t` (ns). Subclasses must implement."""
+        raise NotImplementedError
+
+    def area(self) -> float:
+        """Return integral_0^{t_g} value(t) dt by quadrature (override if a closed
+        form exists)."""
+        ts = np.linspace(0.0, self.t_g, 4001)
+        return float(_trapezoid([self.value(t) for t in ts], ts))
+
+
+class ConstantPulse(Envelope):
+    """Flat pump with instantaneous on/off; handy for steady-state rate checks."""
+
+    def value(self, t: float) -> float:
+        """Amplitude `amp` for t in [0, t_g], else 0."""
+        return self.amp if 0.0 <= t <= self.t_g else 0.0
+
+    def deriv(self, t: float) -> float:
+        """Zero everywhere (flat pulse)."""
+        return 0.0
+
+    def area(self) -> float:
+        """Closed form: amp * t_g."""
+        return self.amp * self.t_g
+
+
+class RaisedCosine(Envelope):
+    """Hann (raised-cosine) envelope: smooth turn-on/off, vanishing endpoints,
+
+        value(t) = amp/2 [1 - cos(2 pi t / t_g)] ,  t in [0, t_g] .
+    """
+
+    def value(self, t: float) -> float:
+        """Hann amplitude at `t` (ns); 0 outside [0, t_g]."""
+        if not (0.0 <= t <= self.t_g):
+            return 0.0
+        return self.amp * 0.5 * (1.0 - np.cos(TWO_PI * t / self.t_g))
+
+    def deriv(self, t: float) -> float:
+        """Analytic derivative of the Hann window at `t` (ns); 0 outside [0, t_g]."""
+        if not (0.0 <= t <= self.t_g):
+            return 0.0
+        return self.amp * 0.5 * (TWO_PI / self.t_g) * np.sin(TWO_PI * t / self.t_g)
+
+    def area(self) -> float:
+        """Closed form: amp * t_g / 2 (exact integral of the Hann window)."""
+        return self.amp * self.t_g / 2.0
+
 
 # ===========================================================================
 # Pump tone
@@ -156,12 +235,12 @@ def _fit_virtual_z(U: np.ndarray, U_ideal: np.ndarray) -> np.ndarray:
     U_ideal : ndarray, shape (4, 4)
         Target unitary (here the ideal iSWAP).
 
-    Returns:
+    Returns
     -------
     ndarray, shape (4, 4)
         Z(pa*, pb*) U, with the phases maximising |Tr(U_ideal^dag Z U)|^2 (coarse
         grid plus local refinement).
-    """  # noqa: D205
+    """
     def z_rotation(phase_a: float, phase_b: float) -> np.ndarray:
         return np.diag([1.0,
                         np.exp(1j * phase_b),
@@ -216,7 +295,7 @@ class ZhouCoupler:
         Per-mode Fock truncation. 2 -> qubit (sigma_-, Eq. 72); >= 3 -> oscillator
         (captures leakage). A scalar applies to every mode.
 
-    Attributes:
+    Attributes
     ----------
     omega : ndarray
         Mode angular frequencies (rad/ns).
@@ -304,8 +383,7 @@ class ZhouCoupler:
 
     def _embed(self, op: np.ndarray, mode: int) -> np.ndarray:
         """Embed a single-mode operator `op` acting on `mode` into the full
-        tensor-product space.
-        """  # noqa: D205
+        tensor-product space."""
         factors = [np.eye(d, dtype=complex) for d in self.dims]
         factors[mode] = op
         embedded = factors[0]
@@ -322,7 +400,7 @@ class ZhouCoupler:
         occupations : sequence of int
             Per-mode photon numbers |n_0, n_1, ...> (mode 0 most significant).
 
-        Returns:
+        Returns
         -------
         int
             The mixed-radix flat index.
@@ -342,7 +420,7 @@ class ZhouCoupler:
         index : int
             Flat Hilbert-space index.
 
-        Returns:
+        Returns
         -------
         list of int
             Per-mode occupations.
@@ -361,7 +439,7 @@ class ZhouCoupler:
         occupations : sequence of int
             Per-mode photon numbers.
 
-        Returns:
+        Returns
         -------
         ndarray, shape (dim,)
             The corresponding computational-basis ket.
@@ -380,7 +458,7 @@ class ZhouCoupler:
         mode : int
             Mode index whose occupation is wanted.
 
-        Returns:
+        Returns
         -------
         float
             <n_mode> = sum_k p_k * occ_mode(k).
@@ -396,7 +474,7 @@ class ZhouCoupler:
         i, j : int
             Mode indices.
 
-        Returns:
+        Returns
         -------
         float
             w_i - w_j (rad/ns).
@@ -418,7 +496,7 @@ class ZhouCoupler:
             the (a, b) pair (rotation angle pi/2). The condition is
             integral 6 g3 lambda_as lambda_bs |eta(t)| dt = pi/2 (Eqs. 55/73).
 
-        Returns:
+        Returns
         -------
         None
         """
@@ -446,10 +524,28 @@ class ZhouCoupler:
             raise ValueError("Pump envelope has zero area.")
         tone.envelope.amp *= target_eta_area / current_eta_area
 
+    def scale_pump_amplitude(self, scale: float, tone_index: int = 0) -> None:
+        """Multiply one tone's envelope amplitude by `scale`, applied AFTER any
+        normalization. Used to apply a calibrated correction to the open-loop
+        analytic pi/2 amplitude, which over-rotates because the leading-order rate
+        6 g3 la lb |eta| under-estimates the dressed effective rate at finite eta.
+
+        Parameters
+        ----------
+        scale : float
+            Multiplicative factor on the envelope peak amplitude.
+        tone_index : int, default 0
+            Which attached tone to rescale.
+
+        Returns
+        -------
+        None
+        """
+        self._pump_tones[tone_index].envelope.amp *= float(scale)
+
     def _eta(self, tone: PumpTone, t: float) -> complex:
         """Displaced pump amplitude eta_p(t), complex when DRAG is on (Eq. 50;
-        Motzoi PRL 103, 110501 (2009)).
-        """  # noqa: D205
+        Motzoi PRL 103, 110501 (2009))."""
         omega_p = tone.w_p_GHz * TWO_PI
         omega_s = self.omega[self.coupler_index]
         prefactor = 1.0 if tone.is_eta else (2 * omega_p / (omega_p ** 2 - omega_s ** 2))
@@ -462,8 +558,7 @@ class ZhouCoupler:
     def _flux_letters(self) -> List[FluxLetter]:
         """All letters of X(t): the static mode operators plus the current pump
         tones. A tone contributes eta_p e^{-i w_p t} (key (i, False)) and its
-        conjugate eta_p* e^{+i w_p t} (key (i, True)).
-        """  # noqa: D205
+        conjugate eta_p* e^{+i w_p t} (key (i, True))."""
         letters = list(self._mode_letters)
         for tone_index, tone in enumerate(self._pump_tones):
             omega_p = tone.w_p_GHz * TWO_PI
@@ -483,7 +578,7 @@ class ZhouCoupler:
         t : float
             Time (ns).
 
-        Returns:
+        Returns
         -------
         ndarray, shape (dim, dim)
             The dense X(t).
@@ -510,7 +605,7 @@ class ZhouCoupler:
         t : float
             Time (ns).
 
-        Returns:
+        Returns
         -------
         ndarray, shape (dim, dim)
             The dense Hamiltonian (rad/ns).
@@ -545,11 +640,11 @@ class ZhouCoupler:
             the form handed to QuTiP. A finite cutoff drops the fast carriers,
             leaving a rotating-wave / average-Hamiltonian reduction.
 
-        Returns:
+        Returns
         -------
         list of (float, tuple, ndarray)
             (exact Omega in rad/ns, pump signature, constant operator) per group.
-        """  # noqa: D205
+        """
         cutoff_rad = abs(cutoff_GHz) * TWO_PI
         letters = self._flux_letters()
 
@@ -598,7 +693,7 @@ class ZhouCoupler:
             Pump amplitude |eta|. Defaults to |eta| at the envelope peak of the
             first tone.
 
-        Returns:
+        Returns
         -------
         float
             The effective rate g_eff (rad/ns).
@@ -620,7 +715,7 @@ class ZhouCoupler:
         return float(C * g * (eta ** n_pump_quanta) * participation_product)
 
     def iswap_rate(self, a: int, b: int, eta: Optional[float] = None) -> float:
-        """ISWAP coupling g_eff = 6 g3 lambda_as lambda_bs |eta| (Eqs. 55/73).
+        """iSWAP coupling g_eff = 6 g3 lambda_as lambda_bs |eta| (Eqs. 55/73).
 
         Parameters
         ----------
@@ -629,7 +724,7 @@ class ZhouCoupler:
         eta : float, optional
             Pump amplitude |eta|; defaults to the envelope peak of the first tone.
 
-        Returns:
+        Returns
         -------
         float
             The iSWAP rate (rad/ns).
@@ -645,11 +740,11 @@ class ZhouCoupler:
         tone_index : int, default 0
             Which attached tone to evaluate.
 
-        Returns:
+        Returns
         -------
         float
             |eta| at t_g/2.
-        """  # noqa: D205
+        """
         tone = self._pump_tones[tone_index]
         return abs(self._eta(tone, tone.envelope.t_g / 2.0))
 
@@ -658,8 +753,7 @@ class ZhouCoupler:
     def _iswap_fidelity_from_U(U: np.ndarray, fit_virtual_z: bool) -> Tuple[float, float]:
         """Leakage-aware average gate fidelity and leakage from a 4x4 projected
         propagator (Pedersen PLA 367, 47 (2007); Wood & Gambetta PRA 97, 032306
-        (2018)); virtual-Z phases optionally fitted out (free in software).
-        """  # noqa: D205
+        (2018)); virtual-Z phases optionally fitted out (free in software)."""
         d = 4
         U_ideal = _ideal_iswap()
         U_fit = _fit_virtual_z(U, U_ideal) if fit_virtual_z else U
@@ -671,8 +765,7 @@ class ZhouCoupler:
 
     def _subspace_indices(self, a: int, b: int) -> List[int]:
         """Flat indices of |00>, |01>, |10>, |11> on the (a, b) pair, all other
-        modes in |0>.
-        """  # noqa: D205
+        modes in |0>."""
         indices = []
         for occ_a, occ_b in [(0, 0), (0, 1), (1, 0), (1, 1)]:
             occupations = [0] * self.n_modes
@@ -702,14 +795,14 @@ class ZhouCoupler:
             Store each constant operator as a SciPy CSR matrix (the fast path);
             False keeps dense arrays.
 
-        Returns:
+        Returns
         -------
         qutip.QobjEvo or list
             A QobjEvo on QuTiP 5; the raw list on QuTiP 4 (both accepted by the
             solvers). Feed to qt.sesolve (closed system) or qt.mesolve /
             qt.propagator with collapse operators (T1/T2, coupler loss) for the
             open-system run that hardware adds on top of Zhou's unitary model.
-        """  # noqa: D205
+        """
         import cmath
         import qutip as qt
         import scipy.sparse as sp
@@ -752,8 +845,7 @@ class ZhouCoupler:
     def _sesolve_final(self, H: Any, start_index: int, t_g: float,
                        options: Any) -> np.ndarray:
         """Closed-system evolve a single computational-basis ket to t_g and return
-        the final state vector (numpy).
-        """  # noqa: D205
+        the final state vector (numpy)."""
         import qutip as qt
         vector = np.zeros(self.dim, dtype=complex)
         vector[start_index] = 1.0
@@ -778,14 +870,46 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns:
+        Returns
         -------
         ndarray, shape (dim,)
             Final state vector |psi(t_g)>.
-        """  # noqa: D205
+        """
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
         return self._sesolve_final(H, self.fock_index(init_occupations), t_g, options)
+
+    def evolve_trajectory(self, init_occupations: Sequence[int], times: Sequence[float],
+                          atol: float = 1e-10, rtol: float = 1e-8,
+                          nsteps: int = 500000) -> np.ndarray:
+        """Evolve a Fock initial state on the EXACT Hamiltonian and return the state
+        at EVERY time in `times` (QuTiP sesolve over the full tlist). Used to map
+        population exchange P(t) at a fixed pump strength (Fig. 8a style).
+
+        Parameters
+        ----------
+        init_occupations : sequence of int
+            Per-mode photon numbers of the initial state.
+        times : sequence of float
+            Output times (ns); must be sorted and start at 0.
+        atol, rtol : float
+            Absolute / relative ODE tolerances.
+        nsteps : int
+            Maximum internal solver steps between outputs.
+
+        Returns
+        -------
+        ndarray, shape (len(times), dim)
+            State vector at each output time.
+        """
+        import qutip as qt
+        H = self.to_qutip_hamiltonian()
+        options = self._qutip_options(atol, rtol, nsteps)
+        vector = np.zeros(self.dim, dtype=complex)
+        vector[self.fock_index(init_occupations)] = 1.0
+        psi0 = qt.Qobj(vector.reshape(-1, 1), dims=[self.dims, [1] * self.n_modes])
+        result = qt.sesolve(H, psi0, np.asarray(times, dtype=float), options=options)
+        return np.array([state.full().ravel() for state in result.states])
 
     def propagator_columns(self, a: int, b: int, t_g: float,
                            atol: float = 1e-10, rtol: float = 1e-8,
@@ -806,11 +930,11 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns:
+        Returns
         -------
         ndarray, shape (4, 4)
             The projected propagator (columns evolve |00>, |01>, |10>, |11>).
-        """  # noqa: D205
+        """
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
         indices = self._subspace_indices(a, b)
@@ -841,7 +965,7 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns:
+        Returns
         -------
         fidelity : float
             Leakage-aware average gate fidelity vs the ideal iSWAP.
@@ -850,7 +974,7 @@ class ZhouCoupler:
         U : ndarray, shape (4, 4)
             The projected propagator.
 
-        Notes:
+        Notes
         -----
         Open system ('what hardware achieves'): build collapse operators from the
         embedded ladder ops -- e.g. sqrt(1/T1) qt.Qobj(self.a_ops[i]) for
@@ -858,7 +982,7 @@ class ZhouCoupler:
         dephasing -- propagate the superoperator with
         qt.propagator(self.to_qutip_hamiltonian(), [0, t_g], c_ops=...), restrict
         to the computational subspace, and use qt.average_gate_fidelity.
-        """  # noqa: D205
+        """
         U = self.propagator_columns(a, b, t_g, atol=atol, rtol=rtol, nsteps=nsteps)
         fidelity, leakage = self._iswap_fidelity_from_U(U, fit_virtual_z)
         return fidelity, leakage, U
