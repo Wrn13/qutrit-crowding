@@ -177,7 +177,7 @@ def build_grid(channels: Sequence[str], specfreqs: Sequence[float],
     drags : sequence of bool
         DRAG on/off settings.
 
-    Returns
+    Returns:
     -------
     list of Point
         Points ordered channel -> spec_freq -> lam_spec -> drag, indexed 0..M-1.

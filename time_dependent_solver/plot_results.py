@@ -383,7 +383,8 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
         vcol, vlabel, cmap = "F_avg", r"$\log_{10}(1-F)$", "magma"
         def transform(z): return np.log10(np.clip(1.0 - z, 1e-12, None))
     else:
-        vcol, vlabel, cmap = metric, rf"$\log_{{10}}\,${metric.replace('_', r'\_')}", "magma"
+        safe_metric = metric.replace("_", r"\_")        # backslash lives outside the f-string now
+        vcol, vlabel, cmap = metric, rf"$\log_{{10}}\,${safe_metric}", "magma"
         def transform(z): return np.log10(np.clip(z, 1e-12, None))
 
     nr, nc = len(drags), len(chans)

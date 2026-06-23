@@ -295,7 +295,7 @@ class ZhouCoupler:
         Per-mode Fock truncation. 2 -> qubit (sigma_-, Eq. 72); >= 3 -> oscillator
         (captures leakage). A scalar applies to every mode.
 
-    Attributes
+    Attributes:
     ----------
     omega : ndarray
         Mode angular frequencies (rad/ns).
@@ -640,11 +640,11 @@ class ZhouCoupler:
             the form handed to QuTiP. A finite cutoff drops the fast carriers,
             leaving a rotating-wave / average-Hamiltonian reduction.
 
-        Returns
+        Returns:
         -------
         list of (float, tuple, ndarray)
             (exact Omega in rad/ns, pump signature, constant operator) per group.
-        """
+        """  # noqa: D205
         cutoff_rad = abs(cutoff_GHz) * TWO_PI
         letters = self._flux_letters()
 
@@ -795,14 +795,14 @@ class ZhouCoupler:
             Store each constant operator as a SciPy CSR matrix (the fast path);
             False keeps dense arrays.
 
-        Returns
+        Returns:
         -------
         qutip.QobjEvo or list
             A QobjEvo on QuTiP 5; the raw list on QuTiP 4 (both accepted by the
             solvers). Feed to qt.sesolve (closed system) or qt.mesolve /
             qt.propagator with collapse operators (T1/T2, coupler loss) for the
             open-system run that hardware adds on top of Zhou's unitary model.
-        """
+        """  # noqa: D205
         import cmath
         import qutip as qt
         import scipy.sparse as sp
@@ -939,11 +939,11 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns
+        Returns:
         -------
         ndarray, shape (4, 4)
             The projected propagator (columns evolve |00>, |01>, |10>, |11>).
-        """
+        """  # noqa: D205
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
         indices = self._subspace_indices(a, b)
@@ -974,7 +974,7 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns
+        Returns:
         -------
         fidelity : float
             Leakage-aware average gate fidelity vs the ideal iSWAP.
@@ -983,7 +983,7 @@ class ZhouCoupler:
         U : ndarray, shape (4, 4)
             The projected propagator.
 
-        Notes
+        Notes:
         -----
         Open system ('what hardware achieves'): build collapse operators from the
         embedded ladder ops -- e.g. sqrt(1/T1) qt.Qobj(self.a_ops[i]) for
@@ -991,7 +991,7 @@ class ZhouCoupler:
         dephasing -- propagate the superoperator with
         qt.propagator(self.to_qutip_hamiltonian(), [0, t_g], c_ops=...), restrict
         to the computational subspace, and use qt.average_gate_fidelity.
-        """
+        """  # noqa: D205
         U = self.propagator_columns(a, b, t_g, atol=atol, rtol=rtol, nsteps=nsteps)
         fidelity, leakage = self._iswap_fidelity_from_U(U, fit_virtual_z)
         return fidelity, leakage, U
