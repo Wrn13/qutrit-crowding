@@ -7,32 +7,30 @@ Allocation in Tunable-Coupler Quantum Architectures" (arXiv:2409.18262), but wit
 the EXACT Zhou dressed-mode coupler (zhou_coupler.ZhouCoupler) instead of the
 paper's RWA effective Hamiltonian.
 
-  Panel (a)  Population exchange P(|01> -> |10>) as a function of gate time and
-             pump strength |eta|, with the analytic full-iSWAP duration
-             t_f(eta) = pi / (2 * 6 |eta| g3 lambda_a lambda_b)  (McKinney Eq. 11,
-             = Zhou Eq. 73) overlaid as the dashed line.
+  Panel (a)  Population exchange P(|01> -> |10>) vs gate time and pump strength
+             |eta| (constant drive), with the analytic full-iSWAP duration
+             t_f(eta) = pi / (2 * 6 |eta| g3 lambda_a lambda_b) overlaid.
   Panel (b)  Coherent qubit-qubit-spectator infidelity 1 - F vs pump strength,
-             for several spectator detunings delta_Q (McKinney Eq. 12 / Fig. 8b),
-             using the same spectator convention as run_sweep_zhou.py.
+             for several spectator detunings delta_Q, computed WITH and WITHOUT
+             DRAG. DRAG adds the second pump quadrature eps^y = -d(eps^x)/dt / delta_Q
+             (Zhou SI Disc. 1) to cancel leakage into the detuned spectator; it
+             requires a shaped pulse, so panel (b) uses a raised-cosine envelope.
 
-The point of using the exact coupler: in McKinney's RWA model the target is a full
-iSWAP at the dashed line for ANY eta (eta only sets speed), so panel (a) is a clean
-fan of swaps. The exact integration additionally carries the strong subharmonic /
-counter-rotating SNAIL self-terms (his Table I, ~100x the target) that he brackets
-out as a breakdown constraint -- so the exact map should track the dashed line at
-small eta and DEVIATE (incomplete / frequency-pulled swaps) as eta grows, which is
-precisely the effect that motivates per-device pump calibration.
-
-Two backends:
-  dense  -- scipy on ZhouCoupler.hamiltonian_matrix (the dense oracle); no QuTiP,
-            good for small grids and in-sandbox validation.
+Backends:
+  dense  -- scipy on ZhouCoupler.hamiltonian_matrix (no QuTiP); good for small
+            grids and in-sandbox validation.
   qutip  -- ZhouCoupler.evolve_trajectory / .iswap_fidelity (compiled sparse
-            sesolve); use on a compute node for production grids.
+            sesolve); for production grids on a compute node.
+
+Parallelism: the (eta) columns of panel (a) and the (drag, delta_Q, eta) points
+of panel (b) are independent and are evaluated across a process pool (--jobs N,
+defaulting to $SLURM_CPUS_PER_TASK or the CPU count). Keep BLAS single-threaded
+per worker (the SLURM script exports OMP_NUM_THREADS=1) to avoid oversubscription.
 
 Usage
 -----
-    python figure8_data.py --mode both --backend qutip --out fig8.npz --plot fig8.png
-    python figure8_data.py --mode map  --backend dense --eta-points 16 --t-points 80
+    python figure8_data.py --mode both --backend qutip --jobs 16 \
+        --out fig8.npz --plot fig8.png
 See snail_figure8.slurm for the cluster job.
 """
 
@@ -40,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from concurrent.futures import ProcessPoolExecutor
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -64,8 +64,8 @@ FIG8_DEFAULTS: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 def iswap_duration_ns(g3_GHz: float, lam_a: float, lam_b: float, eta: float,
                       n: int = 1) -> float:
-    """Full (n=1) or fractional (n>1) iSWAP duration for a constant pump of peak
-    |eta| (McKinney Eq. 11 / Zhou Eq. 73): pi/(2n) = 6 t_f |eta| g3 lambda^2.
+    """Full (n=1) iSWAP duration for a CONSTANT pump of peak |eta|
+    (McKinney Eq. 11 / Zhou Eq. 73): pi/(2n) = 6 t_f |eta| g3 lambda^2.
 
     Parameters
     ----------
@@ -81,10 +81,32 @@ def iswap_duration_ns(g3_GHz: float, lam_a: float, lam_b: float, eta: float,
     Returns
     -------
     float
-        Gate duration t_f (ns).
+        Gate duration t_f (ns) for a constant pump.
     """
     g_eff = 6.0 * eta * (g3_GHz * TWO_PI) * lam_a * lam_b      # rad/ns
     return (np.pi / (2 * n)) / g_eff
+
+
+def raised_cosine_iswap_duration(g3_GHz: float, lam_a: float, lam_b: float,
+                                 eta: float) -> float:
+    """Full-iSWAP duration for a RAISED-COSINE pump of peak |eta|. The Hann window
+    integral is eta*t_g/2, so it needs twice the constant-pump duration.
+
+    Parameters
+    ----------
+    g3_GHz : float
+        Three-wave non-linearity g3 (GHz).
+    lam_a, lam_b : float
+        Qubit participations.
+    eta : float
+        Peak pump strength |eta|.
+
+    Returns
+    -------
+    float
+        Gate duration t_g (ns) for a raised-cosine pump.
+    """
+    return 2.0 * iswap_duration_ns(g3_GHz, lam_a, lam_b, eta)
 
 
 def load_config(path: Optional[str]) -> Dict[str, Any]:
@@ -112,10 +134,12 @@ def load_config(path: Optional[str]) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 def build_gate(config: Dict[str, Any], eta: float, t_env: float,
                spectator: Optional[Tuple[float, float]] = None,
-               wp_offset_GHz: float = 0.0):
-    """Build the coupler with a CONSTANT pump of peak |eta| (no normalization, so
+               wp_offset_GHz: float = 0.0, envelope: str = "constant",
+               drag: bool = False, delta_drag_GHz: Optional[float] = None):
+    """Build the coupler with a pump of peak |eta| (no normalization, so
     peak_eta() == eta) on the (a, b) iSWAP. Optionally add one qubit-qubit
-    spectator detuned from the pump by delta_Q.
+    spectator detuned from the pump by delta_Q, choose the envelope, and enable
+    DRAG.
 
     Parameters
     ----------
@@ -124,20 +148,25 @@ def build_gate(config: Dict[str, Any], eta: float, t_env: float,
     eta : float
         Pump strength |eta| to set directly.
     t_env : float
-        Constant-pulse duration (ns); cover the full evolution window.
+        Pulse duration (ns).
     spectator : tuple(float, float), optional
         (delta_Q_GHz, lam_spec): a 2-level spectator whose exchange with qubit a is
-        off-resonant by delta_Q (placed at w_spec = w_b - (w_p + delta_Q), matching
-        run_sweep_zhou's beat = spec_freq - w_p convention).
+        off-resonant by delta_Q (placed at w_spec = w_b - (w_p + delta_Q)).
     wp_offset_GHz : float, default 0.0
         Offset added to the pump frequency w_b - w_a (GHz).
+    envelope : {"constant", "raised_cosine"}, default "constant"
+        Pump envelope shape. DRAG requires "raised_cosine" (nonzero derivative).
+    drag : bool, default False
+        Enable the DRAG second quadrature.
+    delta_drag_GHz : float, optional
+        DRAG detuning (typically the spectator detuning delta_Q).
 
     Returns
     -------
     (ZhouCoupler, float)
         The coupler and the analytic iSWAP rate g_eff = 6 g3 lambda^2 |eta| (rad/ns).
     """
-    from zhou_coupler import ZhouCoupler, PumpTone, ConstantPulse
+    from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse
 
     wa, wb = (float(config["qubit_freqs_GHz"][0]), float(config["qubit_freqs_GHz"][1]))
     ws = float(config["coupler_freq_GHz"])
@@ -152,15 +181,16 @@ def build_gate(config: Dict[str, Any], eta: float, t_env: float,
               int(config["coupler_levels"])]
     if spectator is not None:
         delta_Q_GHz, lam_spec = spectator
-        w_spec = wb - (w_p_GHz + delta_Q_GHz)
-        freqs.append(w_spec)
+        freqs.append(wb - (w_p_GHz + delta_Q_GHz))
         participations[3] = float(lam_spec)
         levels.append(int(config["spec_levels"]))
 
     cpl = ZhouCoupler(mode_freqs_GHz=freqs, coupler_index=2,
                       participations=participations, nonlinearities=nonlin, levels=levels)
-    cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=ConstantPulse(amp=eta, t_g=t_env),
-                          is_eta=True), normalize_iswap=None)
+    EnvCls = RaisedCosine if envelope == "raised_cosine" else ConstantPulse
+    cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=eta, t_g=t_env),
+                          is_eta=True, drag=drag, delta_drag_GHz=delta_drag_GHz),
+                 normalize_iswap=None)
     return cpl, cpl.iswap_rate(0, 1)
 
 
@@ -201,13 +231,62 @@ def _propagator4(cpl, a: int, b: int, t_g: float, backend: str,
 
 
 # ---------------------------------------------------------------------------
+# Parallel map helper
+# ---------------------------------------------------------------------------
+def _resolve_jobs(n_jobs: Optional[int]) -> int:
+    """Number of worker processes: explicit n_jobs, else $SLURM_CPUS_PER_TASK,
+    else the CPU count."""
+    if n_jobs and n_jobs > 0:
+        return int(n_jobs)
+    return int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+
+
+def _pmap(func, arg_list: List[Any], n_jobs: Optional[int]) -> List[Any]:
+    """Apply `func` to each item of `arg_list`, in parallel over a process pool
+    (order preserved). Falls back to a serial loop for n_jobs<=1 or a single item.
+
+    Parameters
+    ----------
+    func : callable
+        A module-level worker taking one (picklable) argument.
+    arg_list : list
+        Argument tuples, one per task.
+    n_jobs : int or None
+        Worker count (see _resolve_jobs).
+
+    Returns
+    -------
+    list
+        Results in input order.
+    """
+    jobs = _resolve_jobs(n_jobs)
+    if jobs <= 1 or len(arg_list) <= 1:
+        return [func(a) for a in arg_list]
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        return list(pool.map(func, arg_list))
+
+
+# ---------------------------------------------------------------------------
 # Panel (a): population-exchange map
 # ---------------------------------------------------------------------------
+def _map_column_worker(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """One eta column of the population map (P10, P01, n_coupler, leak over time)."""
+    config, eta, times, backend, solver, max_step = args
+    cpl, _ = build_gate(config, eta, t_env=float(times[-1]))
+    i00 = cpl.fock_index([0, 0, 0]); i01 = cpl.fock_index([0, 1, 0])
+    i10 = cpl.fock_index([1, 0, 0]); i11 = cpl.fock_index([1, 1, 0])
+    states = _trajectory(cpl, [0, 1, 0], times, backend, solver, max_step)
+    pops = np.abs(states) ** 2
+    ncpl = np.array([cpl.mean_occupation(p, 2) for p in pops])
+    leak = 1.0 - (pops[:, i00] + pops[:, i01] + pops[:, i10] + pops[:, i11])
+    return pops[:, i10], pops[:, i01], ncpl, leak
+
+
 def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarray,
                    backend: str = "dense", solver: Optional[Dict[str, Any]] = None,
-                   max_step: float = 0.02) -> Dict[str, np.ndarray]:
-    """P(|01> -> |10>) over the (eta, time) grid, plus diagnostics and the analytic
-    full-iSWAP line t_f(eta).
+                   max_step: float = 0.02, n_jobs: Optional[int] = None) -> Dict[str, np.ndarray]:
+    """P(|01> -> |10>) over the (eta, time) grid (parallel over eta), plus
+    diagnostics and the analytic full-iSWAP line t_f(eta).
 
     Parameters
     ----------
@@ -223,6 +302,8 @@ def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarr
         Tolerances (atol, rtol, nsteps); defaults provided.
     max_step : float, default 0.02
         Dense-backend max ODE step (ns).
+    n_jobs : int, optional
+        Worker processes (see _resolve_jobs).
 
     Returns
     -------
@@ -230,21 +311,10 @@ def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarr
         eta_grid, times, P10 / P01 / n_coupler / leak [n_eta, n_t], and t_f (n_eta).
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
-    n_eta, n_t = len(eta_grid), len(times)
-    P10 = np.zeros((n_eta, n_t)); P01 = np.zeros((n_eta, n_t))
-    ncpl = np.zeros((n_eta, n_t)); leak = np.zeros((n_eta, n_t))
-    i01 = None
-    for ie, eta in enumerate(eta_grid):
-        cpl, _ = build_gate(config, float(eta), t_env=float(times[-1]))
-        if i01 is None:
-            i01 = cpl.fock_index([0, 1, 0]); i10 = cpl.fock_index([1, 0, 0])
-            i00 = cpl.fock_index([0, 0, 0]); i11 = cpl.fock_index([1, 1, 0])
-        states = _trajectory(cpl, [0, 1, 0], times, backend, solver, max_step)
-        pops = np.abs(states) ** 2
-        P10[ie] = pops[:, i10]; P01[ie] = pops[:, i01]
-        ncpl[ie] = [cpl.mean_occupation(p, 2) for p in pops]
-        comp = pops[:, i00] + pops[:, i01] + pops[:, i10] + pops[:, i11]
-        leak[ie] = 1.0 - comp
+    args = [(config, float(e), times, backend, solver, max_step) for e in eta_grid]
+    results = _pmap(_map_column_worker, args, n_jobs)
+    P10 = np.array([r[0] for r in results]); P01 = np.array([r[1] for r in results])
+    ncpl = np.array([r[2] for r in results]); leak = np.array([r[3] for r in results])
     t_f = np.array([iswap_duration_ns(config["g3_GHz"], config["lam_a"],
                                       config["lam_b"], float(e)) for e in eta_grid])
     return {"eta_grid": np.asarray(eta_grid), "times": np.asarray(times),
@@ -252,14 +322,29 @@ def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarr
 
 
 # ---------------------------------------------------------------------------
-# Panel (b): spectator coherent infidelity vs eta
+# Panel (b): spectator coherent infidelity vs eta, with/without DRAG
 # ---------------------------------------------------------------------------
+def _spectator_point_worker(args: Tuple) -> Tuple[float, float]:
+    """One (drag, delta_Q, eta) spectator point: returns (infidelity, leakage)."""
+    config, eta, delta_Q, lam_spec, drag, backend, solver, max_step = args
+    t_g = raised_cosine_iswap_duration(config["g3_GHz"], config["lam_a"],
+                                       config["lam_b"], eta)
+    cpl, _ = build_gate(config, eta, t_env=t_g, spectator=(delta_Q, lam_spec),
+                        envelope="raised_cosine", drag=drag,
+                        delta_drag_GHz=(delta_Q if drag else None))
+    U = _propagator4(cpl, 0, 1, t_g, backend, solver, max_step)
+    F, lk = cpl._iswap_fidelity_from_U(U, True)
+    return 1.0 - F, lk
+
+
 def spectator_infidelity(config: Dict[str, Any], eta_grid: np.ndarray,
                          delta_Q_GHz: Sequence[float], lam_spec: float = 0.20,
+                         drags: Sequence[bool] = (False, True),
                          backend: str = "dense", solver: Optional[Dict[str, Any]] = None,
-                         max_step: float = 0.02) -> Dict[str, np.ndarray]:
-    """Coherent iSWAP infidelity 1 - F vs pump strength, for each spectator detuning,
-    evaluating the gate at its own full-iSWAP duration t_f(eta).
+                         max_step: float = 0.02, n_jobs: Optional[int] = None) -> Dict[str, np.ndarray]:
+    """Coherent iSWAP infidelity 1 - F vs pump strength, for each spectator detuning
+    and DRAG setting, on a raised-cosine gate at its full-iSWAP duration t_g(eta).
+    Parallel over the flattened (drag, delta_Q, eta) grid.
 
     Parameters
     ----------
@@ -271,40 +356,40 @@ def spectator_infidelity(config: Dict[str, Any], eta_grid: np.ndarray,
         Spectator detunings from the pump (GHz).
     lam_spec : float, default 0.20
         Spectator participation.
+    drags : sequence of bool, default (False, True)
+        DRAG settings to compare.
     backend : {"dense", "qutip"}
         Solver backend.
     solver : dict, optional
         Tolerances; defaults provided.
     max_step : float, default 0.02
         Dense-backend max ODE step (ns).
+    n_jobs : int, optional
+        Worker processes (see _resolve_jobs).
 
     Returns
     -------
     dict
-        eta_grid, delta_Q_GHz, and infidelity / leakage [n_delta, n_eta].
+        eta_grid, delta_Q_GHz, drags, and infidelity / leak [n_drag, n_delta, n_eta].
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     deltas = np.asarray(delta_Q_GHz, dtype=float)
-    infid = np.zeros((len(deltas), len(eta_grid)))
-    leak = np.zeros((len(deltas), len(eta_grid)))
-    for jd, dq in enumerate(deltas):
-        for ie, eta in enumerate(eta_grid):
-            t_f = iswap_duration_ns(config["g3_GHz"], config["lam_a"], config["lam_b"], float(eta))
-            cpl, _ = build_gate(config, float(eta), t_env=t_f, spectator=(float(dq), lam_spec))
-            U = _propagator4(cpl, 0, 1, t_f, backend, solver, max_step)
-            F, lk = cpl._iswap_fidelity_from_U(U, True)
-            infid[jd, ie] = 1.0 - F
-            leak[jd, ie] = lk
+    drags = list(drags)
+    args = [(config, float(e), float(d), lam_spec, bool(dr), backend, solver, max_step)
+            for dr in drags for d in deltas for e in eta_grid]
+    results = _pmap(_spectator_point_worker, args, n_jobs)
+    infid = np.array([r[0] for r in results]).reshape(len(drags), len(deltas), len(eta_grid))
+    leak = np.array([r[1] for r in results]).reshape(len(drags), len(deltas), len(eta_grid))
     return {"eta_grid": np.asarray(eta_grid), "delta_Q_GHz": deltas,
-            "infidelity": infid, "leak": leak}
+            "drags": np.array(drags, dtype=bool), "infidelity": infid, "leak": leak}
 
 
 # ---------------------------------------------------------------------------
 # Plotting
 # ---------------------------------------------------------------------------
 def plot_figure8(npz_path: str, png_path: str) -> None:
-    """Render Fig.8-style panels from a saved .npz (whichever of map / spectator
-    data it contains).
+    """Render Fig.8-style panels from a saved .npz (map and/or spectator data).
+    Panel (b) overlays DRAG-off (solid) and DRAG-on (dashed) per detuning.
 
     Parameters
     ----------
@@ -341,7 +426,7 @@ def plot_figure8(npz_path: str, png_path: str) -> None:
         mesh = ax.pcolormesh(eta, t, P10.T, shading="auto", cmap="viridis", vmin=0, vmax=1)
         ax.plot(eta, data["t_f"], "r--", lw=1.8, label=r"full iSWAP $t_f(\eta)$")
         ax.set_xlabel(r"pump strength $|\eta|$"); ax.set_ylabel("gate time (ns)")
-        ax.set_ylim(t[0], t[-1]); ax.set_title("(a) population exchange  $P(|01\\rangle\\to|10\\rangle)$")
+        ax.set_ylim(t[0], t[-1]); ax.set_title(r"(a) population exchange $P(|01\rangle\to|10\rangle)$")
         ax.legend(loc="upper right", framealpha=0.9)
         fig.colorbar(mesh, ax=ax, label=r"$P(|10\rangle)$")
 
@@ -349,11 +434,17 @@ def plot_figure8(npz_path: str, png_path: str) -> None:
         ax = axes[ax_i]; ax_i += 1
         eta = data["spec_eta_grid"] if "spec_eta_grid" in data.files else data["eta_grid"]
         infid = data["infidelity"]; deltas = data["delta_Q_GHz"]
+        drags = data["drags"] if "drags" in data.files else np.array([False])
+        colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", None)
         for jd, dq in enumerate(deltas):
-            ax.semilogy(eta, np.clip(infid[jd], 1e-6, None), marker="o", ms=3,
-                        label=fr"$\delta_Q={dq*1e3:.0f}$ MHz")
+            color = colors[jd % len(colors)] if colors else None
+            for kd, dr in enumerate(drags):
+                style = "--" if bool(dr) else "-"
+                tag = " +DRAG" if bool(dr) else ""
+                ax.semilogy(eta, np.clip(infid[kd, jd], 1e-6, None), style, color=color,
+                            marker="o", ms=3, label=fr"$\delta_Q={dq*1e3:.0f}$ MHz{tag}")
         ax.set_xlabel(r"pump strength $|\eta|$"); ax.set_ylabel(r"coherent infidelity $1-F$")
-        ax.set_title("(b) qubit-qubit spectator infidelity"); ax.legend(framealpha=0.9)
+        ax.set_title("(b) qubit-qubit spectator infidelity"); ax.legend(framealpha=0.9, fontsize=8)
 
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -369,6 +460,7 @@ def main() -> None:
     ap.add_argument("--device", default=None, help="device JSON (overrides FIG8_DEFAULTS)")
     ap.add_argument("--mode", choices=["map", "spectator", "both"], default="both")
     ap.add_argument("--backend", choices=["dense", "qutip"], default="dense")
+    ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = SLURM_CPUS_PER_TASK or CPU count)")
     ap.add_argument("--out", default="fig8.npz", help="output .npz")
     ap.add_argument("--plot", default=None, help="optional output PNG")
     # panel (a) grid
@@ -380,6 +472,7 @@ def main() -> None:
     # panel (b) spectator
     ap.add_argument("--deltas-MHz", default="100,200,400", help="comma list of spectator detunings (MHz)")
     ap.add_argument("--lam-spec", type=float, default=0.20)
+    ap.add_argument("--no-drag-compare", action="store_true", help="only compute DRAG-off")
     # solver
     ap.add_argument("--max-step", type=float, default=0.02, help="dense-backend max ODE step (ns)")
     ap.add_argument("--atol", type=float, default=1e-10)
@@ -391,23 +484,25 @@ def main() -> None:
     solver = {"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps}
     eta_grid = np.linspace(args.eta_min, args.eta_max, args.eta_points)
     out: Dict[str, np.ndarray] = {}
+    print(f"jobs={_resolve_jobs(args.jobs)} backend={args.backend}")
 
     if args.mode in ("map", "both"):
         t_max = args.t_max or 1.3 * iswap_duration_ns(config["g3_GHz"], config["lam_a"],
                                                       config["lam_b"], args.eta_min)
         times = np.linspace(0.0, t_max, args.t_points)
-        print(f"[map] eta {args.eta_min}-{args.eta_max} x{args.eta_points}, "
-              f"t 0-{t_max:.1f} ns x{args.t_points}, backend={args.backend}")
-        out.update(population_map(config, eta_grid, times, args.backend, solver, args.max_step))
+        print(f"[map] eta {args.eta_min}-{args.eta_max} x{args.eta_points}, t 0-{t_max:.1f} ns x{args.t_points}")
+        out.update(population_map(config, eta_grid, times, args.backend, solver,
+                                  args.max_step, n_jobs=args.jobs))
 
     if args.mode in ("spectator", "both"):
         deltas = [float(x) / 1000.0 for x in args.deltas_MHz.split(",")]
-        print(f"[spectator] deltas {args.deltas_MHz} MHz, lam_spec={args.lam_spec}, backend={args.backend}")
-        spec = spectator_infidelity(config, eta_grid, deltas, args.lam_spec,
-                                    args.backend, solver, args.max_step)
+        drags = (False,) if args.no_drag_compare else (False, True)
+        print(f"[spectator] deltas {args.deltas_MHz} MHz, lam_spec={args.lam_spec}, drags={drags}")
+        spec = spectator_infidelity(config, eta_grid, deltas, args.lam_spec, drags,
+                                    args.backend, solver, args.max_step, n_jobs=args.jobs)
         out.update({"infidelity": spec["infidelity"], "delta_Q_GHz": spec["delta_Q_GHz"],
-                    "spec_leak": spec["leak"], "eta_grid": spec["eta_grid"],
-                    "spec_eta_grid": spec["eta_grid"]})
+                    "drags": spec["drags"], "spec_leak": spec["leak"],
+                    "eta_grid": spec["eta_grid"], "spec_eta_grid": spec["eta_grid"]})
 
     np.savez(args.out, **out)
     print(f"written {args.out}")

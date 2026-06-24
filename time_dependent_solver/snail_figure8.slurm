@@ -3,8 +3,8 @@
 #SBATCH --output=snail_fig8_%j.out
 #SBATCH --error=snail_fig8_%j.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem-per-cpu=16G
+#SBATCH --cpus-per-task=16        # process-pool workers (figure8_data --jobs)
+#SBATCH --mem-per-cpu=2G          # ~32G total; raise if coupler_levels/Hilbert size grows
 #SBATCH --time=12:00:00          # full eta x time map + spectator scan on the exact coupler
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=wcalphon@syr.edu
@@ -24,21 +24,23 @@ MODE="${MODE:-both}"                     # map | spectator | both
 OUT="${OUT:-fig8.npz}"
 PLOT="${PLOT:-fig8.png}"
 ETA_MIN="${ETA_MIN:-0.1}"; ETA_MAX="${ETA_MAX:-2.4}"; ETA_POINTS="${ETA_POINTS:-32}"
-T_POINTS="${T_POINTS:-160}"
-DELTAS_MHZ="${DELTAS_MHZ:-100,200,400}"
-LAM_SPEC="${LAM_SPEC:-0.20}"
+T_POINTS="${T_POINTS:-120}"
+DELTAS_MHZ="${DELTAS_MHZ:-50,100,200,400}"
+LAM_SPEC="${LAM_SPEC:-0.1}"
+JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-1}}"   # process-pool workers
+DRAG_FLAG="${DRAG_FLAG:-}"                   # set to "--no-drag-compare" to skip DRAG-on
 LAUNCHER="${LAUNCHER:-uv run python}"
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 cd "${SLURM_SUBMIT_DIR:-.}"
-echo "host=$(hostname) job=${SLURM_JOB_ID} mode=${MODE} start=$(date -Is)"
+echo "host=$(hostname) job=${SLURM_JOB_ID} mode=${MODE} jobs=${JOBS} start=$(date -Is)"
 
 DEVICE_FLAG=""
 [ -n "${DEVICE}" ] && DEVICE_FLAG="--device ${DEVICE}"
 
 srun ${LAUNCHER} figure8_data.py \
-    ${DEVICE_FLAG} \
-    --mode "${MODE}" --backend qutip \
+    ${DEVICE_FLAG} ${DRAG_FLAG} \
+    --mode "${MODE}" --backend qutip --jobs "${JOBS}" \
     --out "${OUT}" --plot "${PLOT}" \
     --eta-min "${ETA_MIN}" --eta-max "${ETA_MAX}" --eta-points "${ETA_POINTS}" \
     --t-points "${T_POINTS}" \
