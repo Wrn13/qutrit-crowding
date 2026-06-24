@@ -1,0 +1,24 @@
+{
+  "qubit_freqs_GHz": [
+    3.5,
+    5.7
+  ],
+  "qubit_levels": 3,
+  "lam_a": 0.1,
+  "lam_b": 0.1,
+  "coupler_freq_GHz": 4.7,
+  "coupler_levels": 5,
+  "g3_GHz": 0.06,
+  "g4_GHz": 0.0,
+  "spec_levels_qubit": 2,
+  "spec_levels_sub": 3,
+  "anchor": 1,
+  "t_g_ns": 1000,
+  "envelope": "raised_cosine",
+  "amp_scale": 1,
+  "wp_offset_GHz": 0.0,
+  "integrate": true,
+  "rtol": 1e-06,
+  "atol": 1e-08,
+  "nsteps": 500000
+}
