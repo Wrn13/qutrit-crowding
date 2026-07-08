@@ -16,21 +16,21 @@ paper's RWA effective Hamiltonian.
              (Zhou SI Disc. 1) to cancel leakage into the detuned spectator; it
              requires a shaped pulse, so panel (b) uses a raised-cosine envelope.
 
-Backends:
-  dense  -- scipy on ZhouCoupler.hamiltonian_matrix (no QuTiP); good for small
-            grids and in-sandbox validation.
-  qutip  -- ZhouCoupler.evolve_trajectory / .iswap_fidelity (compiled sparse
-            sesolve); for production grids on a compute node.
+Solver: QuTiP's compiled sesolve. By default it runs on CPU; pass --gpu to route
+through the qutip-jax / diffrax backend (zhou_coupler.use_gpu). Note GPU only wins
+for large Hilbert spaces -- for these small couplers CPU is usually faster.
 
 Parallelism: the (eta) columns of panel (a) and the (drag, delta_Q, eta) points
 of panel (b) are independent and are evaluated across a process pool (--jobs N,
 defaulting to $SLURM_CPUS_PER_TASK or the CPU count). Keep BLAS single-threaded
 per worker (the SLURM script exports OMP_NUM_THREADS=1) to avoid oversubscription.
+--gpu forces --jobs 1 (a single process drives the GPU, which parallelizes the
+linear algebra internally).
 
 Usage
 -----
-    python figure8_data.py --mode both --backend qutip --jobs 16 \
-        --out fig8.npz --plot fig8.png
+    python figure8_data.py --mode both --jobs 16 --out fig8.npz --plot fig8.png
+    python figure8_data.py --mode both --gpu --out fig8.npz          # GPU (large systems)
 See snail_figure8.slurm for the cluster job.
 """
 
@@ -195,42 +195,6 @@ def build_gate(config: Dict[str, Any], eta: float, t_env: float,
 
 
 # ---------------------------------------------------------------------------
-# Backends
-# ---------------------------------------------------------------------------
-def _trajectory(cpl, init_occ: Sequence[int], times: np.ndarray, backend: str,
-                solver: Dict[str, Any], max_step: float) -> np.ndarray:
-    """State vector at each time in `times` (shape (len(times), dim))."""
-    if backend == "qutip":
-        return cpl.evolve_trajectory(init_occ, times, **solver)
-    from scipy.integrate import solve_ivp
-    y0 = np.zeros(cpl.dim, dtype=complex)
-    y0[cpl.fock_index(list(init_occ))] = 1.0
-    sol = solve_ivp(lambda t, y: -1j * (cpl.hamiltonian_matrix(t) @ y),
-                    (0.0, float(times[-1])), y0, t_eval=times,
-                    rtol=solver["rtol"], atol=solver["atol"], max_step=max_step, method="RK45")
-    return sol.y.T
-
-
-def _propagator4(cpl, a: int, b: int, t_g: float, backend: str,
-                 solver: Dict[str, Any], max_step: float) -> np.ndarray:
-    """4x4 projected propagator on the (a, b) computational subspace."""
-    if backend == "qutip":
-        return cpl.propagator_columns(a, b, t_g, **solver)
-    from scipy.integrate import solve_ivp
-    idx = cpl._subspace_indices(a, b)
-    U = np.zeros((4, 4), dtype=complex)
-    for col, start in enumerate(idx):
-        y0 = np.zeros(cpl.dim, dtype=complex); y0[start] = 1.0
-        sol = solve_ivp(lambda t, y: -1j * (cpl.hamiltonian_matrix(t) @ y),
-                        (0.0, t_g), y0, rtol=solver["rtol"], atol=solver["atol"],
-                        max_step=max_step, method="RK45")
-        psi = sol.y[:, -1]
-        for row, end in enumerate(idx):
-            U[row, col] = psi[end]
-    return U
-
-
-# ---------------------------------------------------------------------------
 # Parallel map helper
 # ---------------------------------------------------------------------------
 def _resolve_jobs(n_jobs: Optional[int]) -> int:
@@ -271,11 +235,11 @@ def _pmap(func, arg_list: List[Any], n_jobs: Optional[int]) -> List[Any]:
 # ---------------------------------------------------------------------------
 def _map_column_worker(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """One eta column of the population map (P10, P01, n_coupler, leak over time)."""
-    config, eta, times, backend, solver, max_step = args
+    config, eta, times, solver = args
     cpl, _ = build_gate(config, eta, t_env=float(times[-1]))
     i00 = cpl.fock_index([0, 0, 0]); i01 = cpl.fock_index([0, 1, 0])
     i10 = cpl.fock_index([1, 0, 0]); i11 = cpl.fock_index([1, 1, 0])
-    states = _trajectory(cpl, [0, 1, 0], times, backend, solver, max_step)
+    states = cpl.evolve_trajectory([0, 1, 0], times, **solver)
     pops = np.abs(states) ** 2
     ncpl = np.array([cpl.mean_occupation(p, 2) for p in pops])
     leak = 1.0 - (pops[:, i00] + pops[:, i01] + pops[:, i10] + pops[:, i11])
@@ -283,10 +247,11 @@ def _map_column_worker(args: Tuple) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
 
 
 def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarray,
-                   backend: str = "dense", solver: Optional[Dict[str, Any]] = None,
-                   max_step: float = 0.02, n_jobs: Optional[int] = None) -> Dict[str, np.ndarray]:
+                   solver: Optional[Dict[str, Any]] = None,
+                   n_jobs: Optional[int] = None) -> Dict[str, np.ndarray]:
     """P(|01> -> |10>) over the (eta, time) grid (parallel over eta), plus
-    diagnostics and the analytic full-iSWAP line t_f(eta).
+    diagnostics and the analytic full-iSWAP line t_f(eta). Uses QuTiP's compiled
+    (CPU) or qutip-jax/diffrax (GPU) solver.
 
     Parameters
     ----------
@@ -296,14 +261,10 @@ def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarr
         Pump strengths |eta| to scan (x-axis).
     times : ndarray
         Output times in ns (y-axis); sorted, starting at 0.
-    backend : {"dense", "qutip"}
-        Solver backend.
     solver : dict, optional
         Tolerances (atol, rtol, nsteps); defaults provided.
-    max_step : float, default 0.02
-        Dense-backend max ODE step (ns).
     n_jobs : int, optional
-        Worker processes (see _resolve_jobs).
+        Worker processes (see _resolve_jobs). Ignored on GPU (single process).
 
     Returns
     -------
@@ -311,7 +272,7 @@ def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarr
         eta_grid, times, P10 / P01 / n_coupler / leak [n_eta, n_t], and t_f (n_eta).
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
-    args = [(config, float(e), times, backend, solver, max_step) for e in eta_grid]
+    args = [(config, float(e), times, solver) for e in eta_grid]
     results = _pmap(_map_column_worker, args, n_jobs)
     P10 = np.array([r[0] for r in results]); P01 = np.array([r[1] for r in results])
     ncpl = np.array([r[2] for r in results]); leak = np.array([r[3] for r in results])
@@ -326,13 +287,13 @@ def population_map(config: Dict[str, Any], eta_grid: np.ndarray, times: np.ndarr
 # ---------------------------------------------------------------------------
 def _spectator_point_worker(args: Tuple) -> Tuple[float, float]:
     """One (drag, delta_Q, eta) spectator point: returns (infidelity, leakage)."""
-    config, eta, delta_Q, lam_spec, drag, backend, solver, max_step = args
+    config, eta, delta_Q, lam_spec, drag, solver = args
     t_g = raised_cosine_iswap_duration(config["g3_GHz"], config["lam_a"],
                                        config["lam_b"], eta)
     cpl, _ = build_gate(config, eta, t_env=t_g, spectator=(delta_Q, lam_spec),
                         envelope="raised_cosine", drag=drag,
                         delta_drag_GHz=(delta_Q if drag else None))
-    U = _propagator4(cpl, 0, 1, t_g, backend, solver, max_step)
+    U = cpl.propagator_columns(0, 1, t_g, **solver)
     F, lk = cpl._iswap_fidelity_from_U(U, True)
     return 1.0 - F, lk
 
@@ -340,8 +301,8 @@ def _spectator_point_worker(args: Tuple) -> Tuple[float, float]:
 def spectator_infidelity(config: Dict[str, Any], eta_grid: np.ndarray,
                          delta_Q_GHz: Sequence[float], lam_spec: float = 0.20,
                          drags: Sequence[bool] = (False, True),
-                         backend: str = "dense", solver: Optional[Dict[str, Any]] = None,
-                         max_step: float = 0.02, n_jobs: Optional[int] = None) -> Dict[str, np.ndarray]:
+                         solver: Optional[Dict[str, Any]] = None,
+                         n_jobs: Optional[int] = None) -> Dict[str, np.ndarray]:
     """Coherent iSWAP infidelity 1 - F vs pump strength, for each spectator detuning
     and DRAG setting, on a raised-cosine gate at its full-iSWAP duration t_g(eta).
     Parallel over the flattened (drag, delta_Q, eta) grid.
@@ -358,14 +319,10 @@ def spectator_infidelity(config: Dict[str, Any], eta_grid: np.ndarray,
         Spectator participation.
     drags : sequence of bool, default (False, True)
         DRAG settings to compare.
-    backend : {"dense", "qutip"}
-        Solver backend.
     solver : dict, optional
         Tolerances; defaults provided.
-    max_step : float, default 0.02
-        Dense-backend max ODE step (ns).
     n_jobs : int, optional
-        Worker processes (see _resolve_jobs).
+        Worker processes (see _resolve_jobs). Ignored on GPU (single process).
 
     Returns
     -------
@@ -375,7 +332,7 @@ def spectator_infidelity(config: Dict[str, Any], eta_grid: np.ndarray,
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     deltas = np.asarray(delta_Q_GHz, dtype=float)
     drags = list(drags)
-    args = [(config, float(e), float(d), lam_spec, bool(dr), backend, solver, max_step)
+    args = [(config, float(e), float(d), lam_spec, bool(dr), solver)
             for dr in drags for d in deltas for e in eta_grid]
     results = _pmap(_spectator_point_worker, args, n_jobs)
     infid = np.array([r[0] for r in results]).reshape(len(drags), len(deltas), len(eta_grid))
@@ -459,7 +416,8 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", default=None, help="device JSON (overrides FIG8_DEFAULTS)")
     ap.add_argument("--mode", choices=["map", "spectator", "both"], default="both")
-    ap.add_argument("--backend", choices=["dense", "qutip"], default="dense")
+    ap.add_argument("--gpu", action="store_true",
+                    help="run the solver on GPU via qutip-jax/diffrax (forces --jobs 1)")
     ap.add_argument("--jobs", type=int, default=0, help="worker processes (0 = SLURM_CPUS_PER_TASK or CPU count)")
     ap.add_argument("--out", default="fig8.npz", help="output .npz")
     ap.add_argument("--plot", default=None, help="optional output PNG")
@@ -473,33 +431,36 @@ def main() -> None:
     ap.add_argument("--deltas-MHz", default="100,200,400", help="comma list of spectator detunings (MHz)")
     ap.add_argument("--lam-spec", type=float, default=0.20)
     ap.add_argument("--no-drag-compare", action="store_true", help="only compute DRAG-off")
-    # solver
-    ap.add_argument("--max-step", type=float, default=0.02, help="dense-backend max ODE step (ns)")
+    # solver tolerances (nsteps ignored on GPU/diffrax)
     ap.add_argument("--atol", type=float, default=1e-10)
     ap.add_argument("--rtol", type=float, default=1e-8)
     ap.add_argument("--nsteps", type=int, default=500000)
     args = ap.parse_args()
 
+    if args.gpu:
+        import zhou_coupler
+        zhou_coupler.use_gpu(True)
+        args.jobs = 1                       # one process drives the GPU; it parallelizes internally
+
     config = load_config(args.device)
     solver = {"atol": args.atol, "rtol": args.rtol, "nsteps": args.nsteps}
     eta_grid = np.linspace(args.eta_min, args.eta_max, args.eta_points)
     out: Dict[str, np.ndarray] = {}
-    print(f"jobs={_resolve_jobs(args.jobs)} backend={args.backend}")
+    print(f"jobs={_resolve_jobs(args.jobs)} device={'GPU' if args.gpu else 'CPU'}")
 
     if args.mode in ("map", "both"):
         t_max = args.t_max or 1.3 * iswap_duration_ns(config["g3_GHz"], config["lam_a"],
                                                       config["lam_b"], args.eta_min)
         times = np.linspace(0.0, t_max, args.t_points)
         print(f"[map] eta {args.eta_min}-{args.eta_max} x{args.eta_points}, t 0-{t_max:.1f} ns x{args.t_points}")
-        out.update(population_map(config, eta_grid, times, args.backend, solver,
-                                  args.max_step, n_jobs=args.jobs))
+        out.update(population_map(config, eta_grid, times, solver, n_jobs=args.jobs))
 
     if args.mode in ("spectator", "both"):
         deltas = [float(x) / 1000.0 for x in args.deltas_MHz.split(",")]
         drags = (False,) if args.no_drag_compare else (False, True)
         print(f"[spectator] deltas {args.deltas_MHz} MHz, lam_spec={args.lam_spec}, drags={drags}")
         spec = spectator_infidelity(config, eta_grid, deltas, args.lam_spec, drags,
-                                    args.backend, solver, args.max_step, n_jobs=args.jobs)
+                                    solver, n_jobs=args.jobs)
         out.update({"infidelity": spec["infidelity"], "delta_Q_GHz": spec["delta_Q_GHz"],
                     "drags": spec["drags"], "spec_leak": spec["leak"],
                     "eta_grid": spec["eta_grid"], "spec_eta_grid": spec["eta_grid"]})

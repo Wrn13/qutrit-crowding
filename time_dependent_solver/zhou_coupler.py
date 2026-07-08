@@ -74,10 +74,57 @@ import itertools
 from dataclasses import dataclass
 from math import factorial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-
+from envelope import RaisedCosine, ConstantPulse, Envelope
 import numpy as np
 
 TWO_PI: float = 2.0 * np.pi
+
+# --- solver backend (CPU QuTiP by default; GPU via qutip-jax / diffrax) -------
+# Operators run as `jaxdia` (diagonal-sparse JAX) and states as dense `jax`, with
+# the diffrax integrator, following QuTiP 5 (Lambert et al., arXiv:2412.04705).
+# GPU only wins above a Hilbert-space crossover (thousands of states); for the
+# small couplers here CPU is usually faster -- see use_gpu().
+_SOLVER_BACKEND: Dict[str, Any] = {"gpu": False, "op_dtype": "jaxdia", "state_dtype": "jax",
+                                   "method": "diffrax"}
+
+
+def use_gpu(enable: bool = True, x64: bool = True) -> None:
+    """Route the QuTiP solver through the qutip-jax / diffrax GPU backend.
+
+    When enabled, `to_qutip_hamiltonian` stores each constant operator in the
+    `jaxdia` data layer, initial states are converted to dense `jax`, and the
+    solvers integrate with diffrax (which runs on GPU if JAX sees one). Requires
+    `qutip-jax` and a JAX build with CUDA; raises ImportError otherwise.
+
+    Note: JAX + diffrax pays off only for large Hilbert spaces (the QuTiP 5 paper
+    shows the CPU<->GPU crossover in the thousands of states). For the modest
+    couplers in this project (dim ~ tens), CPU QuTiP is typically faster; GPU is
+    worthwhile mainly when scaling to many modes/levels or open-system
+    (superoperator) runs.
+
+    Parameters
+    ----------
+    enable : bool, default True
+        Turn the GPU backend on (True) or back to CPU QuTiP (False).
+    x64 : bool, default True
+        Enable JAX double precision (recommended for gate fidelities).
+
+    Returns
+    -------
+    None
+    """
+    if enable:
+        import jax
+        import qutip_jax  # noqa: F401  (registers the 'jax'/'jaxdia' data layers)
+        if x64:
+            jax.config.update("jax_enable_x64", True)
+    _SOLVER_BACKEND["gpu"] = bool(enable)
+
+
+def gpu_enabled() -> bool:
+    """True if the qutip-jax / diffrax GPU backend is active."""
+    return bool(_SOLVER_BACKEND["gpu"])
+
 
 # numpy>=2 renamed trapz -> trapezoid; fall back only if needed (trapz is gone in 2.x).
 _trapezoid: Callable[..., float] = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
@@ -93,82 +140,6 @@ FluxLetter = Tuple[np.ndarray, float, float, Optional[Tuple[int, bool]]]
 # operator). pump_signature is the sorted tuple of (tone_index, is_conjugate)
 # pump factors carried by the term.
 HamiltonianTerm = Tuple[float, Tuple[Tuple[int, bool], ...], np.ndarray]
-
-
-# ===========================================================================
-# Pump envelopes  (real shape eps(t) on [0, t_g]; peak scale carried in `amp`)
-# ===========================================================================
-class Envelope:
-    """Base class for a real pump-amplitude envelope eps(t) on [0, t_g].
-
-    Subclasses implement `value` and `deriv`; `area` integrates eps over the gate
-    (subclasses with closed forms override it).
-
-    Parameters
-    ----------
-    amp : float
-        Peak amplitude. Carries |eps| in rad/ns, or directly |eta| when the
-        owning PumpTone has ``is_eta=True``.
-    t_g : float
-        Gate duration in ns; the envelope is supported on [0, t_g].
-    """
-
-    def __init__(self, amp: float, t_g: float) -> None:
-        self.amp: float = float(amp)
-        self.t_g: float = float(t_g)
-
-    def value(self, t: float) -> float:
-        """Envelope amplitude at time `t` (ns). Subclasses must implement."""
-        raise NotImplementedError
-
-    def deriv(self, t: float) -> float:
-        """Time derivative d eps/dt at time `t` (ns). Subclasses must implement."""
-        raise NotImplementedError
-
-    def area(self) -> float:
-        """Return integral_0^{t_g} value(t) dt by quadrature (override if a closed
-        form exists)."""
-        ts = np.linspace(0.0, self.t_g, 4001)
-        return float(_trapezoid([self.value(t) for t in ts], ts))
-
-
-class ConstantPulse(Envelope):
-    """Flat pump with instantaneous on/off; handy for steady-state rate checks."""
-
-    def value(self, t: float) -> float:
-        """Amplitude `amp` for t in [0, t_g], else 0."""
-        return self.amp if 0.0 <= t <= self.t_g else 0.0
-
-    def deriv(self, t: float) -> float:
-        """Zero everywhere (flat pulse)."""
-        return 0.0
-
-    def area(self) -> float:
-        """Closed form: amp * t_g."""
-        return self.amp * self.t_g
-
-
-class RaisedCosine(Envelope):
-    """Hann (raised-cosine) envelope: smooth turn-on/off, vanishing endpoints,
-
-        value(t) = amp/2 [1 - cos(2 pi t / t_g)] ,  t in [0, t_g] .
-    """
-
-    def value(self, t: float) -> float:
-        """Hann amplitude at `t` (ns); 0 outside [0, t_g]."""
-        if not (0.0 <= t <= self.t_g):
-            return 0.0
-        return self.amp * 0.5 * (1.0 - np.cos(TWO_PI * t / self.t_g))
-
-    def deriv(self, t: float) -> float:
-        """Analytic derivative of the Hann window at `t` (ns); 0 outside [0, t_g]."""
-        if not (0.0 <= t <= self.t_g):
-            return 0.0
-        return self.amp * 0.5 * (TWO_PI / self.t_g) * np.sin(TWO_PI * t / self.t_g)
-
-    def area(self) -> float:
-        """Closed form: amp * t_g / 2 (exact integral of the Hann window)."""
-        return self.amp * self.t_g / 2.0
 
 
 # ===========================================================================
@@ -295,7 +266,7 @@ class ZhouCoupler:
         Per-mode Fock truncation. 2 -> qubit (sigma_-, Eq. 72); >= 3 -> oscillator
         (captures leakage). A scalar applies to every mode.
 
-    Attributes:
+    Attributes
     ----------
     omega : ndarray
         Mode angular frequencies (rad/ns).
@@ -640,11 +611,11 @@ class ZhouCoupler:
             the form handed to QuTiP. A finite cutoff drops the fast carriers,
             leaving a rotating-wave / average-Hamiltonian reduction.
 
-        Returns:
+        Returns
         -------
         list of (float, tuple, ndarray)
             (exact Omega in rad/ns, pump signature, constant operator) per group.
-        """  # noqa: D205
+        """
         cutoff_rad = abs(cutoff_GHz) * TWO_PI
         letters = self._flux_letters()
 
@@ -795,14 +766,14 @@ class ZhouCoupler:
             Store each constant operator as a SciPy CSR matrix (the fast path);
             False keeps dense arrays.
 
-        Returns:
+        Returns
         -------
         qutip.QobjEvo or list
             A QobjEvo on QuTiP 5; the raw list on QuTiP 4 (both accepted by the
             solvers). Feed to qt.sesolve (closed system) or qt.mesolve /
             qt.propagator with collapse operators (T1/T2, coupler loss) for the
             open-system run that hardware adds on top of Zhou's unitary model.
-        """  # noqa: D205
+        """
         import cmath
         import qutip as qt
         import scipy.sparse as sp
@@ -824,6 +795,8 @@ class ZhouCoupler:
         for omega, pump_signature, operator in self.expand_terms(cutoff_GHz):
             matrix = sp.csr_matrix(operator) if sparse else np.asarray(operator, dtype=complex)
             qobj = qt.Qobj(matrix, dims=dims)
+            if _SOLVER_BACKEND["gpu"]:
+                qobj = qobj.to(_SOLVER_BACKEND["op_dtype"])      # jaxdia for GPU
             if abs(omega) < 1e-9 and not pump_signature:
                 H.append(qobj)                                  # genuinely static term
             else:
@@ -835,12 +808,24 @@ class ZhouCoupler:
 
     # -- time evolution & gate metrics (QuTiP compiled solver) --------------
     def _qutip_options(self, atol: float, rtol: float, nsteps: int) -> Any:
-        """Return a solver-options object compatible with QuTiP 4 or 5."""
+        """Return a solver-options object compatible with QuTiP 4 or 5 (and the
+        diffrax integrator when the GPU backend is active)."""
         import qutip as qt
+        if _SOLVER_BACKEND["gpu"]:
+            return {"method": _SOLVER_BACKEND["method"], "atol": atol, "rtol": rtol}
         try:
             return qt.Options(atol=atol, rtol=rtol, nsteps=nsteps)     # QuTiP 4
-        except AttributeError:
-            return {"atol": atol, "rtol": rtol, "nsteps": nsteps}       # QuTiP 5
+        except (AttributeError, TypeError):
+            return {"atol": atol, "rtol": rtol, "nsteps": nsteps}       # QuTiP 5 (CPU)
+
+    def _ket(self, start_index: int) -> Any:
+        """Computational-basis ket |start_index> as a QuTiP Qobj, converted to the
+        dense `jax` data layer when the GPU backend is active."""
+        import qutip as qt
+        vector = np.zeros(self.dim, dtype=complex)
+        vector[start_index] = 1.0
+        psi0 = qt.Qobj(vector.reshape(-1, 1), dims=[self.dims, [1] * self.n_modes])
+        return psi0.to(_SOLVER_BACKEND["state_dtype"]) if _SOLVER_BACKEND["gpu"] else psi0
 
     def _sesolve_final(self, H: Any, start_index: int, t_g: float,
                        options: Any) -> np.ndarray:
@@ -854,9 +839,7 @@ class ZhouCoupler:
         the intermediate points and only the final state is returned.
         """
         import qutip as qt
-        vector = np.zeros(self.dim, dtype=complex)
-        vector[start_index] = 1.0
-        psi0 = qt.Qobj(vector.reshape(-1, 1), dims=[self.dims, [1] * self.n_modes])
+        psi0 = self._ket(start_index)
         n_out = int(np.clip(np.ceil(t_g / 5.0), 1, 4000)) + 1   # ~one output / 5 ns
         tlist = np.linspace(0.0, t_g, n_out)
         result = qt.sesolve(H, psi0, tlist, options=options)
@@ -914,9 +897,7 @@ class ZhouCoupler:
         import qutip as qt
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
-        vector = np.zeros(self.dim, dtype=complex)
-        vector[self.fock_index(init_occupations)] = 1.0
-        psi0 = qt.Qobj(vector.reshape(-1, 1), dims=[self.dims, [1] * self.n_modes])
+        psi0 = self._ket(self.fock_index(init_occupations))
         result = qt.sesolve(H, psi0, np.asarray(times, dtype=float), options=options)
         return np.array([state.full().ravel() for state in result.states])
 
@@ -939,11 +920,11 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns:
+        Returns
         -------
         ndarray, shape (4, 4)
             The projected propagator (columns evolve |00>, |01>, |10>, |11>).
-        """  # noqa: D205
+        """
         H = self.to_qutip_hamiltonian()
         options = self._qutip_options(atol, rtol, nsteps)
         indices = self._subspace_indices(a, b)
@@ -974,7 +955,7 @@ class ZhouCoupler:
         nsteps : int
             Maximum internal solver steps between outputs.
 
-        Returns:
+        Returns
         -------
         fidelity : float
             Leakage-aware average gate fidelity vs the ideal iSWAP.
@@ -983,7 +964,7 @@ class ZhouCoupler:
         U : ndarray, shape (4, 4)
             The projected propagator.
 
-        Notes:
+        Notes
         -----
         Open system ('what hardware achieves'): build collapse operators from the
         embedded ladder ops -- e.g. sqrt(1/T1) qt.Qobj(self.a_ops[i]) for
@@ -991,7 +972,7 @@ class ZhouCoupler:
         dephasing -- propagate the superoperator with
         qt.propagator(self.to_qutip_hamiltonian(), [0, t_g], c_ops=...), restrict
         to the computational subspace, and use qt.average_gate_fidelity.
-        """  # noqa: D205
+        """
         U = self.propagator_columns(a, b, t_g, atol=atol, rtol=rtol, nsteps=nsteps)
         fidelity, leakage = self._iswap_fidelity_from_U(U, fit_virtual_z)
         return fidelity, leakage, U
