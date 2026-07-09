@@ -19,7 +19,7 @@
     "min_detuning_GHz": 0.05,
     "drag_compare": true,
     "drag_compare_below_MHz": 100.0,
-    "t_g_ns": 1000,
+    "t_g_ns": 500,
     "envelope": "raised_cosine",
     "amp_scale": 1,
     "wp_offset_GHz": 0.0,
@@ -38,7 +38,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 1,
@@ -49,7 +49,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 2,
@@ -60,7 +60,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 3,
@@ -71,7 +71,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 4,
@@ -82,7 +82,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 5,
@@ -93,7 +93,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 6,
@@ -104,7 +104,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 7,
@@ -115,7 +115,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 8,
@@ -126,7 +126,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 9,
@@ -137,7 +137,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.7,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 10,
@@ -148,7 +148,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 11,
@@ -159,7 +159,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 12,
@@ -170,7 +170,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 13,
@@ -181,7 +181,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 14,
@@ -192,7 +192,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 15,
@@ -203,7 +203,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 16,
@@ -214,7 +214,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 17,
@@ -225,7 +225,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 18,
@@ -236,7 +236,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 19,
@@ -247,7 +247,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.8,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 20,
@@ -258,7 +258,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 21,
@@ -269,7 +269,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 22,
@@ -280,7 +280,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 23,
@@ -291,7 +291,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 24,
@@ -302,7 +302,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 25,
@@ -313,7 +313,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 26,
@@ -324,7 +324,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 27,
@@ -335,7 +335,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 28,
@@ -346,7 +346,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 29,
@@ -357,7 +357,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 3.9,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 30,
@@ -368,7 +368,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 31,
@@ -379,7 +379,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 32,
@@ -390,7 +390,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 33,
@@ -401,7 +401,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 34,
@@ -412,7 +412,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 35,
@@ -423,7 +423,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 36,
@@ -434,7 +434,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 37,
@@ -445,7 +445,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 38,
@@ -456,7 +456,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 39,
@@ -467,7 +467,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.0,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 40,
@@ -478,7 +478,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 41,
@@ -489,7 +489,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 42,
@@ -500,7 +500,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 43,
@@ -511,7 +511,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 44,
@@ -522,7 +522,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 45,
@@ -533,7 +533,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 46,
@@ -544,7 +544,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 47,
@@ -555,7 +555,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 48,
@@ -566,7 +566,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 49,
@@ -577,7 +577,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 50,
@@ -588,7 +588,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 51,
@@ -599,7 +599,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 52,
@@ -610,7 +610,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 53,
@@ -621,7 +621,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 54,
@@ -632,7 +632,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 55,
@@ -643,7 +643,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 56,
@@ -654,7 +654,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 57,
@@ -665,7 +665,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 58,
@@ -676,7 +676,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 59,
@@ -687,7 +687,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 4.1,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 60,
@@ -698,7 +698,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 61,
@@ -709,7 +709,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 62,
@@ -720,7 +720,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 63,
@@ -731,7 +731,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 64,
@@ -742,7 +742,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 65,
@@ -753,7 +753,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 66,
@@ -764,7 +764,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 67,
@@ -775,7 +775,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 68,
@@ -786,7 +786,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 69,
@@ -797,7 +797,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.2,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 70,
@@ -808,7 +808,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 71,
@@ -819,7 +819,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 72,
@@ -830,7 +830,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 73,
@@ -841,7 +841,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 74,
@@ -852,7 +852,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 75,
@@ -863,7 +863,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 76,
@@ -874,7 +874,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 77,
@@ -885,7 +885,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 78,
@@ -896,7 +896,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 79,
@@ -907,7 +907,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.3,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 80,
@@ -918,7 +918,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 81,
@@ -929,7 +929,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 82,
@@ -940,7 +940,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 83,
@@ -951,7 +951,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 84,
@@ -962,7 +962,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 85,
@@ -973,7 +973,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 86,
@@ -984,7 +984,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 87,
@@ -995,7 +995,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 88,
@@ -1006,7 +1006,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 89,
@@ -1017,7 +1017,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.4,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     },
     {
       "index": 90,
@@ -1028,7 +1028,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 3.7
+      "spec_abs_GHz": 3.75
     },
     {
       "index": 91,
@@ -1039,7 +1039,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 3.8
+      "spec_abs_GHz": 3.85
     },
     {
       "index": 92,
@@ -1050,7 +1050,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 3.9
+      "spec_abs_GHz": 3.95
     },
     {
       "index": 93,
@@ -1061,7 +1061,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 4.0
+      "spec_abs_GHz": 4.05
     },
     {
       "index": 94,
@@ -1072,7 +1072,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.15
     },
     {
       "index": 95,
@@ -1083,7 +1083,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 4.1
+      "spec_abs_GHz": 4.25
     },
     {
       "index": 96,
@@ -1094,7 +1094,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 5.2
+      "spec_abs_GHz": 5.25
     },
     {
       "index": 97,
@@ -1105,7 +1105,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 5.3
+      "spec_abs_GHz": 5.35
     },
     {
       "index": 98,
@@ -1116,7 +1116,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 5.4
+      "spec_abs_GHz": 5.45
     },
     {
       "index": 99,
@@ -1127,7 +1127,7 @@
       "kind": "target",
       "wa_GHz": 3.5,
       "wb_GHz": 5.5,
-      "spec_abs_GHz": 5.5
+      "spec_abs_GHz": 5.55
     }
   ]
 }
