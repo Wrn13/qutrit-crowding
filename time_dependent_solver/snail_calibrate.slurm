@@ -30,7 +30,7 @@ set -euo pipefail
 DEVICE="${DEVICE:-device.json}"
 CALIB="${CALIB:-calibration.json}"
 CALIBRATED_DEVICE="${CALIBRATED_DEVICE:-device_calibrated.json}"
-TARGET_ETA="${TARGET_ETA:-0.1}"          # perturbative target; sets t_g if device has none
+TARGET_ETA="${TARGET_ETA:-1.2}"          # perturbative target; sets t_g if device has none
 TUNE_FREQ="${TUNE_FREQ:-0}"              # set to 1 to also search a small pump-freq offset
 LAUNCHER="${LAUNCHER:-uv run python}"    # e.g. "python" after activating a venv
 GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax; also add "#SBATCH --gres=gpu:1"

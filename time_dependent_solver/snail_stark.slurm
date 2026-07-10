@@ -43,11 +43,11 @@ CALIB="${CALIB:-}"                       # optional calibration.json to read amp
 TARGET_ETA="${TARGET_ETA:-}"            # operating |eta| (sets t_g); or use T_G / AMP_SCALE
 T_G="${T_G:-}"                           # explicit operating gate time (ns)
 AMP_SCALE="${AMP_SCALE:-1.0}"            # amplitude-scale from a prior amplitude calibration
-SPAN_MHZ="${SPAN_MHZ:-60}"               # scan is +/- SPAN/2 about |w_b - w_a|
-POINTS="${POINTS:-41}"                   # offset grid points
+SPAN_MHZ="${SPAN_MHZ:-100}"               # scan is +/- SPAN/2 about |w_b - w_a|
+POINTS="${POINTS:-150}"                   # offset grid points
 WINDOW_FACTOR="${WINDOW_FACTOR:-2.0}"    # time window = factor * t_g
-TIME_POINTS="${TIME_POINTS:-200}"
-LAUNCHER="${LAUNCHER:-uv run python}"    # e.g. "python" after activating a venv
+TIME_POINTS="${TIME_POINTS:-250}"
+LAUNCHER="${LAUNCHER:-uv run --no-sync}"    # e.g. "python" after activating a venv
 GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax (forces --jobs 1)
 
 # One worker per allocated CPU (GPU path is single-process; --gpu overrides anyway).

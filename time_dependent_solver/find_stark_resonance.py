@@ -331,6 +331,9 @@ def main() -> None:
         zhou_coupler.use_gpu(True)
         args.jobs = 1
 
+    if not args.plot:
+        args.plot = args.device.rsplit(".",1)[0] + "_Frequency_Response_Plot.png"
+
     config = load_device(args.device)
     amp_scale = float(args.amp_scale)
     t_g = args.t_g

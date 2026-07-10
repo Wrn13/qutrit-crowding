@@ -128,8 +128,8 @@ DEFAULT_CONFIG = {
     # target qubits a, b
     "qubit_freqs_GHz": [5.00, 4.60],
     "qubit_levels":    3,            # >=3 so target-pair leakage is captured
-    "lam_a":           0.20,         # participation lambda_as = g_as/Delta_as
-    "lam_b":           0.20,         # participation lambda_bs = g_bs/Delta_bs
+    "lam_a":           0.10,         # participation lambda_as = g_as/Delta_as
+    "lam_b":           0.10,         # participation lambda_bs = g_bs/Delta_bs
     # coupler S (the SNAIL)
     "coupler_freq_GHz": 7.00,
     "coupler_levels":   5,
@@ -139,11 +139,11 @@ DEFAULT_CONFIG = {
     "spec_levels_qubit": 2,          # "qubit_qubit" channel
     "spec_levels_sub":   3,          # "qubit_sub" channel
     "anchor":            1,          # spectator freq measured below qubit b
-    "anharm_qubit_GHz": -0.20,       # transmon anharmonicity of qubits a & b (0 = harmonic)
-    "anharm_spec_GHz":  -0.20,       # spectator anharmonicity (qubit_qubit channel)
+    "anharm_qubit_GHz": -0.12,       # transmon anharmonicity of qubits a & b (0 = harmonic)
+    "anharm_spec_GHz":  -0.12,       # spectator anharmonicity (qubit_qubit channel)
     # fixed neighbour bath at ABSOLUTE frequencies (used by --sweep target)
     # target-allocation sweep (--sweep target): fixed w_a & w_s, scan (w_b, w_spec)
-    "spec_lam":          0.20,       # spectator participation for the allocation sweep
+    "spec_lam":          0.10,       # spectator participation for the allocation sweep
     "spec_channel":      "qubit_qubit",  # "qubit_qubit" or "qubit_sub"
     "min_detuning_GHz":  0.05,       # drop placements with |w_b-w_a| below this
     "drag_compare":         False,   # target sweep: also run DRAG-on in the near-collision window
