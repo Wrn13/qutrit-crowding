@@ -33,10 +33,11 @@ CALIBRATED_DEVICE="${CALIBRATED_DEVICE:-device_calibrated.json}"
 TARGET_ETA="${TARGET_ETA:-0.1}"          # perturbative target; sets t_g if device has none
 TUNE_FREQ="${TUNE_FREQ:-0}"              # set to 1 to also search a small pump-freq offset
 LAUNCHER="${LAUNCHER:-uv run python}"    # e.g. "python" after activating a venv
+GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax; also add "#SBATCH --gres=gpu:1"
 
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 cd "${SLURM_SUBMIT_DIR:-.}"
-echo "host=$(hostname) job=${SLURM_JOB_ID} device=${DEVICE} target_eta=${TARGET_ETA} start=$(date -Is)"
+echo "host=$(hostname) job=${SLURM_JOB_ID} device=${DEVICE} target_eta=${TARGET_ETA} gpu=${GPU:-0} start=$(date -Is)"
 
 FREQ_FLAG=""
 [ "${TUNE_FREQ}" = "1" ] && FREQ_FLAG="--tune-freq"
@@ -46,6 +47,6 @@ srun ${LAUNCHER} calibrate_iswap.py \
     --out "${CALIB}" \
     --target-eta "${TARGET_ETA}" \
     --update-device "${CALIBRATED_DEVICE}" \
-    ${FREQ_FLAG}
+    ${FREQ_FLAG} ${GPU_FLAG}
 
 echo "done end=$(date -Is)"

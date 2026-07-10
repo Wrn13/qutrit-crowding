@@ -13,7 +13,7 @@
   "spec_levels_qubit": 2,
   "spec_levels_sub": 3,
   "anchor": 1,
-  "t_g_ns": 1000,
+  "t_g_ns": 300,
   "envelope": "raised_cosine",
   "amp_scale": 1,
   "wp_offset_GHz": 0.0,
