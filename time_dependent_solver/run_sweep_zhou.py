@@ -139,6 +139,8 @@ DEFAULT_CONFIG = {
     "spec_levels_qubit": 2,          # "qubit_qubit" channel
     "spec_levels_sub":   3,          # "qubit_sub" channel
     "anchor":            1,          # spectator freq measured below qubit b
+    "anharm_qubit_GHz": -0.20,       # transmon anharmonicity of qubits a & b (0 = harmonic)
+    "anharm_spec_GHz":  -0.20,       # spectator anharmonicity (qubit_qubit channel)
     # fixed neighbour bath at ABSOLUTE frequencies (used by --sweep target)
     # target-allocation sweep (--sweep target): fixed w_a & w_s, scan (w_b, w_spec)
     "spec_lam":          0.20,       # spectator participation for the allocation sweep
@@ -382,6 +384,11 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     if float(config.get("g4_GHz", 0.0)) != 0.0:
         nonlin[4] = float(config["g4_GHz"])
 
+    aq = float(config.get("anharm_qubit_GHz", 0.0))
+    anharm = {a: aq, b: aq}
+    if pt.channel == "qubit_qubit":                    # spectator is a transmon too
+        anharm[spec] = float(config.get("anharm_spec_GHz", 0.0))
+
     cpl = ZhouCoupler(
         mode_freqs_GHz=freqs_GHz,
         coupler_index=coupler,
@@ -390,6 +397,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                         spec: float(pt.lam_spec)},
         nonlinearities=nonlin,
         levels=levels,
+        anharmonicities_GHz=anharm,
     )
 
     # DRAG targets the off-resonant spectator<->anchor exchange, detuned from the
@@ -520,8 +528,14 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     if float(config.get("g4_GHz", 0.0)) != 0.0:
         nonlin[4] = float(config["g4_GHz"])
 
+    aq = float(config.get("anharm_qubit_GHz", 0.0))
+    anharm = {a: aq, b: aq}
+    if channel == "qubit_qubit":
+        anharm[spec] = float(config.get("anharm_spec_GHz", 0.0))
+
     cpl = ZhouCoupler(mode_freqs_GHz=freqs_GHz, coupler_index=coupler,
-                      participations=participations, nonlinearities=nonlin, levels=levels)
+                      participations=participations, nonlinearities=nonlin, levels=levels,
+                      anharmonicities_GHz=anharm)
 
     # --- nearest collision: spectator vs {a, b}, pump-assisted and direct -----
     # pump-assisted exchange a_q^d a_spec is resonant at |w_q - w_spec| = w_p; the

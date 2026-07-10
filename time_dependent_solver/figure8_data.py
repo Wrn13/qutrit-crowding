@@ -179,14 +179,18 @@ def build_gate(config: Dict[str, Any], eta: float, t_env: float,
     participations = {0: float(config["lam_a"]), 1: float(config["lam_b"])}
     levels = [int(config["qubit_levels"]), int(config["qubit_levels"]),
               int(config["coupler_levels"])]
+    aq = float(config.get("anharm_qubit_GHz", 0.0))
+    anharm = {0: aq, 1: aq}
     if spectator is not None:
         delta_Q_GHz, lam_spec = spectator
         freqs.append(wb - (w_p_GHz + delta_Q_GHz))
         participations[3] = float(lam_spec)
         levels.append(int(config["spec_levels"]))
+        anharm[3] = float(config.get("anharm_spec_GHz", aq))
 
     cpl = ZhouCoupler(mode_freqs_GHz=freqs, coupler_index=2,
-                      participations=participations, nonlinearities=nonlin, levels=levels)
+                      participations=participations, nonlinearities=nonlin, levels=levels,
+                      anharmonicities_GHz=anharm)
     EnvCls = RaisedCosine if envelope == "raised_cosine" else ConstantPulse
     cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=eta, t_g=t_env),
                           is_eta=True, drag=drag, delta_drag_GHz=delta_drag_GHz),

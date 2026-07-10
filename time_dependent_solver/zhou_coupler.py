@@ -74,7 +74,7 @@ import itertools
 from dataclasses import dataclass
 from math import factorial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-from envelope import RaisedCosine, ConstantPulse, Envelope
+
 import numpy as np
 
 TWO_PI: float = 2.0 * np.pi
@@ -140,6 +140,82 @@ FluxLetter = Tuple[np.ndarray, float, float, Optional[Tuple[int, bool]]]
 # operator). pump_signature is the sorted tuple of (tone_index, is_conjugate)
 # pump factors carried by the term.
 HamiltonianTerm = Tuple[float, Tuple[Tuple[int, bool], ...], np.ndarray]
+
+
+# ===========================================================================
+# Pump envelopes  (real shape eps(t) on [0, t_g]; peak scale carried in `amp`)
+# ===========================================================================
+class Envelope:
+    """Base class for a real pump-amplitude envelope eps(t) on [0, t_g].
+
+    Subclasses implement `value` and `deriv`; `area` integrates eps over the gate
+    (subclasses with closed forms override it).
+
+    Parameters
+    ----------
+    amp : float
+        Peak amplitude. Carries |eps| in rad/ns, or directly |eta| when the
+        owning PumpTone has ``is_eta=True``.
+    t_g : float
+        Gate duration in ns; the envelope is supported on [0, t_g].
+    """
+
+    def __init__(self, amp: float, t_g: float) -> None:
+        self.amp: float = float(amp)
+        self.t_g: float = float(t_g)
+
+    def value(self, t: float) -> float:
+        """Envelope amplitude at time `t` (ns). Subclasses must implement."""
+        raise NotImplementedError
+
+    def deriv(self, t: float) -> float:
+        """Time derivative d eps/dt at time `t` (ns). Subclasses must implement."""
+        raise NotImplementedError
+
+    def area(self) -> float:
+        """Return integral_0^{t_g} value(t) dt by quadrature (override if a closed
+        form exists)."""
+        ts = np.linspace(0.0, self.t_g, 4001)
+        return float(_trapezoid([self.value(t) for t in ts], ts))
+
+
+class ConstantPulse(Envelope):
+    """Flat pump with instantaneous on/off; handy for steady-state rate checks."""
+
+    def value(self, t: float) -> float:
+        """Amplitude `amp` for t in [0, t_g], else 0."""
+        return self.amp if 0.0 <= t <= self.t_g else 0.0
+
+    def deriv(self, t: float) -> float:
+        """Zero everywhere (flat pulse)."""
+        return 0.0
+
+    def area(self) -> float:
+        """Closed form: amp * t_g."""
+        return self.amp * self.t_g
+
+
+class RaisedCosine(Envelope):
+    """Hann (raised-cosine) envelope: smooth turn-on/off, vanishing endpoints,
+
+        value(t) = amp/2 [1 - cos(2 pi t / t_g)] ,  t in [0, t_g] .
+    """
+
+    def value(self, t: float) -> float:
+        """Hann amplitude at `t` (ns); 0 outside [0, t_g]."""
+        if not (0.0 <= t <= self.t_g):
+            return 0.0
+        return self.amp * 0.5 * (1.0 - np.cos(TWO_PI * t / self.t_g))
+
+    def deriv(self, t: float) -> float:
+        """Analytic derivative of the Hann window at `t` (ns); 0 outside [0, t_g]."""
+        if not (0.0 <= t <= self.t_g):
+            return 0.0
+        return self.amp * 0.5 * (TWO_PI / self.t_g) * np.sin(TWO_PI * t / self.t_g)
+
+    def area(self) -> float:
+        """Closed form: amp * t_g / 2 (exact integral of the Hann window)."""
+        return self.amp * self.t_g / 2.0
 
 
 # ===========================================================================
@@ -293,6 +369,7 @@ class ZhouCoupler:
         participations: Dict[int, float],
         nonlinearities: Dict[int, float],
         levels: Union[int, Sequence[int]] = 3,
+        anharmonicities_GHz: Optional[Dict[int, float]] = None,
     ) -> None:
         self.omega: np.ndarray = np.asarray(mode_freqs_GHz, dtype=float) * TWO_PI  # rad/ns
         self.n_modes: int = self.omega.size
@@ -326,11 +403,32 @@ class ZhouCoupler:
         if not self.g_n:
             raise ValueError("Provide at least one non-linearity, e.g. {3: g3_GHz}.")
 
+        # per-mode transmon anharmonicity alpha_i (GHz -> rad/ns); 0 = harmonic mode.
+        # The coupler's non-linearity lives in g_n, so it is normally left harmonic
+        # here; alpha is meant for the transmon/spectator modes.
+        self.anharm: np.ndarray = np.zeros(self.n_modes, dtype=float)
+        if anharmonicities_GHz:
+            for index, value in anharmonicities_GHz.items():
+                if not (0 <= int(index) < self.n_modes):
+                    raise ValueError(f"anharmonicity index {index} out of range.")
+                self.anharm[int(index)] = float(value) * TWO_PI
+
         # embedded ladder operators (dense, mixed-radix), built once
         self.a_ops: List[np.ndarray] = [self._embed(self._annihilation(self.dims[i]), i)
                                         for i in range(self.n_modes)]
         self.ad_ops: List[np.ndarray] = [op.conj().T for op in self.a_ops]
         self.identity: np.ndarray = np.eye(self.dim, dtype=complex)
+
+        # static transmon-anharmonicity operator  sum_i (alpha_i/2) a_i^d a_i^d a_i a_i
+        #   = sum_i (alpha_i/2) n_i (n_i - 1)   (diagonal; shifts |2>_i by alpha_i).
+        # Time-independent and number-diagonal, so it commutes with the free
+        # Hamiltonian and enters the interaction picture unchanged (Omega = 0).
+        self._anharm_op: np.ndarray = np.zeros((self.dim, self.dim), dtype=complex)
+        for i in range(self.n_modes):
+            if self.anharm[i] != 0.0:
+                d = self.dims[i]
+                local = np.diag([float(k * (k - 1)) for k in range(d)]).astype(complex)
+                self._anharm_op = self._anharm_op + 0.5 * self.anharm[i] * self._embed(local, i)
 
         # time-independent letters of X(t) (mode operators only); the pump letters
         # are time-dependent and are added in _flux_letters(). Single source of
@@ -566,7 +664,8 @@ class ZhouCoupler:
         return X
 
     def hamiltonian_matrix(self, t: float) -> np.ndarray:
-        """Exact interaction-picture Hamiltonian H_I(t) = sum_n g_n X(t)^n (dense).
+        """Exact interaction-picture Hamiltonian
+        H_I(t) = sum_n g_n X(t)^n + sum_i (alpha_i/2) n_i(n_i-1) (dense).
 
         Reference builder used by the self-test and as a one-point cross-check
         against the QuTiP solver; it is not used in the production solve path.
@@ -589,6 +688,7 @@ class ZhouCoupler:
         H = np.zeros((self.dim, self.dim), dtype=complex)
         for n, g in self.g_n.items():
             H = H + g * powers[n]
+        H = H + self._anharm_op          # static transmon anharmonicity (diagonal)
         return H
 
     # -- exact operator decomposition (engine of the QuTiP export) ----------
@@ -801,6 +901,12 @@ class ZhouCoupler:
                 H.append(qobj)                                  # genuinely static term
             else:
                 H.append([qobj, make_coeff(float(omega), pump_signature)])
+        if np.any(self.anharm):                                 # static transmon anharmonicity
+            matrix = sp.csr_matrix(self._anharm_op) if sparse else self._anharm_op
+            a_qobj = qt.Qobj(matrix, dims=dims)
+            if _SOLVER_BACKEND["gpu"]:
+                a_qobj = a_qobj.to(_SOLVER_BACKEND["op_dtype"])
+            H.append(a_qobj)
         try:
             return qt.QobjEvo(H)
         except Exception:
@@ -1006,3 +1112,15 @@ if __name__ == "__main__":
     print(f"DC <ge|H|eg|/2pi          = {abs(dc_matrix_element) / TWO_PI * 1e3:.4f} MHz")
     print(f"Zhou 6 g3 la lb |eta| /2pi = {coupler.iswap_rate(0, 1) / TWO_PI * 1e3:.4f} MHz")
     print(f"ratio                      = {abs(dc_matrix_element) / coupler.iswap_rate(0, 1):.5f}  (expect 1.0)")
+
+    # transmon anharmonicity: |2>_a should be shifted by alpha_a (diagonal, static)
+    alpha_a_GHz = -0.20
+    anh = ZhouCoupler(mode_freqs_GHz=[4.0, 5.0, 7.0], coupler_index=2,
+                      participations={0: 0.15, 1: 0.15}, nonlinearities={3: 0.10},
+                      levels=[3, 3, 6], anharmonicities_GHz={0: alpha_a_GHz})
+    H0 = anh.hamiltonian_matrix(0.0)
+    e0 = H0[anh.fock_index([0, 0, 0])].real[anh.fock_index([0, 0, 0])]
+    e1 = H0[anh.fock_index([1, 0, 0])].real[anh.fock_index([1, 0, 0])]
+    e2 = H0[anh.fock_index([2, 0, 0])].real[anh.fock_index([2, 0, 0])]
+    shift = ((e2 - e1) - (e1 - e0)) / TWO_PI       # (E2-E1)-(E1-E0) = alpha_a
+    print(f"\nanharmonicity |2>_a shift  = {shift:.4f} GHz  (expect {alpha_a_GHz})")

@@ -145,9 +145,11 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
     if float(config.get("g4_GHz", 0.0)) != 0.0:
         nonlin[4] = float(config["g4_GHz"])
 
+    aq = float(config.get("anharm_qubit_GHz", 0.0))
     cpl = ZhouCoupler(mode_freqs_GHz=[wa, wb, ws], coupler_index=2,
                       participations={0: float(config["lam_a"]), 1: float(config["lam_b"])},
-                      nonlinearities=nonlin, levels=levels)
+                      nonlinearities=nonlin, levels=levels,
+                      anharmonicities_GHz={0: aq, 1: aq})
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
     cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True),
                  normalize_iswap=(0, 1))
