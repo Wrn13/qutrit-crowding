@@ -153,6 +153,11 @@ DEFAULT_CONFIG = {
     "envelope": "raised_cosine",
     "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_iswap.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
+    "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance
+    "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
+    "stark_points":   21,            # per-point chevron offset samples
+    "stark_window_factor": 2.0,      # chevron time window = factor * t_g
+    "stark_time_points":   120,      # chevron time samples
     "integrate": True,               # set False for the instant analytic map only
     "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
     "nsteps": 500000,                # max internal solver steps between outputs
@@ -335,6 +340,48 @@ def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
 # ---------------------------------------------------------------------------
 # Single-point computation (imports zhou_coupler lazily)
 # ---------------------------------------------------------------------------
+def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
+                      t_g: float, amp_scale: float, solver: Dict[str, Any]) -> float:
+    """Per-point AC-Stark-shifted iSWAP resonance offset (GHz) for the pump.
+
+    Runs the spectator-free chevron of find_stark_resonance.py at this point's
+    (w_a, w_b) and operating amplitude, returning the offset from |w_b - w_a| that
+    maximises swap contrast. The spectator is excluded on purpose: the drive
+    frequency is a property of the a<->b gate, calibrated as on hardware without
+    the neighbour. Serial (n_jobs=1) because the caller may already be in a pool.
+
+    Parameters
+    ----------
+    config : dict
+        Merged device configuration (supplies g3, participations, levels,
+        anharmonicity, envelope, and the stark_* chevron resolution keys).
+    wa_GHz, wb_GHz : float
+        Qubit frequencies of this point (GHz).
+    t_g : float
+        Operating gate time (ns); sets the probe |eta| via the normalization.
+    amp_scale : float
+        Amplitude-scale correction from a prior amplitude calibration.
+    solver : dict
+        QuTiP tolerances (atol, rtol, nsteps).
+
+    Returns
+    -------
+    float
+        Stark resonance offset (GHz) to add to |w_b - w_a|.
+    """
+    import find_stark_resonance as FS
+    sub = dict(config)
+    sub["qubit_freqs_GHz"] = [float(wa_GHz), float(wb_GHz)]
+    span = float(config.get("stark_span_MHz", 60.0)) / 1000.0
+    n_pts = int(config.get("stark_points", 21))
+    offsets = np.linspace(-span / 2.0, span / 2.0, n_pts)
+    window = float(config.get("stark_window_factor", 2.0)) * float(t_g)
+    n_time = int(config.get("stark_time_points", 120))
+    res = FS.scan(sub, float(t_g), float(amp_scale), offsets, window, n_time,
+                  solver, n_jobs=1)
+    return float(res["resonance_offset_GHz"])
+
+
 def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     """Compute one sweep point: the analytic collision prediction always, and the
     full QuTiP gate simulation when ``config['integrate']`` is True.
@@ -367,6 +414,18 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     ws = config["coupler_freq_GHz"] * TWO_PI
     w_p = abs(wb - wa)                              # iSWAP pump = |detuning| (fixed)
     w_p_GHz = w_p / TWO_PI + float(config.get("wp_offset_GHz", 0.0))   # calibrated offset
+    # optional: drive at the AC-Stark-shifted resonance (needs the integrated run).
+    # In the spectator sweep w_a, w_b are fixed, so this offset is identical for every
+    # point -- for efficiency you can instead precompute it once with
+    # find_stark_resonance.py and set wp_offset_GHz.
+    stark_offset_GHz = 0.0
+    if bool(config.get("integrate", True)) and bool(config.get("stark_drive", False)):
+        _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
+                   nsteps=int(config.get("nsteps", 500000)))
+        stark_offset_GHz = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
+                                             float(config["t_g_ns"]),
+                                             float(config.get("amp_scale", 1.0)), _sv)
+        w_p_GHz += stark_offset_GHz
     w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
     freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
@@ -441,6 +500,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "g_iswap_eff_MHz": round(float(g_iswap / TWO_PI * 1e3), 4),
         "g_spec_eff_MHz": round(float(g_spec / TWO_PI * 1e3), 4),
         "w_p_GHz": round(float(w_p_GHz), 6),
+        "stark_offset_MHz": round(float(stark_offset_GHz) * 1e3, 4),
         "w_spec_GHz": round(float(w_spec / TWO_PI), 6),
         "t_g_ns": float(config["t_g_ns"]),
         "status": status_drag if status_drag != "ok" else "analytic",
@@ -509,6 +569,18 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     lam_spec = float(config.get("spec_lam", 0.20))
     channel = pt.channel
     integrate = bool(config.get("integrate", True))
+
+    # optional: drive at the per-point AC-Stark-shifted resonance (w_b varies across
+    # the allocation sweep, so Delta_Stark differs point to point). Needs the
+    # integrated run; shifts w_p for both the collision classification and the gate.
+    stark_offset_GHz = 0.0
+    if integrate and bool(config.get("stark_drive", False)):
+        _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
+                   nsteps=int(config.get("nsteps", 500000)))
+        stark_offset_GHz = _stark_offset_GHz(config, wa_GHz, wb_GHz,
+                                             float(config["t_g_ns"]),
+                                             float(config.get("amp_scale", 1.0)), _sv)
+        w_p_GHz += stark_offset_GHz
 
     # Rates/eta are level-independent, so the analytic-only build uses 2 levels
     # everywhere (tiny Hilbert space); the full build uses the configured levels.
@@ -593,6 +665,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "wa_GHz": round(wa_GHz, 6), "wb_GHz": round(wb_GHz, 6),
         "w_snail_GHz": round(ws_GHz, 6), "spec_GHz": round(wspec_GHz, 6),
         "detuning_GHz": round(wb_GHz - wa_GHz, 6), "w_p_GHz": round(w_p_GHz, 6),
+        "stark_offset_MHz": round(float(stark_offset_GHz) * 1e3, 4),
         "lam_spec": round(lam_spec, 4),
         "drag": bool(pt.drag), "drag_applied": bool(base_drag),
         "drag_compare_window": bool(drag_compare and in_window),
@@ -705,9 +778,9 @@ def collect(outdir: str) -> None:
     spec_cols = ["index", "channel", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
                  "beat_GHz", "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
-                 "w_p_GHz", "w_spec_GHz", "t_g_ns", "wall_s"]
+                 "w_p_GHz", "stark_offset_MHz", "w_spec_GHz", "t_g_ns", "wall_s"]
     target_cols = ["index", "kind", "channel", "wa_GHz", "wb_GHz", "w_snail_GHz",
-                   "spec_GHz", "detuning_GHz", "w_p_GHz", "lam_spec", "drag",
+                   "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz", "lam_spec", "drag",
                    "drag_applied", "drag_compare_window", "eta_peak",
                    "g_iswap_eff_MHz", "nearest_beat_GHz", "nearest_kind",
                    "nearest_target", "g_collision_MHz", "status", "F_avg", "leakage",
@@ -838,6 +911,13 @@ def main() -> None:
                     help="[target] near-collision window for the DRAG comparison (default 100)")
     ap.add_argument("--no-integrate", action="store_true",
                     help="analytic collision map only (no time integration)")
+    ap.add_argument("--stark", action="store_true",
+                    help="drive each point at its AC-Stark-shifted resonance (per-point "
+                         "chevron; needs the integrated run and is markedly slower)")
+    ap.add_argument("--stark-span-MHz", type=float, default=None,
+                    help="per-point Stark chevron width (default 60)")
+    ap.add_argument("--stark-points", type=int, default=None,
+                    help="per-point Stark chevron offset samples (default 21)")
     ap.add_argument("--gpu", action="store_true",
                     help="run the solver on GPU via qutip-jax/diffrax (see zhou_coupler.use_gpu)")
     args = ap.parse_args()
@@ -852,6 +932,12 @@ def main() -> None:
             config.update(json.load(f))
     if args.no_integrate:
         config["integrate"] = False
+    if args.stark:
+        config["stark_drive"] = True
+    if args.stark_span_MHz is not None:
+        config["stark_span_MHz"] = float(args.stark_span_MHz)
+    if args.stark_points is not None:
+        config["stark_points"] = int(args.stark_points)
     if args.channel:
         config["spec_channel"] = args.channel
     if args.lam_spec is not None:
