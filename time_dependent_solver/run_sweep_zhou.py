@@ -24,25 +24,23 @@ spectator frequency moves, so the target gate is untouched as the sweep runs:
 
     w_spec = w_b - (spec_freq_GHz * 2pi).
 
-Sweep axes  (channel x spec_freq x lam_spec x drag)
----------------------------------------------------
-* channel   : "qubit_qubit" (2-level neighbor) or "qubit_sub" (3-level neighbor,
-              captures |1>->|2> leakage). In the dressed-mode picture the SNAIL
-              is the coupler, so the old "qubit_snail" channel is reported on
-              EVERY point as the coupler-occupation column ``n_coupler``.
+Sweep axes  (spec_freq x drag)
+------------------------------
 * spec_freq : spectator transition frequency Delta = w_b - w_spec (GHz), swept
               broadly. For a single-tone, pure-g3 coupler the spectator's only
               collision in the qubit band is the one-pump exchange with the
               anchor, resonant at Delta = w_p (beat = Delta - w_p). Two-mode
               higher-order collisions require g4 or a second pump tone; the FULL
               sim still captures whatever is actually present.
-* lam_spec  : spectator participation lambda_spec = g_spec,s/Delta_spec,s. This
-              replaces the old phenomenological spectator ``eta``.
 * drag      : first-order DRAG quadrature (Motzoi et al., PRL 103, 110501 (2009))
               on the pump, eta(t) -> eta(t) - i d eta/dt / (2 pi * beat), tuned to
               the spectator's beat detuning. Suppresses the OFF-resonant spectator;
               skipped (drag_applied=False) when |beat| < 5e-4 GHz, since an
               on-resonant collision needs frequency allocation, not DRAG.
+
+The spectator is a single fixed 3-level anharmonic transmon (config ``spec_levels``
+= 3, ``anharm_spec_GHz``) whose participation equals the qubits' ``lam_b``. Neither
+the participation nor a "channel"/level count is a sweep axis.
 
 Frequency-allocation sweep  (--sweep target)
 --------------------------------------------
@@ -117,7 +115,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 TWO_PI = 2.0 * np.pi
-_CHANNELS = ("qubit_qubit", "qubit_sub")
 _DELTA_EPS_GHz = 5e-4   # |beat| below this: collision is essentially on-resonance
 
 # ---------------------------------------------------------------------------
@@ -135,16 +132,12 @@ DEFAULT_CONFIG = {
     "coupler_levels":   5,
     "g3_GHz":           0.10,        # measured cubic (engine of every process)
     "g4_GHz":           0.0,         # optional quartic (four-wave mixing)
-    # spectator mode
-    "spec_levels_qubit": 2,          # "qubit_qubit" channel
-    "spec_levels_sub":   3,          # "qubit_sub" channel
+    # spectator mode: a single 3-level anharmonic transmon; participation = lam_b
+    "spec_levels":       3,          # spectator Hilbert dimension (captures |1>->|2> leakage)
     "anchor":            1,          # spectator freq measured below qubit b
     "anharm_qubit_GHz": -0.20,       # transmon anharmonicity of qubits a & b (0 = harmonic)
-    "anharm_spec_GHz":  -0.20,       # spectator anharmonicity (qubit_qubit channel)
-    # fixed neighbour bath at ABSOLUTE frequencies (used by --sweep target)
+    "anharm_spec_GHz":  -0.20,       # spectator anharmonicity (0 = harmonic 3-level ladder)
     # target-allocation sweep (--sweep target): fixed w_a & w_s, scan (w_b, w_spec)
-    "spec_lam":          0.20,       # spectator participation for the allocation sweep
-    "spec_channel":      "qubit_qubit",  # "qubit_qubit" or "qubit_sub"
     "min_detuning_GHz":  0.05,       # drop placements with |w_b-w_a| below this
     "drag_compare":         False,   # target sweep: also run DRAG-on in the near-collision window
     "drag_compare_below_MHz": 100.0, # |nearest beat| window (MHz) for the DRAG comparison
@@ -169,12 +162,10 @@ DEFAULT_CONFIG = {
     "nsteps": 500000,                # max internal solver steps between outputs
 }
 
-# Default sweep axes (override with --channels/--specfreqs/--lams).
-DEFAULT_CHANNELS = ["qubit_qubit"]
+# Default sweep axes (override with --specfreqs/--drags).
 # Broad spectator-frequency sweep (GHz). With w_p = 0.40 this crosses the
 # fundamental exchange (m=1, 0.40) and the two-pump process (m=2, 0.80).
 DEFAULT_SPECFREQS_GHz = [round(0.20 + 0.05 * k, 3) for k in range(15)]  # 0.20..0.90
-DEFAULT_LAMS = [0.10]
 DEFAULT_DRAGS = [False, True]
 # For --sweep target, w_a and w_s are fixed while (w_b, w_spec) are scanned; DRAG
 # can only null one collision, so it defaults off for allocation maps.
@@ -189,12 +180,8 @@ class Point:
     ----------
     index : int
         Position in the grid; also the output filename suffix.
-    channel : str
-        Spectator channel, "qubit_qubit" or "qubit_sub" (spectator sweep).
     spec_freq_GHz : float
         Spectator transition frequency Delta = w_b - w_spec (GHz; spectator sweep).
-    lam_spec : float
-        Spectator participation lambda_spec = g_spec,s / Delta_spec,s (spectator sweep).
     drag : bool
         Whether the first-order DRAG quadrature is requested for this point.
     kind : str
@@ -208,9 +195,7 @@ class Point:
     """
 
     index: int
-    channel: str = "qubit_qubit"
     spec_freq_GHz: float = 0.0
-    lam_spec: float = 0.0
     drag: bool = False
     kind: str = "spectator"
     wa_GHz: Optional[float] = None
@@ -221,43 +206,33 @@ class Point:
 # ---------------------------------------------------------------------------
 # Grid construction (deterministic, solver-free)
 # ---------------------------------------------------------------------------
-def build_grid(channels: Sequence[str], specfreqs: Sequence[float],
-               lams: Sequence[float], drags: Sequence[bool]) -> List[Point]:
+def build_grid(specfreqs: Sequence[float], drags: Sequence[bool]) -> List[Point]:
     """Build the Cartesian sweep grid in a stable order.
 
     Parameters
     ----------
-    channels : sequence of str
-        Spectator channels; each must be one of ("qubit_qubit", "qubit_sub").
     specfreqs : sequence of float
         Spectator frequencies Delta = w_b - w_spec (GHz).
-    lams : sequence of float
-        Spectator participations lambda_spec.
     drags : sequence of bool
         DRAG on/off settings.
 
     Returns
     -------
     list of Point
-        Points ordered channel -> spec_freq -> lam_spec -> drag, indexed 0..M-1.
+        Points ordered spec_freq -> drag, indexed 0..M-1.
     """
     points: List[Point] = []
     index = 0
-    for channel in channels:
-        if channel not in _CHANNELS:
-            raise ValueError(f"unknown channel {channel!r}; choose from {_CHANNELS}")
-        for spec_freq in specfreqs:
-            for lam in lams:
-                for drag in drags:
-                    points.append(Point(index=index, channel=channel,
-                                        spec_freq_GHz=float(spec_freq),
-                                        lam_spec=float(lam), drag=bool(drag)))
-                    index += 1
+    for spec_freq in specfreqs:
+        for drag in drags:
+            points.append(Point(index=index, spec_freq_GHz=float(spec_freq),
+                                drag=bool(drag)))
+            index += 1
     return points
 
 
 def build_target_grid(wa_GHz: float, wb_list: Sequence[float], spec_list: Sequence[float],
-                      channel: str, drags: Sequence[bool],
+                      drags: Sequence[bool],
                       min_detuning_GHz: float = 0.05) -> List[Point]:
     """Build the allocation grid: fixed w_a (and w_s), Cartesian w_b x w_spec x drag.
     Placements with |w_b - w_a| < ``min_detuning_GHz`` (pump too slow) are dropped.
@@ -270,8 +245,6 @@ def build_target_grid(wa_GHz: float, wb_list: Sequence[float], spec_list: Sequen
         Partner-qubit frequencies w_b to scan (GHz).
     spec_list : sequence of float
         Spectator ABSOLUTE frequencies w_spec to scan (GHz).
-    channel : str
-        Spectator channel, "qubit_qubit" or "qubit_sub".
     drags : sequence of bool
         DRAG on/off settings.
     min_detuning_GHz : float, default 0.05
@@ -282,8 +255,6 @@ def build_target_grid(wa_GHz: float, wb_list: Sequence[float], spec_list: Sequen
     list of Point
         Points (kind="target") ordered w_b -> w_spec -> drag, indexed 0..M-1.
     """
-    if channel not in _CHANNELS:
-        raise ValueError(f"unknown channel {channel!r}; choose from {_CHANNELS}")
     points: List[Point] = []
     index = 0
     for wb in wb_list:
@@ -291,7 +262,7 @@ def build_target_grid(wa_GHz: float, wb_list: Sequence[float], spec_list: Sequen
             continue
         for spec in spec_list:
             for drag in drags:
-                points.append(Point(index=index, kind="target", channel=channel,
+                points.append(Point(index=index, kind="target",
                                     wa_GHz=float(wa_GHz), wb_GHz=float(wb),
                                     spec_abs_GHz=float(spec), drag=bool(drag)))
                 index += 1
@@ -395,7 +366,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     Parameters
     ----------
     pt : Point
-        The grid point (channel, spectator frequency, participation, DRAG flag).
+        The grid point (spectator frequency, DRAG flag).
     config : dict
         Resolved device/simulation configuration (see DEFAULT_CONFIG). Imports
         ``zhou_coupler`` (and, for the full path, QuTiP) lazily.
@@ -435,13 +406,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
     freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
-    # --- levels per channel ------------------------------------------------
-    if pt.channel == "qubit_qubit":
-        spec_levels = int(config["spec_levels_qubit"])
-    elif pt.channel == "qubit_sub":
-        spec_levels = int(config["spec_levels_sub"])
-    else:
-        raise ValueError(f"unknown channel {pt.channel!r}")
+    # --- spectator: a single 3-level anharmonic transmon --------------------
+    spec_levels = int(config["spec_levels"])
     levels = [int(config["qubit_levels"]), int(config["qubit_levels"]),
               int(config["coupler_levels"]), spec_levels]
 
@@ -450,16 +416,15 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         nonlin[4] = float(config["g4_GHz"])
 
     aq = float(config.get("anharm_qubit_GHz", 0.0))
-    anharm = {a: aq, b: aq}
-    if pt.channel == "qubit_qubit":                    # spectator is a transmon too
-        anharm[spec] = float(config.get("anharm_spec_GHz", 0.0))
+    lam_b = float(config["lam_b"])
+    anharm = {a: aq, b: aq, spec: float(config.get("anharm_spec_GHz", 0.0))}
 
     cpl = ZhouCoupler(
         mode_freqs_GHz=freqs_GHz,
         coupler_index=coupler,
         participations={a: float(config["lam_a"]),
-                        b: float(config["lam_b"]),
-                        spec: float(pt.lam_spec)},
+                        b: lam_b,
+                        spec: lam_b},          # spectator participation = lam_b
         nonlinearities=nonlin,
         levels=levels,
         anharmonicities_GHz=anharm,
@@ -496,9 +461,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
 
     out = {
         "index": pt.index,
-        "channel": pt.channel,
         "spec_freq_GHz": pt.spec_freq_GHz,
-        "lam_spec": pt.lam_spec,
+        "lam_spec": round(lam_b, 4),           # spectator participation (= lam_b)
         "drag": bool(pt.drag),
         "drag_applied": bool(use_drag),
         "beat_GHz": round(float(beat_GHz), 6),
@@ -550,12 +514,12 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     Parameters
     ----------
     pt : Point
-        A kind="target" point carrying wb_GHz, spec_abs_GHz, channel, drag (w_a is
+        A kind="target" point carrying wb_GHz, spec_abs_GHz, drag (w_a is
         read from the config, held fixed).
     config : dict
         Resolved configuration; reads ``qubit_freqs_GHz[0]`` (fixed w_a),
-        ``coupler_freq_GHz`` (fixed w_s), ``lam_a``/``lam_b``, ``spec_lam``,
-        ``g3_GHz``, pulse and solver keys.
+        ``coupler_freq_GHz`` (fixed w_s), ``lam_a``/``lam_b`` (the spectator uses
+        ``lam_b``), ``g3_GHz``, pulse and solver keys.
 
     Returns
     -------
@@ -572,8 +536,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     wb_GHz = float(pt.wb_GHz)                           # swept
     wspec_GHz = float(pt.spec_abs_GHz)                  # swept (absolute)
     w_p_GHz = abs(wb_GHz - wa_GHz) + float(config.get("wp_offset_GHz", 0.0))
-    lam_spec = float(config.get("spec_lam", 0.20))
-    channel = pt.channel
+    lam_spec = float(config["lam_b"])                  # spectator participation = lam_b
     integrate = bool(config.get("integrate", True))
 
     # Per-point calibration (w_b varies across the allocation sweep, so both the
@@ -616,8 +579,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     # everywhere (tiny Hilbert space); the full build uses the configured levels.
     if integrate:
         q_lv, c_lv = int(config["qubit_levels"]), int(config["coupler_levels"])
-        s_lv = int(config["spec_levels_sub"] if channel == "qubit_sub"
-                   else config["spec_levels_qubit"])
+        s_lv = int(config["spec_levels"])
     else:
         q_lv = c_lv = s_lv = 2
 
@@ -631,9 +593,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         nonlin[4] = float(config["g4_GHz"])
 
     aq = float(config.get("anharm_qubit_GHz", 0.0))
-    anharm = {a: aq, b: aq}
-    if channel == "qubit_qubit":
-        anharm[spec] = float(config.get("anharm_spec_GHz", 0.0))
+    anharm = {a: aq, b: aq, spec: float(config.get("anharm_spec_GHz", 0.0))}
 
     cpl = ZhouCoupler(mode_freqs_GHz=freqs_GHz, coupler_index=coupler,
                       participations=participations, nonlinearities=nonlin, levels=levels,
@@ -691,7 +651,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     g_coll = cpl.effective_rate([nearest[4], spec], n=3, C=6)   # 6 g3 l_q l_spec |eta|
 
     out = {
-        "index": pt.index, "kind": "target", "channel": channel,
+        "index": pt.index, "kind": "target",
         "wa_GHz": round(wa_GHz, 6), "wb_GHz": round(wb_GHz, 6),
         "w_snail_GHz": round(ws_GHz, 6), "spec_GHz": round(wspec_GHz, 6),
         "detuning_GHz": round(wb_GHz - wa_GHz, 6), "w_p_GHz": round(w_p_GHz, 6),
@@ -808,11 +768,11 @@ def collect(outdir: str) -> None:
         rows.append(meta); U_stack.append(U); idx_stack.append(meta["index"])
 
     rows.sort(key=lambda r: r["index"])
-    spec_cols = ["index", "channel", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
+    spec_cols = ["index", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
                  "beat_GHz", "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
                  "w_p_GHz", "stark_offset_MHz", "w_spec_GHz", "t_g_ns", "wall_s"]
-    target_cols = ["index", "kind", "channel", "wa_GHz", "wb_GHz", "w_snail_GHz",
+    target_cols = ["index", "kind", "wa_GHz", "wb_GHz", "w_snail_GHz",
                    "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz",
                    "amp_scale_used", "wp_offset_used_MHz", "lam_spec", "drag",
                    "drag_applied", "drag_compare_window", "eta_peak",
@@ -931,14 +891,10 @@ def main() -> None:
     ap.add_argument("--nproc", type=int, default=4, help="processes for mode=local")
     ap.add_argument("--sweep", choices=["spectator", "target"], default="spectator",
                     help="spectator sweep (default) or target-frequency allocation sweep")
-    ap.add_argument("--channels", help="comma list: qubit_qubit,qubit_sub")
     ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta (GHz)")
-    ap.add_argument("--lams", help="comma list of spectator participations")
     ap.add_argument("--drags", help="comma list of bools, e.g. false,true")
     ap.add_argument("--wb-GHz", help="[target] comma list of partner (w_b) freqs (GHz)")
     ap.add_argument("--spec-GHz", help="[target] comma list of spectator ABSOLUTE freqs (GHz)")
-    ap.add_argument("--channel", choices=list(_CHANNELS), help="[target] spectator channel")
-    ap.add_argument("--lam-spec", type=float, help="[target] spectator participation lambda_spec")
     ap.add_argument("--drag-compare", action="store_true",
                     help="[target] also run DRAG-on where |nearest beat| < --drag-compare-below-MHz")
     ap.add_argument("--drag-compare-below-MHz", type=float, default=None,
@@ -987,10 +943,6 @@ def main() -> None:
         config["stark_span_MHz"] = float(args.stark_span_MHz)
     if args.stark_points is not None:
         config["stark_points"] = int(args.stark_points)
-    if args.channel:
-        config["spec_channel"] = args.channel
-    if args.lam_spec is not None:
-        config["spec_lam"] = float(args.lam_spec)
     if args.drag_compare:
         config["drag_compare"] = True
     if args.drag_compare_below_MHz is not None:
@@ -1006,20 +958,19 @@ def main() -> None:
             lo = min(wa_GHz, float(nominal[1])) - 0.40
             spec_default = [round(lo + 0.02 * k, 3) for k in range(41)]
             spec_list = _parse_list(args.spec_GHz, float) or spec_default
-            channel = config.get("spec_channel", "qubit_qubit")
             if config.get("drag_compare"):
                 if args.drags:
                     print("note: --drag-compare runs DRAG on/off per point; ignoring --drags.")
                 drags = [False]
             else:
                 drags = _bool_list(args.drags) or DEFAULT_TARGET_DRAGS
-            points = build_target_grid(wa_GHz, wb_list, spec_list, channel, drags,
+            points = build_target_grid(wa_GHz, wb_list, spec_list, drags,
                                        float(config.get("min_detuning_GHz", 0.05)))
             path = write_grid(args.outdir, config, points)
             m = len(points)
             print(f"Wrote {m} allocation points -> {path}")
             print(f"  fixed: w_a={wa_GHz:.4f} GHz, w_snail={config['coupler_freq_GHz']:.4f} GHz; "
-                  f"spectator lam={config.get('spec_lam', 0.2)} ({channel})")
+                  f"spectator lam={config['lam_b']} (3-level anharmonic)")
             print(f"  scan: w_b ({len(wb_list)}) x w_spec ({len(spec_list)}) x drag ({len(drags)}) "
                   f"[dropped |detuning|<{config.get('min_detuning_GHz', 0.05)} GHz]")
             if config.get("drag_compare"):
@@ -1030,11 +981,9 @@ def main() -> None:
             print(f"Submit with:\n  RUNNER=run_sweep_zhou.py OUTDIR={args.outdir} "
                   f"sbatch --array=0-{m-1} slurm/snail_sweep.slurm")
             return
-        channels = _parse_list(args.channels, str) or DEFAULT_CHANNELS
         specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
-        lams = _parse_list(args.lams, float) or DEFAULT_LAMS
         drags = _bool_list(args.drags) or DEFAULT_DRAGS
-        points = build_grid(channels, specfreqs, lams, drags)
+        points = build_grid(specfreqs, drags)
         path = write_grid(args.outdir, config, points)
         m = len(points)
         print(f"Wrote {m} points -> {path}")

@@ -9,14 +9,10 @@
   "coupler_freq_GHz": 4.7,
   "coupler_levels": 5,
   "g3_GHz": 0.06,
-  "g4_GHz": 0.0,
-  "spec_levels_qubit": 3,
-  "spec_levels_sub":   3,       
+  "g4_GHz": 0.0,  
   "anchor": 1,
   "anharm_qubit_GHz": -0.12,
   "anharm_spec_GHz":  -0.12,
-  "spec_lam": 0.10,
-  "spec_channel": "qubit_qubit",
   "min_detuning_GHz": 0.05,
   "drag_compare": false,
   "drag_compare_below_MHz": 100.0, 
@@ -30,5 +26,5 @@
   "stark_window_factor": 2.0,
   "stark_time_points": 120,
   "integrate": true,
-  "rtol": 1e-6, "atol": 1e-8,
+  "rtol": 1e-6, "atol": 1e-8
 }
