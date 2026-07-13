@@ -14,7 +14,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1        # each point is single-threaded (BLAS pinned to 1)
 #SBATCH --mem-per-cpu=4G
-#SBATCH --time=00:30:00          # per-point wall limit; raise for large N / long t_g
+#SBATCH --time=06:00:00          # per-point wall limit; raise for large N / long t_g
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=wcalphon@syr.edu   # NOTE: on an array, ALL e-mails per task (120!);
                                        # use --mail-type=END,FAIL to cut the volume

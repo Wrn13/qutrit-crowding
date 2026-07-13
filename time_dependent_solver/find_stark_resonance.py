@@ -91,10 +91,17 @@ def operating_eta(config: Dict[str, Any], t_g: float, amp_scale: float) -> float
 
 
 def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
-                          wp_offset_GHz: float, window_ns: float):
-    """Spectator-free (a, b, coupler) system driven by a CONSTANT pump of peak
+                          wp_offset_GHz: float, window_ns: float,
+                          spec_abs_GHz: Optional[float] = None):
+    """(a, b, coupler[, spectator]) system driven by a CONSTANT pump of peak
     |eta| = eta_op held over [0, window_ns], with the pump frequency offset from
     |w_b - w_a| by wp_offset_GHz. Anharmonicity / qutrit levels are included.
+
+    With ``spec_abs_GHz`` given, a 4th spectator mode is added at that ABSOLUTE
+    frequency (participation lam_b, ``spec_levels`` levels, ``anharm_spec_GHz``),
+    so the located resonance reflects the spectator's dispersive pull on the a<->b
+    iSWAP. With ``spec_abs_GHz=None`` the system is the bare 3-mode pair (the
+    spectator-free baseline).
 
     Parameters
     ----------
@@ -106,6 +113,8 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
         Offset added to the bare pump frequency w_b - w_a (GHz).
     window_ns : float
         Envelope duration (ns); the pump stays on for the whole scan window.
+    spec_abs_GHz : float, optional
+        Spectator ABSOLUTE frequency (GHz). None -> no spectator (bare pair).
 
     Returns
     -------
@@ -117,17 +126,26 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     ws = float(config["coupler_freq_GHz"])
     w_p_GHz = abs(wb - wa) + wp_offset_GHz
-    levels = [int(config["qubit_levels"]), int(config["qubit_levels"]),
-              int(config["coupler_levels"])]
+    aq = float(config.get("anharm_qubit_GHz", 0.0))
     nonlin = {3: float(config["g3_GHz"])}
     if float(config.get("g4_GHz", 0.0)) != 0.0:
         nonlin[4] = float(config["g4_GHz"])
-    aq = float(config.get("anharm_qubit_GHz", 0.0))
 
-    cpl = ZhouCoupler(mode_freqs_GHz=[wa, wb, ws], coupler_index=2,
-                      participations={0: float(config["lam_a"]), 1: float(config["lam_b"])},
+    freqs = [wa, wb, ws]
+    levels = [int(config["qubit_levels"]), int(config["qubit_levels"]),
+              int(config["coupler_levels"])]
+    participations = {0: float(config["lam_a"]), 1: float(config["lam_b"])}
+    anharm = {0: aq, 1: aq}
+    if spec_abs_GHz is not None:                    # add the spectator as a 4th mode
+        freqs.append(float(spec_abs_GHz))
+        levels.append(int(config.get("spec_levels", 3)))
+        participations[3] = float(config["lam_b"])           # spectator participation = lam_b
+        anharm[3] = float(config.get("anharm_spec_GHz", 0.0))
+
+    cpl = ZhouCoupler(mode_freqs_GHz=freqs, coupler_index=2,
+                      participations=participations,
                       nonlinearities=nonlin, levels=levels,
-                      anharmonicities_GHz={0: aq, 1: aq})
+                      anharmonicities_GHz=anharm)
     # constant pump at fixed |eta| (is_eta=True, no normalization): peak_eta == eta_op
     cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=ConstantPulse(amp=eta_op, t_g=window_ns),
                           is_eta=True), normalize_iswap=None)
@@ -144,12 +162,15 @@ def _resolve_jobs(n_jobs: Optional[int]) -> int:
 
 
 def _chevron_worker(args: Tuple) -> np.ndarray:
-    """One pump-offset column: P(|01>->|10>) over the time grid."""
-    config, eta_op, wp_offset, times, solver = args
-    cpl, _w_p = build_chevron_coupler(config, eta_op, wp_offset, float(times[-1]))
-    states = cpl.evolve_trajectory([0, 1, 0], times, **solver)
-    i10 = cpl.fock_index([1, 0, 0])
-    return np.abs(states[:, i10]) ** 2
+    """One pump-offset column: P(|01>->|10>) over the time grid. Works for the
+    3-mode bare pair or the 4-mode pair+spectator (state/index built from n_modes)."""
+    config, eta_op, wp_offset, times, solver, spec_abs_GHz = args
+    cpl, _w_p = build_chevron_coupler(config, eta_op, wp_offset, float(times[-1]),
+                                      spec_abs_GHz=spec_abs_GHz)
+    init = [0] * cpl.n_modes; init[1] = 1          # |01...> : qubit b excited
+    tgt = [0] * cpl.n_modes; tgt[0] = 1            # |10...> : qubit a excited
+    states = cpl.evolve_trajectory(init, times, **solver)
+    return np.abs(states[:, cpl.fock_index(tgt)]) ** 2
 
 
 def _parabolic_vertex(x: Sequence[float], y: Sequence[float]) -> float:
@@ -201,7 +222,8 @@ def locate_resonance(offsets_GHz: np.ndarray, max_transfer: np.ndarray) -> float
 def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
          offsets_GHz: np.ndarray, window_ns: float, n_time: int,
          solver: Optional[Dict[str, Any]] = None,
-         n_jobs: Optional[int] = None) -> Dict[str, Any]:
+         n_jobs: Optional[int] = None,
+         spec_abs_GHz: Optional[float] = None) -> Dict[str, Any]:
     """Run the pump-frequency chevron and locate the Stark-shifted resonance.
 
     Parameters
@@ -223,6 +245,9 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
     n_jobs : int, optional
         Worker processes (0/None -> SLURM_CPUS_PER_TASK or CPU count). Forced to 1
         on GPU.
+    spec_abs_GHz : float, optional
+        If given, include a spectator mode at this ABSOLUTE frequency so the
+        located resonance includes its dispersive pull; None -> bare pair.
 
     Returns
     -------
@@ -233,7 +258,8 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     eta_op = operating_eta(config, t_g, amp_scale)
     times = np.linspace(0.0, window_ns, n_time)
-    args = [(config, eta_op, float(off), times, solver) for off in offsets_GHz]
+    args = [(config, eta_op, float(off), times, solver, spec_abs_GHz)
+            for off in offsets_GHz]
 
     jobs = _resolve_jobs(n_jobs)
     if jobs <= 1 or len(args) <= 1:

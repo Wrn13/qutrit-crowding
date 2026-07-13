@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-r"""plot_results.py.
+r"""
+plot_results.py
 ===============
 
 Read a sweep result directory (``summary.csv`` + ``combined.npz`` produced by
@@ -29,7 +30,7 @@ Usage
     python plot_results.py --outdir results_zhou/ --figdir figs/ --usetex
     # one figure only:
     python plot_results.py --outdir results_zhou/ --only heatmap --metric leakage
-"""  # noqa: D205
+"""
 from __future__ import annotations
 
 import argparse
@@ -69,10 +70,10 @@ def set_literature_style(usetex: bool = False) -> None:
         If True, render text with a system LaTeX install (requires TeX +
         amsmath); otherwise mathtext is used and no LaTeX is needed.
 
-    Returns:
+    Returns
     -------
     None
-    """  # noqa: D205
+    """
     mpl.rcParams.update({
         "figure.dpi": 130, "savefig.dpi": 600, "savefig.bbox": "tight",
         "font.size": 9, "font.family": "sans-serif",
@@ -115,7 +116,7 @@ def load_summary(outdir: str) -> Dict[str, np.ndarray]:
     outdir : str
         Sweep directory containing summary.csv.
 
-    Returns:
+    Returns
     -------
     dict[str, ndarray]
         One array per column. Numeric columns are floats with empty cells -> NaN
@@ -139,6 +140,12 @@ def load_summary(outdir: str) -> Dict[str, np.ndarray]:
                                 for x in raw], dtype=bool)
         else:
             data[c] = np.array([str(x) for x in raw], dtype=object)
+    # The Zhou sweep no longer varies a spectator "channel"; if that column is
+    # absent, synthesize a single-value stand-in so the per-channel faceting
+    # collapses to one panel instead of raising KeyError.
+    if "channel" not in data:
+        n = len(next(iter(data.values())))
+        data["channel"] = np.array(["spectator"] * n, dtype=object)
     return data
 
 
@@ -150,7 +157,7 @@ def series_column(data: Dict[str, np.ndarray]) -> str:
     data : dict[str, ndarray]
         Loaded summary columns.
 
-    Returns:
+    Returns
     -------
     str
         'lam_spec' (Zhou driver) or 'eta' (effective-model driver).
@@ -170,7 +177,7 @@ def has_full_metrics(data: Dict[str, np.ndarray]) -> bool:
     data : dict[str, ndarray]
         Loaded summary columns.
 
-    Returns:
+    Returns
     -------
     bool
         True if an ``F_avg`` column with at least one finite value is present.
@@ -204,11 +211,11 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
     figsize : tuple(float, float), optional
         Figure size in inches; a channel-count-dependent default is used if None.
 
-    Returns:
+    Returns
     -------
     matplotlib.figure.Figure
         The assembled figure.
-    """  # noqa: D205
+    """
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     lams = sorted(np.unique(data[scol]))
@@ -282,11 +289,11 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
     figsize : tuple(float, float), optional
         Figure size in inches; a channel-count-dependent default is used if None.
 
-    Returns:
+    Returns
     -------
     matplotlib.figure.Figure
         The assembled figure.
-    """  # noqa: D205
+    """
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     # one representative participation (largest) keeps the panel readable
@@ -369,11 +376,11 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
     figsize : tuple(float, float), optional
         Figure size in inches; a panel-count-dependent default is used if None.
 
-    Returns:
+    Returns
     -------
     matplotlib.figure.Figure
         The assembled figure.
-    """  # noqa: D205
+    """
     scol = series_column(data)
     chans = list(dict.fromkeys(data["channel"]))
     drags = [d for d in (False, True) if (data["drag"] == d).any()]
@@ -383,7 +390,7 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
         vcol, vlabel, cmap = "F_avg", r"$\log_{10}(1-F)$", "magma"
         def transform(z): return np.log10(np.clip(1.0 - z, 1e-12, None))
     else:
-        safe_metric = metric.replace("_", r"\_")        # backslash lives outside the f-string now
+        safe_metric = metric.replace("_", r"\_")        # backslash outside the f-string (pre-3.12 safe)
         vcol, vlabel, cmap = metric, rf"$\log_{{10}}\,${safe_metric}", "magma"
         def transform(z): return np.log10(np.clip(z, 1e-12, None))
 
@@ -434,11 +441,11 @@ def fig_analytic_map(data: Dict[str, np.ndarray],
     figsize : tuple(float, float), optional
         Figure size in inches; default (7.2, 3.0) if None.
 
-    Returns:
+    Returns
     -------
     matplotlib.figure.Figure or None
         The figure, or None if the analytic rate column is absent.
-    """  # noqa: D205
+    """
     scol = series_column(data)
     if "g_spec_eff_MHz" not in data:
         return None
@@ -495,7 +502,7 @@ def main() -> None:
     figures. A full sweep yields Figs 1-4; an analytic-only sweep yields Fig 4.
     Run ``--help`` for the option list (``--outdir``, ``--figdir``, ``--only``,
     ``--metric``, ``--format``, ``--usetex``).
-    """  # noqa: D205
+    """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--outdir", required=True, help="sweep result dir (has summary.csv)")
