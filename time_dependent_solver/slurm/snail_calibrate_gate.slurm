@@ -18,23 +18,27 @@
 # #SBATCH --gres=gpu:1
 # module load cuda   # and: uv pip install qutip-jax diffrax jax[cuda]
 
-# Full experimental iSWAP tune-up (amplitude + Stark-frequency, iterated) with a
-# final fidelity test, run as an ARRAY over many device configurations. Provide a
-# manifest: one device JSON path per line. Submit with an array matching its length:
+# Full experimental iSWAP tune-up (Stark-frequency + amplitude, iterated) with a
+# final fidelity test. Two ways to run:
 #
-#   printf '%s\n' devices/*.json > configs.txt
-#   MANIFEST=configs.txt TARGET_ETA=1.5 ITERS=2 OUTDIR=cal_out \
-#       sbatch --array=0-$(( $(wc -l < configs.txt) - 1 )) snail_calibrate_gate.slurm
+#   ONE device (no array needed):
+#       DEVICE=devices/evan_device.json TARGET_ETA=1.5 sbatch slurm/snail_calibrate_gate.slurm
+#
+#   MANY devices (array over a manifest: one device JSON path per line):
+#       printf '%s\n' devices/*.json > configs.txt
+#       MANIFEST=configs.txt TARGET_ETA=1.5 ITERS=2 \
+#           sbatch --array=0-$(( $(wc -l < configs.txt) - 1 )) slurm/snail_calibrate_gate.slurm
 #
 # Each task writes <OUTDIR>/cal_<device-stem>.json (+ .npz) and a calibrated device
 # JSON <OUTDIR>/<device-stem>_calibrated.json to feed run_sweep_zhou.py. Plot the
-# Stark shift afterwards with calibration_plots.py.
+# Stark shift afterwards with calibration_plots.py. OUTDIR defaults to results/cal_out.
 #
 # Needs QuTiP (it integrates the exact Hamiltonian) -- run on compute nodes.
 set -euo pipefail
 
-MANIFEST="${MANIFEST:-configs.txt}"
-OUTDIR="${OUTDIR:-cal_out}"
+DEVICE="${DEVICE:-}"                      # single device JSON (no array needed)
+MANIFEST="${MANIFEST:-}"                  # OR a file of device paths, one per line (array job)
+OUTDIR="${OUTDIR:-results/cal_out}"
 TARGET_ETA="${TARGET_ETA:-1.5}"          # operating |eta| (sets t_g); or set T_G
 T_G="${T_G:-}"                           # explicit gate time (ns), overrides via --t-g
 ITERS="${ITERS:-2}"                      # amplitude/frequency rounds
@@ -45,16 +49,34 @@ GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffra
 
 JOBS="${JOBS:-${SLURM_CPUS_PER_TASK:-1}}"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
-cd "${SLURM_SUBMIT_DIR:-.}"
+# Run from the code root (the time_dependent_solver/ folder, parent of slurm/).
+# Submit from there:  sbatch slurm/snail_calibrate_gate.slurm   (or set CODE_DIR to that folder).
+cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 mkdir -p "${OUTDIR}"
 
-# select this task's device from the manifest (0-indexed array -> line N+1)
+# Pick this task's device. Two modes:
+#   single:  DEVICE=devices/dev.json sbatch slurm/snail_calibrate_gate.slurm
+#   array:   MANIFEST=configs.txt   sbatch --array=0-$(( $(wc -l < configs.txt)-1 )) slurm/...
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
-DEVICE="$(sed -n "$(( IDX + 1 ))p" "${MANIFEST}")"
-if [ -z "${DEVICE}" ]; then
-    echo "ERROR: no device at manifest line $(( IDX + 1 )) of ${MANIFEST}" >&2
+if [ -n "${DEVICE}" ]; then
+    :                                    # use DEVICE as given (single config)
+elif [ -n "${MANIFEST}" ]; then
+    if [ ! -r "${MANIFEST}" ]; then
+        echo "ERROR: MANIFEST '${MANIFEST}' not found (cwd=$(pwd))." >&2
+        exit 1
+    fi
+    DEVICE="$(sed -n "$(( IDX + 1 ))p" "${MANIFEST}")"
+    if [ -z "${DEVICE}" ]; then
+        echo "ERROR: no device at manifest line $(( IDX + 1 )) of '${MANIFEST}'." >&2
+        exit 1
+    fi
+else
+    echo "ERROR: set DEVICE=<device.json> for one config, or MANIFEST=<list.txt> with" >&2
+    echo "       --array for many. Example:" >&2
+    echo "       DEVICE=devices/evan_device.json sbatch slurm/snail_calibrate_gate.slurm" >&2
     exit 1
 fi
+
 STEM="$(basename "${DEVICE}" .json)"
 OUT="${OUTDIR}/cal_${STEM}.json"
 CAL_DEV="${OUTDIR}/${STEM}_calibrated.json"

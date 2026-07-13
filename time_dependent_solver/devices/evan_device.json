@@ -30,6 +30,5 @@
   "stark_window_factor": 2.0,
   "stark_time_points": 120,
   "integrate": true,
-  "rtol": 1e-8, "atol": 1e-10,
-  "nsteps": 500000
+  "rtol": 1e-6, "atol": 1e-8,
 }
