@@ -89,7 +89,7 @@ numpy/scipy. Tune the integrator with ``rtol``/``atol`` and ``nsteps``.
 Workflow (identical CLI shape to run_sweep.py)
 ----------------------------------------------
     python run_sweep_zhou.py prepare --outdir results_zhou/
-    RUNNER=run_sweep_zhou.py OUTDIR=results_zhou sbatch --array=0-<M-1> snail_sweep.slurm
+    RUNNER=run_sweep_zhou.py OUTDIR=results_zhou sbatch --array=0-<M-1> slurm/snail_sweep.slurm
     python run_sweep_zhou.py local --outdir results_zhou/ --nproc 8
     python run_sweep_zhou.py collect --outdir results_zhou/
 
@@ -128,8 +128,8 @@ DEFAULT_CONFIG = {
     # target qubits a, b
     "qubit_freqs_GHz": [5.00, 4.60],
     "qubit_levels":    3,            # >=3 so target-pair leakage is captured
-    "lam_a":           0.10,         # participation lambda_as = g_as/Delta_as
-    "lam_b":           0.10,         # participation lambda_bs = g_bs/Delta_bs
+    "lam_a":           0.20,         # participation lambda_as = g_as/Delta_as
+    "lam_b":           0.20,         # participation lambda_bs = g_bs/Delta_bs
     # coupler S (the SNAIL)
     "coupler_freq_GHz": 7.00,
     "coupler_levels":   5,
@@ -139,11 +139,11 @@ DEFAULT_CONFIG = {
     "spec_levels_qubit": 2,          # "qubit_qubit" channel
     "spec_levels_sub":   3,          # "qubit_sub" channel
     "anchor":            1,          # spectator freq measured below qubit b
-    "anharm_qubit_GHz": -0.12,       # transmon anharmonicity of qubits a & b (0 = harmonic)
-    "anharm_spec_GHz":  -0.12,       # spectator anharmonicity (qubit_qubit channel)
+    "anharm_qubit_GHz": -0.20,       # transmon anharmonicity of qubits a & b (0 = harmonic)
+    "anharm_spec_GHz":  -0.20,       # spectator anharmonicity (qubit_qubit channel)
     # fixed neighbour bath at ABSOLUTE frequencies (used by --sweep target)
     # target-allocation sweep (--sweep target): fixed w_a & w_s, scan (w_b, w_spec)
-    "spec_lam":          0.10,       # spectator participation for the allocation sweep
+    "spec_lam":          0.20,       # spectator participation for the allocation sweep
     "spec_channel":      "qubit_qubit",  # "qubit_qubit" or "qubit_sub"
     "min_detuning_GHz":  0.05,       # drop placements with |w_b-w_a| below this
     "drag_compare":         False,   # target sweep: also run DRAG-on in the near-collision window
@@ -151,24 +151,30 @@ DEFAULT_CONFIG = {
     # pulse / solver
     "t_g_ns":   60.0,
     "envelope": "raised_cosine",
-    "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_iswap.py)
+    "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_gate.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
     "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance
     "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
     "stark_points":   21,            # per-point chevron offset samples
     "stark_window_factor": 2.0,      # chevron time window = factor * t_g
     "stark_time_points":   120,      # chevron time samples
+    "calibrate_points": False,       # per-point amplitude+Stark tune-up (calibrate_gate)
+    "calibrate_iters":  1,           # amplitude/frequency rounds per point
+    "cal_amp_lo":       0.6,         # per-point amplitude-scale search bounds
+    "cal_amp_hi":       1.4,
+    "cal_amp_points":   9,
+    "drag_always":      False,       # force DRAG on for every allocation point
     "integrate": True,               # set False for the instant analytic map only
     "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
     "nsteps": 500000,                # max internal solver steps between outputs
 }
 
 # Default sweep axes (override with --channels/--specfreqs/--lams).
-DEFAULT_CHANNELS = ["qubit_qubit", "qubit_sub"]
+DEFAULT_CHANNELS = ["qubit_qubit"]
 # Broad spectator-frequency sweep (GHz). With w_p = 0.40 this crosses the
 # fundamental exchange (m=1, 0.40) and the two-pump process (m=2, 0.80).
 DEFAULT_SPECFREQS_GHz = [round(0.20 + 0.05 * k, 3) for k in range(15)]  # 0.20..0.90
-DEFAULT_LAMS = [0.10, 0.20]
+DEFAULT_LAMS = [0.10]
 DEFAULT_DRAGS = [False, True]
 # For --sweep target, w_a and w_s are fixed while (w_b, w_spec) are scanned; DRAG
 # can only null one collision, so it defaults off for allocation maps.
@@ -570,17 +576,41 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     channel = pt.channel
     integrate = bool(config.get("integrate", True))
 
-    # optional: drive at the per-point AC-Stark-shifted resonance (w_b varies across
-    # the allocation sweep, so Delta_Stark differs point to point). Needs the
-    # integrated run; shifts w_p for both the collision classification and the gate.
-    stark_offset_GHz = 0.0
-    if integrate and bool(config.get("stark_drive", False)):
+    # Per-point calibration (w_b varies across the allocation sweep, so both the
+    # optimal amplitude and the Stark shift move point to point). Two levels:
+    #   calibrate_points -> full amplitude + Stark tune-up (calibrate_gate), sets
+    #                       both amp_scale and wp_offset for THIS point;
+    #   stark_drive      -> frequency only (cheaper): shift w_p to the Stark
+    #                       resonance at the configured amplitude.
+    # Both need the integrated run and use the spectator-free (a,b) gate.
+    amp_scale_used = float(config.get("amp_scale", 1.0))
+    wp_offset_used_GHz = float(config.get("wp_offset_GHz", 0.0))
+    if integrate and bool(config.get("calibrate_points", False)):
+        import calibrate_gate as CG
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
-        stark_offset_GHz = _stark_offset_GHz(config, wa_GHz, wb_GHz,
-                                             float(config["t_g_ns"]),
-                                             float(config.get("amp_scale", 1.0)), _sv)
-        w_p_GHz += stark_offset_GHz
+        sub = dict(config); sub["qubit_freqs_GHz"] = [wa_GHz, wb_GHz]
+        rec = CG.run_calibration(
+            sub, float(config["t_g_ns"]),
+            iters=int(config.get("calibrate_iters", 1)),
+            amp_bounds=(float(config.get("cal_amp_lo", 0.6)),
+                        float(config.get("cal_amp_hi", 1.4))),
+            amp_points=int(config.get("cal_amp_points", 9)),
+            span_MHz=float(config.get("stark_span_MHz", 60.0)),
+            chevron_points=int(config.get("stark_points", 21)),
+            window_factor=float(config.get("stark_window_factor", 2.0)),
+            time_points=int(config.get("stark_time_points", 120)),
+            solver=_sv, n_jobs=1)["final"]
+        amp_scale_used = float(rec["amp_scale"])
+        wp_offset_used_GHz = float(rec["wp_offset_GHz"])
+        w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
+    elif integrate and bool(config.get("stark_drive", False)):
+        _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
+                   nsteps=int(config.get("nsteps", 500000)))
+        wp_offset_used_GHz += _stark_offset_GHz(config, wa_GHz, wb_GHz,
+                                                float(config["t_g_ns"]),
+                                                amp_scale_used, _sv)
+        w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
 
     # Rates/eta are level-independent, so the analytic-only build uses 2 levels
     # everywhere (tiny Hilbert space); the full build uses the configured levels.
@@ -629,7 +659,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     in_window = (_DELTA_EPS_GHz < beat_abs < thr_GHz)
 
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
-    amp_scale = float(config.get("amp_scale", 1.0))
+    amp_scale = amp_scale_used                          # per-point calibrated (or config default)
 
     def _configure(use_drag: bool) -> None:
         """(Re)set the pump with DRAG on/off (tuned to the nearest beat) and
@@ -649,9 +679,9 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         base_drag = False
         status_drag = "drag_compare" if in_window else "ok"
     else:
-        base_drag = bool(pt.drag)
+        base_drag = bool(pt.drag) or bool(config.get("drag_always", False))
         status_drag = "ok"
-        if pt.drag and abs(drag_beat) < _DELTA_EPS_GHz:
+        if base_drag and abs(drag_beat) < _DELTA_EPS_GHz:
             base_drag = False
             status_drag = "drag_skipped_resonant_collision"
 
@@ -665,7 +695,10 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "wa_GHz": round(wa_GHz, 6), "wb_GHz": round(wb_GHz, 6),
         "w_snail_GHz": round(ws_GHz, 6), "spec_GHz": round(wspec_GHz, 6),
         "detuning_GHz": round(wb_GHz - wa_GHz, 6), "w_p_GHz": round(w_p_GHz, 6),
-        "stark_offset_MHz": round(float(stark_offset_GHz) * 1e3, 4),
+        "stark_offset_MHz": round((wp_offset_used_GHz
+                                   - float(config.get("wp_offset_GHz", 0.0))) * 1e3, 4),
+        "amp_scale_used": round(float(amp_scale_used), 5),
+        "wp_offset_used_MHz": round(float(wp_offset_used_GHz) * 1e3, 4),
         "lam_spec": round(lam_spec, 4),
         "drag": bool(pt.drag), "drag_applied": bool(base_drag),
         "drag_compare_window": bool(drag_compare and in_window),
@@ -780,7 +813,8 @@ def collect(outdir: str) -> None:
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
                  "w_p_GHz", "stark_offset_MHz", "w_spec_GHz", "t_g_ns", "wall_s"]
     target_cols = ["index", "kind", "channel", "wa_GHz", "wb_GHz", "w_snail_GHz",
-                   "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz", "lam_spec", "drag",
+                   "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz",
+                   "amp_scale_used", "wp_offset_used_MHz", "lam_spec", "drag",
                    "drag_applied", "drag_compare_window", "eta_peak",
                    "g_iswap_eff_MHz", "nearest_beat_GHz", "nearest_kind",
                    "nearest_target", "g_collision_MHz", "status", "F_avg", "leakage",
@@ -914,6 +948,13 @@ def main() -> None:
     ap.add_argument("--stark", action="store_true",
                     help="drive each point at its AC-Stark-shifted resonance (per-point "
                          "chevron; needs the integrated run and is markedly slower)")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="per-point amplitude+Stark tune-up (calibrate_gate) before each "
+                         "gate -- the 'better calibration' allocation; slowest, most faithful")
+    ap.add_argument("--calibrate-iters", type=int, default=None,
+                    help="amplitude/frequency rounds per point for --calibrate (default 1)")
+    ap.add_argument("--drag", action="store_true",
+                    help="force DRAG on for every allocation point (tuned to the nearest beat)")
     ap.add_argument("--stark-span-MHz", type=float, default=None,
                     help="per-point Stark chevron width (default 60)")
     ap.add_argument("--stark-points", type=int, default=None,
@@ -926,14 +967,22 @@ def main() -> None:
         import zhou_coupler
         zhou_coupler.use_gpu(True)
 
+    from paths import resolve_device, in_results
+    args.outdir = in_results(args.outdir)                 # bare name -> results/
     config = dict(DEFAULT_CONFIG)
     if args.device:
-        with open(args.device) as f:
+        with open(resolve_device(args.device)) as f:      # bare name -> devices/
             config.update(json.load(f))
     if args.no_integrate:
         config["integrate"] = False
     if args.stark:
         config["stark_drive"] = True
+    if args.calibrate:
+        config["calibrate_points"] = True
+    if args.calibrate_iters is not None:
+        config["calibrate_iters"] = int(args.calibrate_iters)
+    if args.drag:
+        config["drag_always"] = True
     if args.stark_span_MHz is not None:
         config["stark_span_MHz"] = float(args.stark_span_MHz)
     if args.stark_points is not None:
@@ -979,7 +1028,7 @@ def main() -> None:
             print(f"integrate = {config['integrate']}  "
                   f"({'FULL sim per point' if config['integrate'] else 'analytic map only'})")
             print(f"Submit with:\n  RUNNER=run_sweep_zhou.py OUTDIR={args.outdir} "
-                  f"sbatch --array=0-{m-1} snail_sweep.slurm")
+                  f"sbatch --array=0-{m-1} slurm/snail_sweep.slurm")
             return
         channels = _parse_list(args.channels, str) or DEFAULT_CHANNELS
         specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
@@ -992,7 +1041,7 @@ def main() -> None:
         print(f"integrate = {config['integrate']}  "
               f"({'FULL sim per point' if config['integrate'] else 'analytic map only'})")
         print(f"Submit with:\n  RUNNER=run_sweep_zhou.py OUTDIR={args.outdir} "
-              f"sbatch --array=0-{m-1} snail_sweep.slurm")
+              f"sbatch --array=0-{m-1} slurm/snail_sweep.slurm")
         return
 
     if args.mode == "collect":

@@ -14,7 +14,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1        # each point is single-threaded (BLAS pinned to 1)
 #SBATCH --mem-per-cpu=4G
-#SBATCH --time=06:00:00          # per-point wall limit; raise for large N / long t_g
+#SBATCH --time=00:30:00          # per-point wall limit; raise for large N / long t_g
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=wcalphon@syr.edu   # NOTE: on an array, ALL e-mails per task (120!);
                                        # use --mail-type=END,FAIL to cut the volume
@@ -33,8 +33,8 @@
 # The `%32` in --array caps concurrently running tasks at 32.
 set -euo pipefail
 
-OUTDIR="${OUTDIR:-results}"
-RUNNER="${RUNNER:-run_sweep.py}"        # set RUNNER=run_sweep_zhou.py for the Zhou sweep
+OUTDIR="${OUTDIR:-results/results_zhou}"
+RUNNER="${RUNNER:-run_sweep_zhou.py}"   # the Zhou-coupler sweep driver
 LAUNCHER="${LAUNCHER:-uv run python}"   # how to invoke python; e.g. "python" after activating a venv
 GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax; also add "#SBATCH --gres=gpu:1"
 mkdir -p "${OUTDIR}/points"
@@ -52,7 +52,9 @@ export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_TH
 #   GPU only helps for large Hilbert spaces (many modes/levels); small couplers are faster on CPU.
 # ----------------------------------------------------------------------------
 
-cd "${SLURM_SUBMIT_DIR:-.}"
+# Run from the code root (the time_dependent_solver/ folder, parent of slurm/).
+# Submit from there:  sbatch slurm/snail_sweep.slurm   (or set CODE_DIR to that folder).
+cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 echo "host=$(hostname) job=${SLURM_ARRAY_JOB_ID} task=${SLURM_ARRAY_TASK_ID} runner=${RUNNER} outdir=${OUTDIR} gpu=${GPU:-0} start=$(date -Is)"
 
 srun ${LAUNCHER} "${RUNNER}" point ${GPU_FLAG} \

@@ -50,7 +50,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from calibrate_iswap import load_device, auto_t_g
+from device_utils import load_device, target_eta_area
 
 TWO_PI: float = 2.0 * np.pi
 
@@ -59,9 +59,15 @@ TWO_PI: float = 2.0 * np.pi
 # Coupler at a fixed (constant) pump strength held over the whole window
 # ---------------------------------------------------------------------------
 def operating_eta(config: Dict[str, Any], t_g: float, amp_scale: float) -> float:
-    """Peak |eta| of the calibrated operating gate (normalized full iSWAP over
-    t_g, then scaled by amp_scale). This is the amplitude at which we probe the
-    Stark shift.
+    """Constant-pump |eta| that performs a full iSWAP in t_g (then scaled by
+    amp_scale). The Stark chevron is a CONSTANT pulse, so the probe amplitude is
+    the constant-pulse operating point -- not the raised-cosine peak:
+
+        eta = (pi/2) / (6 (2pi g3) la lb t_g) .
+
+    For a raised-cosine gate of the same t_g this is exactly half the RC peak, and
+    is a better single-amplitude proxy for that gate's pulse-averaged Stark shift
+    (Hann <eta^2> = 0.375 eta_peak^2, vs eta_peak^2 at the peak) than the peak is.
 
     Parameters
     ----------
@@ -75,10 +81,12 @@ def operating_eta(config: Dict[str, Any], t_g: float, amp_scale: float) -> float
     Returns
     -------
     float
-        Peak pump strength |eta| of the operating point.
+        Constant-pump operating |eta|.
     """
-    from calibrate_iswap import build_coupler
-    _cpl, _w_p, eta_peak = build_coupler(config, t_g, amp_scale, 0.0)
+    from device_utils import build_coupler
+    sub = dict(config)
+    sub["envelope"] = "constant"                 # Stark calibration is constant-pulse
+    _cpl, _w_p, eta_peak = build_coupler(sub, t_g, amp_scale, 0.0)
     return float(eta_peak)
 
 
@@ -331,10 +339,13 @@ def main() -> None:
         zhou_coupler.use_gpu(True)
         args.jobs = 1
 
-    if not args.plot:
-        args.plot = args.device.rsplit(".",1)[0] + "_Frequency_Response_Plot.png"
-
-    config = load_device(args.device)
+    from paths import resolve_device, in_results
+    args.out = in_results(args.out)
+    if args.update_device:
+        args.update_device = in_results(args.update_device)
+    if args.plot:
+        args.plot = in_results(args.plot)
+    config = load_device(resolve_device(args.device))
     amp_scale = float(args.amp_scale)
     t_g = args.t_g
     if args.calibration:
@@ -343,8 +354,9 @@ def main() -> None:
         amp_scale = float(cal.get("amp_scale", amp_scale))
         t_g = cal.get("t_g_ns", t_g)
     if args.target_eta is not None:
-        t_g = auto_t_g(float(config["g3_GHz"]), float(config["lam_a"]),
-                       float(config["lam_b"]), float(args.target_eta))
+        # constant-pulse full iSWAP: area = eta * t_g = target_eta_area  ->  t_g = area/eta
+        t_g = target_eta_area(float(config["g3_GHz"]), float(config["lam_a"]),
+                              float(config["lam_b"])) / float(args.target_eta)
     if t_g is None:
         t_g = float(config.get("t_g_ns", 200.0))
     t_g = float(t_g)
