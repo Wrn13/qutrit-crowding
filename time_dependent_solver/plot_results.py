@@ -169,6 +169,28 @@ def series_column(data: Dict[str, np.ndarray]) -> str:
     raise KeyError("no series column ('lam_spec' or 'eta') in summary.csv")
 
 
+# x-axis for the vs-frequency figures: absolute spectator frequency (default) or
+# the beat detuning delta = Delta - w_p (0 = on the collision). Set by main().
+_XAXIS = "spec_freq_GHz"
+_XLABELS = {
+    "spec_freq_GHz": r"spectator frequency $\Delta = w_b - w_\mathrm{spec}$ (GHz)",
+    "beat_GHz": r"beat detuning $\delta = \Delta - w_p$ (GHz)",
+}
+
+
+def _xcol(data: Dict[str, np.ndarray]) -> str:
+    """Chosen x column, falling back to spec_freq_GHz when beat is unavailable."""
+    if _XAXIS == "beat_GHz" and "beat_GHz" in data:
+        return "beat_GHz"
+    return "spec_freq_GHz"
+
+
+def _mark_collision(ax, xcol: str) -> None:
+    """On a beat axis, draw delta=0 (the collision, where DRAG cannot help)."""
+    if xcol == "beat_GHz":
+        ax.axvline(0.0, color="0.5", lw=0.8, ls=":", zorder=0)
+
+
 def has_full_metrics(data: Dict[str, np.ndarray]) -> bool:
     """Whether the sweep contains integrated results.
 
@@ -227,6 +249,7 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
                              sharey=True, squeeze=False)
     axes = axes[0]
     floor = np.inf
+    xc = _xcol(data)
     for ax, ch in zip(axes, chans):
         for lam in lams:
             for drag in (False, True):
@@ -234,7 +257,7 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
                      & (data["drag"] == drag) & np.isfinite(data["F_avg"]))
                 if not m.any():
                     continue
-                x = data["spec_freq_GHz"][m]
+                x = data[xc][m]
                 y = 1.0 - data["F_avg"][m]
                 o = np.argsort(x)
                 pos = y[o] > 0
@@ -244,13 +267,14 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
                         ls="-" if drag else "--",
                         marker="o", mfc=(colors[lam] if drag else "white"),
                         mec=colors[lam])
-        if wres is not None:
+        if wres is not None and xc == "spec_freq_GHz":
             ax.axvline(wres, color="0.5", lw=0.8, ls=":", zorder=0)
             ax.text(wres, 1.0, "  spectator\n  resonance", transform=
                     ax.get_xaxis_transform(), va="top", ha="left",
                     fontsize=6.8, color="0.4")
+        _mark_collision(ax, xc)
         ax.set_yscale("log")
-        ax.set_xlabel(r"spectator frequency $\Delta/2\pi$ (GHz)")
+        ax.set_xlabel(_XLABELS[xc])
         ax.set_title(ch.replace("_", "$-$"))
     axes[0].set_ylabel(r"infidelity $1-F$")
     for ax, lab in zip(axes, "abcdef"):
@@ -309,6 +333,7 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
     fig, axes = plt.subplots(1, n, figsize=figsize or (3.5 * n + 0.3, 3.0),
                              sharey=True, squeeze=False)
     axes = axes[0]
+    xc = _xcol(data)
     for ax, ch in zip(axes, chans):
         for met in metrics:
             for drag in (False, True):
@@ -316,14 +341,15 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
                      & (data["drag"] == drag) & np.isfinite(data[met]))
                 if not m.any():
                     continue
-                x = data["spec_freq_GHz"][m]; y = data[met][m]; o = np.argsort(x)
+                x = data[xc][m]; y = data[met][m]; o = np.argsort(x)
                 ax.plot(x[o], np.clip(y[o], 1e-12, None), color=mcolor[met],
                         ls="-" if drag else "--", marker="o",
                         mfc=(mcolor[met] if drag else "white"), mec=mcolor[met])
-        if wres is not None:
+        if wres is not None and xc == "spec_freq_GHz":
             ax.axvline(wres, color="0.5", lw=0.8, ls=":", zorder=0)
+        _mark_collision(ax, xc)
         ax.set_yscale("log")
-        ax.set_xlabel(r"spectator frequency $\Delta/2\pi$ (GHz)")
+        ax.set_xlabel(_XLABELS[xc])
         ax.set_title(ch.replace("_", "$-$") + rf"   ({_series_label(scol)}$={lam:g}$)")
     axes[0].set_ylabel("population")
     for ax, lab in zip(axes, "abcdef"):
@@ -402,20 +428,23 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
     vmin, vmax = (np.nanpercentile(allvals, 2), np.nanpercentile(allvals, 98)) \
         if allvals.size else (-6, 0)
     im = None
+    xc = _xcol(data)
     for i, drag in enumerate(drags):
         for j, ch in enumerate(chans):
             ax = axes[i][j]
             m = ((data["channel"] == ch) & (data["drag"] == drag)
                  & np.isfinite(data[vcol]))
             if m.any():
-                xs, ys, Z = _pivot(data, m, "spec_freq_GHz", scol, vcol)
+                xs, ys, Z = _pivot(data, m, xc, scol, vcol)
                 im = ax.pcolormesh(_edges(xs), _edges(ys), transform(Z),
                                    cmap=cmap, vmin=vmin, vmax=vmax,
                                    shading="auto", rasterized=True)
-                if wres is not None:
+                if wres is not None and xc == "spec_freq_GHz":
                     ax.axvline(wres, color="w", lw=0.8, ls=":")
+                elif xc == "beat_GHz":
+                    ax.axvline(0.0, color="w", lw=0.8, ls=":")
             if i == nr - 1:
-                ax.set_xlabel(r"spectator frequency $\Delta/2\pi$ (GHz)")
+                ax.set_xlabel(_XLABELS[xc])
             if j == 0:
                 ax.set_ylabel(_series_label(scol))
             ax.set_title(f"{ch.replace('_', '$-$')}, DRAG {'on' if drag else 'off'}")
@@ -456,11 +485,12 @@ def fig_analytic_map(data: Dict[str, np.ndarray],
 
     fig, axes = plt.subplots(1, 2, figsize=figsize or (7.2, 3.0))
     ch = chans[0]   # the analytic exchange rate is channel-independent
+    xc = _xcol(data)
     for lam in lams:
         m = (data["channel"] == ch) & (data[scol] == lam) & (data["drag"] == False)
         if not m.any():
             continue
-        x = data["spec_freq_GHz"][m]; o = np.argsort(x)
+        x = data[xc][m]; o = np.argsort(x)
         gspec = data["g_spec_eff_MHz"][m][o]
         beat = data["beat_GHz"][m][o]
         danger = gspec / np.clip(np.abs(beat) * 1e3, 1e-6, None)  # MHz / MHz
@@ -473,9 +503,10 @@ def fig_analytic_map(data: Dict[str, np.ndarray],
         axes[0].text(axes[0].get_xlim()[1], g_is, r" $g^\mathrm{eff}_\mathrm{iSWAP}$",
                      va="center", ha="right", fontsize=7.5, color="0.4")
     for ax in axes:
-        if wres is not None:
+        if wres is not None and xc == "spec_freq_GHz":
             ax.axvline(wres, color="0.5", lw=0.8, ls=":", zorder=0)
-        ax.set_xlabel(r"spectator frequency $\Delta/2\pi$ (GHz)")
+        _mark_collision(ax, xc)
+        ax.set_xlabel(_XLABELS[xc])
     axes[0].set_ylabel(r"exchange rate $g^\mathrm{eff}_\mathrm{spec}/2\pi$ (MHz)")
     axes[1].set_ylabel(r"danger ratio $g^\mathrm{eff}_\mathrm{spec}/|\delta_s|$")
     axes[1].set_yscale("log")
@@ -514,7 +545,14 @@ def main() -> None:
     ap.add_argument("--format", default="pdf,png",
                     help="comma list of output formats (default pdf,png)")
     ap.add_argument("--usetex", action="store_true", help="use a system LaTeX install")
+    ap.add_argument("--vs-beat", action="store_true",
+                    help="plot vs beat detuning delta = Delta - w_p (0 = collision) "
+                         "instead of absolute spectator frequency")
     args = ap.parse_args()
+
+    global _XAXIS
+    if args.vs_beat:
+        _XAXIS = "beat_GHz"
 
     figdir = args.figdir or os.path.join(args.outdir, "figs")
     fmts = [s.strip() for s in args.format.split(",") if s.strip()]

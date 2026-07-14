@@ -146,7 +146,7 @@ DEFAULT_CONFIG = {
     "envelope": "raised_cosine",
     "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_gate.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
-    "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance
+    "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
     "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
     "stark_points":   21,            # per-point chevron offset samples
     "stark_window_factor": 2.0,      # chevron time window = factor * t_g
@@ -318,14 +318,17 @@ def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
 # Single-point computation (imports zhou_coupler lazily)
 # ---------------------------------------------------------------------------
 def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
-                      t_g: float, amp_scale: float, solver: Dict[str, Any]) -> float:
+                      t_g: float, amp_scale: float, solver: Dict[str, Any],
+                      spec_abs_GHz: Optional[float] = None) -> float:
     """Per-point AC-Stark-shifted iSWAP resonance offset (GHz) for the pump.
 
-    Runs the spectator-free chevron of find_stark_resonance.py at this point's
-    (w_a, w_b) and operating amplitude, returning the offset from |w_b - w_a| that
-    maximises swap contrast. The spectator is excluded on purpose: the drive
-    frequency is a property of the a<->b gate, calibrated as on hardware without
-    the neighbour. Serial (n_jobs=1) because the caller may already be in a pool.
+    Runs the chevron of find_stark_resonance.py at this point's (w_a, w_b) and
+    operating amplitude, returning the offset from |w_b - w_a| that maximises swap
+    contrast. With ``spec_abs_GHz`` given, the spectator is INCLUDED in the chevron
+    at that absolute frequency, so the located resonance carries the spectator's
+    (detuning-dependent) dispersive pull -- the offset then varies point to point.
+    With ``spec_abs_GHz=None`` it is the bare a<->b resonance. Serial (n_jobs=1)
+    because the caller may already be in a pool.
 
     Parameters
     ----------
@@ -340,6 +343,9 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
         Amplitude-scale correction from a prior amplitude calibration.
     solver : dict
         QuTiP tolerances (atol, rtol, nsteps).
+    spec_abs_GHz : float, optional
+        Spectator ABSOLUTE frequency (GHz) to include in the chevron. None -> bare
+        pair.
 
     Returns
     -------
@@ -355,7 +361,8 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     window = float(config.get("stark_window_factor", 2.0)) * float(t_g)
     n_time = int(config.get("stark_time_points", 120))
     res = FS.scan(sub, float(t_g), float(amp_scale), offsets, window, n_time,
-                  solver, n_jobs=1)
+                  solver, n_jobs=1,
+                  spec_abs_GHz=(None if spec_abs_GHz is None else float(spec_abs_GHz)))
     return float(res["resonance_offset_GHz"])
 
 
@@ -391,20 +398,23 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     ws = config["coupler_freq_GHz"] * TWO_PI
     w_p = abs(wb - wa)                              # iSWAP pump = |detuning| (fixed)
     w_p_GHz = w_p / TWO_PI + float(config.get("wp_offset_GHz", 0.0))   # calibrated offset
+    w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
+    freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
+
     # optional: drive at the AC-Stark-shifted resonance (needs the integrated run).
-    # In the spectator sweep w_a, w_b are fixed, so this offset is identical for every
-    # point -- for efficiency you can instead precompute it once with
-    # find_stark_resonance.py and set wp_offset_GHz.
+    # The chevron INCLUDES the spectator at w_spec, so the located offset carries the
+    # spectator's dispersive pull and varies point to point (largest near the
+    # collision beat -> 0). This is one extra chevron per point; if you only need the
+    # bare a<->b shift, precompute it once with find_stark_resonance.py + wp_offset_GHz.
     stark_offset_GHz = 0.0
     if bool(config.get("integrate", True)) and bool(config.get("stark_drive", False)):
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
         stark_offset_GHz = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
                                              float(config["t_g_ns"]),
-                                             float(config.get("amp_scale", 1.0)), _sv)
+                                             float(config.get("amp_scale", 1.0)), _sv,
+                                             spec_abs_GHz=w_spec / TWO_PI)
         w_p_GHz += stark_offset_GHz
-    w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
-    freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
     # --- spectator: a single 3-level anharmonic transmon --------------------
     spec_levels = int(config["spec_levels"])
@@ -572,7 +582,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                    nsteps=int(config.get("nsteps", 500000)))
         wp_offset_used_GHz += _stark_offset_GHz(config, wa_GHz, wb_GHz,
                                                 float(config["t_g_ns"]),
-                                                amp_scale_used, _sv)
+                                                amp_scale_used, _sv,
+                                                spec_abs_GHz=wspec_GHz)
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
 
     # Rates/eta are level-independent, so the analytic-only build uses 2 levels
@@ -891,7 +902,13 @@ def main() -> None:
     ap.add_argument("--nproc", type=int, default=4, help="processes for mode=local")
     ap.add_argument("--sweep", choices=["spectator", "target"], default="spectator",
                     help="spectator sweep (default) or target-frequency allocation sweep")
-    ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta (GHz)")
+    ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta = w_b - w_spec (GHz)")
+    ap.add_argument("--beats", help="[spectator] comma list of BEAT detunings delta = Delta - w_p "
+                                    "(GHz); 0 = on the collision. Sets spec_freq = w_p + delta.")
+    ap.add_argument("--beat-span-MHz", type=float, default=None,
+                    help="[spectator] auto beat sweep: +/-span/2 about the collision (delta=0)")
+    ap.add_argument("--beat-points", type=int, default=13,
+                    help="[spectator] number of points for --beat-span-MHz (default 13)")
     ap.add_argument("--drags", help="comma list of bools, e.g. false,true")
     ap.add_argument("--wb-GHz", help="[target] comma list of partner (w_b) freqs (GHz)")
     ap.add_argument("--spec-GHz", help="[target] comma list of spectator ABSOLUTE freqs (GHz)")
@@ -902,8 +919,10 @@ def main() -> None:
     ap.add_argument("--no-integrate", action="store_true",
                     help="analytic collision map only (no time integration)")
     ap.add_argument("--stark", action="store_true",
-                    help="drive each point at its AC-Stark-shifted resonance (per-point "
-                         "chevron; needs the integrated run and is markedly slower)")
+                    help="drive each point at its AC-Stark-shifted resonance, located "
+                         "by a per-point chevron that INCLUDES the spectator (so the "
+                         "offset varies with detuning); needs the integrated run and "
+                         "is markedly slower (one extra chevron per point)")
     ap.add_argument("--calibrate", action="store_true",
                     help="per-point amplitude+Stark tune-up (calibrate_gate) before each "
                          "gate -- the 'better calibration' allocation; slowest, most faithful")
@@ -981,7 +1000,23 @@ def main() -> None:
             print(f"Submit with:\n  RUNNER=run_sweep_zhou.py OUTDIR={args.outdir} "
                   f"sbatch --array=0-{m-1} slurm/snail_sweep.slurm")
             return
-        specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
+        # Detuning axis. Most intuitive is the BEAT delta = spec_freq - w_p (0 = on
+        # the collision); convert to spec_freq = w_p + delta. Fall back to explicit
+        # --specfreqs (Delta = w_b - w_spec) or the default broad axis.
+        wa_g, wb_g = (float(x) for x in config["qubit_freqs_GHz"])
+        w_p = abs(wb_g - wa_g) + float(config.get("wp_offset_GHz", 0.0))
+        if args.beat_span_MHz is not None:
+            half = float(args.beat_span_MHz) / 2000.0            # MHz full-width -> GHz half
+            beats = np.linspace(-half, half, int(args.beat_points))
+            specfreqs = [round(w_p + float(b), 6) for b in beats]
+            print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz; "
+                  f"delta in +/-{args.beat_span_MHz/2:.0f} MHz, {args.beat_points} points")
+        elif args.beats:
+            beats = _parse_list(args.beats, float)
+            specfreqs = [round(w_p + float(b), 6) for b in beats]
+            print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz")
+        else:
+            specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
         drags = _bool_list(args.drags) or DEFAULT_DRAGS
         points = build_grid(specfreqs, drags)
         path = write_grid(args.outdir, config, points)
