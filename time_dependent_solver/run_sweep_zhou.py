@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
     "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_gate.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
     "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
+    "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
     "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
     "stark_points":   21,            # per-point chevron offset samples
     "stark_window_factor": 2.0,      # chevron time window = factor * t_g
@@ -154,6 +155,9 @@ DEFAULT_CONFIG = {
     "stark_jobs":     1,             # processes for the per-point chevron's offset scan
                                      #   (>1 only in mode=point, where one task = one point;
                                      #    mode=local pools points and forces this to 1)
+    "stark_match_pulse": False,      # per-point chevron uses the ACTUAL pulse (raised-cosine,
+                                     #   + DRAG for DRAG-on points) instead of a constant probe,
+                                     #   so DRAG-on points land on the DRAG-on resonance
     "calibrate_points": False,       # per-point amplitude+Stark tune-up (calibrate_gate)
     "calibrate_iters":  1,           # amplitude/frequency rounds per point
     "cal_amp_lo":       0.6,         # per-point amplitude-scale search bounds
@@ -322,9 +326,19 @@ def load_grid(outdir: str) -> Tuple[Dict[str, Any], List[Point]]:
 # ---------------------------------------------------------------------------
 def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
                       t_g: float, amp_scale: float, solver: Dict[str, Any],
-                      spec_abs_GHz: Optional[float] = None) -> float:
+                      spec_abs_GHz: Optional[float] = None,
+                      drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
     """Per-point AC-Stark-shifted iSWAP resonance offset (GHz) for the pump.
 
+    Runs the chevron of find_stark_resonance.py at this point's (w_a, w_b) and
+    operating amplitude, returning the offset from |w_b - w_a| that maximises swap
+    contrast. With ``spec_abs_GHz`` given, the spectator is INCLUDED in the chevron
+    at that absolute frequency, so the located resonance carries the spectator's
+    (detuning-dependent) dispersive pull -- the offset then varies point to point.
+    With ``spec_abs_GHz=None`` it is the bare a<->b resonance. The offset scan
+    parallelizes over ``config['stark_jobs']`` processes: keep it at 1 when the
+    caller is itself in a pool (mode=local) and raise it to cpus-per-task in
+    mode=point, where one task runs a single point.
     Runs the chevron of find_stark_resonance.py at this point's (w_a, w_b) and
     operating amplitude, returning the offset from |w_b - w_a| that maximises swap
     contrast. With ``spec_abs_GHz`` given, the spectator is INCLUDED in the chevron
@@ -351,11 +365,19 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     spec_abs_GHz : float, optional
         Spectator ABSOLUTE frequency (GHz) to include in the chevron. None -> bare
         pair.
+    drag_beat_GHz : float, optional
+        DRAG beat detuning (GHz). Only used when ``config['stark_match_pulse']`` is
+        set: the chevron then uses the ACTUAL raised-cosine gate pulse with the DRAG
+        quadrature tuned to this beat, so the located resonance is the DRAG-ON
+        resonance (it carries the DRAG-quadrature Stark shift a constant probe
+        cannot see). None -> shaped pulse without DRAG.
 
     Returns
     -------
-    float
-        Stark resonance offset (GHz) to add to |w_b - w_a|.
+    dict
+        The full find_stark_resonance.scan result (offsets_GHz, times_ns, P10,
+        max_transfer, resonance_offset_GHz, eta_op, shape, drag_beat_GHz, ...).
+        Callers take ``resonance_offset_GHz`` and may persist the rest.
     """
     import find_stark_resonance as FS
     sub = dict(config)
@@ -365,10 +387,13 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     offsets = np.linspace(-span / 2.0, span / 2.0, n_pts)
     window = float(config.get("stark_window_factor", 2.0)) * float(t_g)
     n_time = int(config.get("stark_time_points", 120))
-    res = FS.scan(sub, float(t_g), float(amp_scale), offsets, window, n_time,
-                  solver, n_jobs=int(config.get("stark_jobs", 1)),
-                  spec_abs_GHz=(None if spec_abs_GHz is None else float(spec_abs_GHz)))
-    return float(res["resonance_offset_GHz"])
+    shaped = bool(config.get("stark_match_pulse", False))
+    return FS.scan(sub, float(t_g), float(amp_scale), offsets, window, n_time,
+                   solver, n_jobs=int(config.get("stark_jobs", 1)),
+                   spec_abs_GHz=(None if spec_abs_GHz is None else float(spec_abs_GHz)),
+                   shape=("raised_cosine" if shaped else "constant"),
+                   drag_beat_GHz=(float(drag_beat_GHz) if (shaped and drag_beat_GHz is not None)
+                                  else None))
 
 
 def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -406,19 +431,32 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
     freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
+    w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
+    freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
+
     # optional: drive at the AC-Stark-shifted resonance (needs the integrated run).
     # The chevron INCLUDES the spectator at w_spec, so the located offset carries the
     # spectator's dispersive pull and varies point to point (largest near the
-    # collision beat -> 0). This is one extra chevron per point; if you only need the
-    # bare a<->b shift, precompute it once with find_stark_resonance.py + wp_offset_GHz.
+    # collision beat -> 0). With config['stark_match_pulse'] the chevron uses the
+    # ACTUAL pulse (raised-cosine, + DRAG when this point uses it), so DRAG-on points
+    # are calibrated on the DRAG-ON resonance (the DRAG-quadrature Stark shift). This
+    # is one extra chevron per point; else precompute once + wp_offset_GHz.
     stark_offset_GHz = 0.0
+    _chevron = None
     if bool(config.get("integrate", True)) and bool(config.get("stark_drive", False)):
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
-        stark_offset_GHz = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
-                                             float(config["t_g_ns"]),
-                                             float(config.get("amp_scale", 1.0)), _sv,
-                                             spec_abs_GHz=w_spec / TWO_PI)
+        # DRAG beat for the chevron uses the pre-Stark pump (the ~MHz Stark offset is
+        # negligible vs the beat in the DRAG quadrature); skip DRAG on-collision.
+        _chev_beat = pt.spec_freq_GHz - w_p_GHz
+        _chev_drag = (_chev_beat if (pt.drag and abs(_chev_beat) >= _DELTA_EPS_GHz)
+                      else None)
+        _chevron = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
+                                     float(config["t_g_ns"]),
+                                     float(config.get("amp_scale", 1.0)), _sv,
+                                     spec_abs_GHz=w_spec / TWO_PI,
+                                     drag_beat_GHz=_chev_drag)
+        stark_offset_GHz = float(_chevron["resonance_offset_GHz"])
         w_p_GHz += stark_offset_GHz
 
     # --- spectator: a single 3-level anharmonic transmon --------------------
@@ -492,6 +530,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "F_avg": "", "leakage": "", "n_spec": "", "n_coupler": "", "p_transfer": "",
         "U_proj": None,
     }
+    if _chevron is not None:
+        out["_chevron"] = _chevron          # persisted by save_point, plotted by mode=chevrons
 
     if not config.get("integrate", True):
         out["wall_s"] = time.time() - t0
@@ -563,6 +603,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     # Both need the integrated run and use the spectator-free (a,b) gate.
     amp_scale_used = float(config.get("amp_scale", 1.0))
     wp_offset_used_GHz = float(config.get("wp_offset_GHz", 0.0))
+    _chevron = None
     if integrate and bool(config.get("calibrate_points", False)):
         import calibrate_gate as CG
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
@@ -585,10 +626,20 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     elif integrate and bool(config.get("stark_drive", False)):
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
-        wp_offset_used_GHz += _stark_offset_GHz(config, wa_GHz, wb_GHz,
-                                                float(config["t_g_ns"]),
-                                                amp_scale_used, _sv,
-                                                spec_abs_GHz=wspec_GHz)
+        # nearest collision from the pre-Stark pump, for the DRAG-matched chevron
+        # (only meaningful when DRAG is forced on every point via drag_always).
+        _cb = None
+        for _wq in (wa_GHz, wb_GHz):
+            _sep = abs(_wq - wspec_GHz)
+            for _bt in (_sep - w_p_GHz, _sep):
+                if _cb is None or abs(_bt) < abs(_cb):
+                    _cb = float(_bt)
+        _chev_drag = (_cb if (bool(config.get("drag_always", False))
+                              and abs(_cb) >= _DELTA_EPS_GHz) else None)
+        _chevron = _stark_offset_GHz(config, wa_GHz, wb_GHz,
+                                     float(config["t_g_ns"]), amp_scale_used, _sv,
+                                     spec_abs_GHz=wspec_GHz, drag_beat_GHz=_chev_drag)
+        wp_offset_used_GHz += float(_chevron["resonance_offset_GHz"])
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
 
     # Rates/eta are level-independent, so the analytic-only build uses 2 levels
@@ -690,6 +741,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "F_avg_drag": "", "leakage_drag": "", "dF_drag": "",
         "U_proj": None,
     }
+    if _chevron is not None:
+        out["_chevron"] = _chevron          # persisted by save_point, plotted by mode=chevrons
 
     if not integrate:
         out["wall_s"] = time.time() - t0
@@ -749,9 +802,21 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
     U = result.pop("U_proj", None)
     if U is None:
         U = np.zeros((4, 4), dtype=complex)
+    chev = result.pop("_chevron", None)        # popped before JSON so meta stays scalar
+    extra: Dict[str, Any] = {}
+    if chev is not None:
+        extra = {"chev_offsets_GHz": np.asarray(chev["offsets_GHz"], dtype=float),
+                 "chev_times_ns": np.asarray(chev["times_ns"], dtype=float),
+                 "chev_P10": np.asarray(chev["P10"], dtype=float),
+                 "chev_max_transfer": np.asarray(chev["max_transfer"], dtype=float),
+                 "chev_resonance_offset_GHz": float(chev["resonance_offset_GHz"]),
+                 "chev_eta_op": float(chev["eta_op"]),
+                 "chev_shape": str(chev.get("shape", "constant")),
+                 "chev_drag_beat_GHz": float(chev.get("drag_beat_GHz", np.nan)),
+                 "chev_spec_abs_GHz": float(chev.get("spec_abs_GHz", np.nan))}
     np.savez_compressed(path,
                         U_proj_real=np.real(U), U_proj_imag=np.imag(U),
-                        meta=json.dumps(result))
+                        meta=json.dumps(result), **extra)
     return path
 
 
@@ -835,6 +900,55 @@ def collect(outdir: str) -> None:
                   f"helped {int((g > 0).sum())}/{g.size}")
 
 
+def plot_chevrons(outdir: str, indices: Optional[List[int]] = None) -> List[str]:
+    """Render the per-point Stark chevrons saved by --stark runs to
+    ``<outdir>/figs/chevrons/chevron_XXXXX.png`` (reuses find_stark_resonance's
+    renderer, so DRAG-matched chevrons are labelled with their beat).
+
+    Parameters
+    ----------
+    outdir : str
+        Sweep output directory (must contain ``points/point_*.npz``).
+    indices : list of int, optional
+        Restrict to these point indices; default renders every point that stored a
+        chevron.
+
+    Returns
+    -------
+    list of str
+        Paths of the written PNGs.
+    """
+    import glob
+    import find_stark_resonance as FS
+    figs = os.path.join(outdir, "figs", "chevrons")
+    os.makedirs(figs, exist_ok=True)
+    written: List[str] = []
+    for npz in sorted(glob.glob(os.path.join(outdir, "points", "point_*.npz"))):
+        d = np.load(npz)
+        if "chev_P10" not in d.files:
+            continue
+        meta = json.loads(str(d["meta"]))
+        idx = int(meta.get("index", -1))
+        if indices is not None and idx not in indices:
+            continue
+        chev = {"offsets_GHz": d["chev_offsets_GHz"], "times_ns": d["chev_times_ns"],
+                "P10": d["chev_P10"], "max_transfer": d["chev_max_transfer"],
+                "resonance_offset_GHz": float(d["chev_resonance_offset_GHz"]),
+                "eta_op": float(d["chev_eta_op"]),
+                "shape": str(d["chev_shape"]),
+                "drag_beat_GHz": float(d["chev_drag_beat_GHz"])}
+        bits: List[str] = []
+        if "spec_freq_GHz" in meta:
+            bits.append(rf"$\Delta$={float(meta['spec_freq_GHz']):.3f} GHz")
+        if isinstance(meta.get("beat_GHz"), (int, float)):
+            bits.append(f"beat={float(meta['beat_GHz'])*1e3:+.0f} MHz")
+        bits.append("DRAG on" if meta.get("drag") else "DRAG off")
+        png = os.path.join(figs, f"chevron_{idx:05d}.png")
+        FS.render_chevron(chev, png, title_suffix=f"pt {idx}  " + "  ".join(bits))
+        written.append(png)
+    return written
+
+
 # ---------------------------------------------------------------------------
 # Modes / CLI
 # ---------------------------------------------------------------------------
@@ -899,7 +1013,7 @@ def main() -> None:
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["prepare", "point", "local", "collect"])
+    ap.add_argument("mode", choices=["prepare", "point", "local", "collect", "chevrons"])
     ap.add_argument("--outdir", default="results_zhou")
     ap.add_argument("--device", help="JSON file overriding DEFAULT_CONFIG")
     ap.add_argument("--index", type=int, help="point index (mode=point)")
@@ -910,8 +1024,20 @@ def main() -> None:
                          "mode=point: defaults to SLURM_CPUS_PER_TASK (parallelize the "
                          "chevron across the task's cores); mode=local: forced to 1 "
                          "(points are already pooled).")
+    ap.add_argument("--stark-jobs", type=int, default=None,
+                    help="processes for the per-point --stark chevron's offset scan. "
+                         "mode=point: defaults to SLURM_CPUS_PER_TASK (parallelize the "
+                         "chevron across the task's cores); mode=local: forced to 1 "
+                         "(points are already pooled).")
     ap.add_argument("--sweep", choices=["spectator", "target"], default="spectator",
                     help="spectator sweep (default) or target-frequency allocation sweep")
+    ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta = w_b - w_spec (GHz)")
+    ap.add_argument("--beats", help="[spectator] comma list of BEAT detunings delta = Delta - w_p "
+                                    "(GHz); 0 = on the collision. Sets spec_freq = w_p + delta.")
+    ap.add_argument("--beat-span-MHz", type=float, default=None,
+                    help="[spectator] auto beat sweep: +/-span/2 about the collision (delta=0)")
+    ap.add_argument("--beat-points", type=int, default=13,
+                    help="[spectator] number of points for --beat-span-MHz (default 13)")
     ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta = w_b - w_spec (GHz)")
     ap.add_argument("--beats", help="[spectator] comma list of BEAT detunings delta = Delta - w_p "
                                     "(GHz); 0 = on the collision. Sets spec_freq = w_p + delta.")
@@ -933,6 +1059,11 @@ def main() -> None:
                          "by a per-point chevron that INCLUDES the spectator (so the "
                          "offset varies with detuning); needs the integrated run and "
                          "is markedly slower (one extra chevron per point)")
+    ap.add_argument("--stark-match-pulse", action="store_true",
+                    help="make the --stark chevron use the ACTUAL gate pulse (raised-"
+                         "cosine, plus DRAG on DRAG-on points) instead of a constant "
+                         "probe, so DRAG-on points calibrate onto the DRAG-on resonance "
+                         "(captures the DRAG-quadrature Stark shift)")
     ap.add_argument("--calibrate", action="store_true",
                     help="per-point amplitude+Stark tune-up (calibrate_gate) before each "
                          "gate -- the 'better calibration' allocation; slowest, most faithful")
@@ -962,6 +1093,8 @@ def main() -> None:
         config["integrate"] = False
     if args.stark:
         config["stark_drive"] = True
+    if args.stark_match_pulse:
+        config["stark_match_pulse"] = True
     if args.calibrate:
         config["calibrate_points"] = True
     if args.calibrate_iters is not None:
@@ -1027,6 +1160,23 @@ def main() -> None:
             print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz")
         else:
             specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
+        # Detuning axis. Most intuitive is the BEAT delta = spec_freq - w_p (0 = on
+        # the collision); convert to spec_freq = w_p + delta. Fall back to explicit
+        # --specfreqs (Delta = w_b - w_spec) or the default broad axis.
+        wa_g, wb_g = (float(x) for x in config["qubit_freqs_GHz"])
+        w_p = abs(wb_g - wa_g) + float(config.get("wp_offset_GHz", 0.0))
+        if args.beat_span_MHz is not None:
+            half = float(args.beat_span_MHz) / 2000.0            # MHz full-width -> GHz half
+            beats = np.linspace(-half, half, int(args.beat_points))
+            specfreqs = [round(w_p + float(b), 6) for b in beats]
+            print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz; "
+                  f"delta in +/-{args.beat_span_MHz/2:.0f} MHz, {args.beat_points} points")
+        elif args.beats:
+            beats = _parse_list(args.beats, float)
+            specfreqs = [round(w_p + float(b), 6) for b in beats]
+            print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz")
+        else:
+            specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
         drags = _bool_list(args.drags) or DEFAULT_DRAGS
         points = build_grid(specfreqs, drags)
         path = write_grid(args.outdir, config, points)
@@ -1042,11 +1192,33 @@ def main() -> None:
         collect(args.outdir)
         return
 
+    if args.mode == "chevrons":
+        idxs = [args.index] if args.index is not None else None
+        paths = plot_chevrons(args.outdir, idxs)
+        dest = os.path.join(args.outdir, "figs", "chevrons")
+        if paths:
+            print(f"Rendered {len(paths)} chevron figure(s) -> {dest}")
+        else:
+            print(f"No saved chevrons found in {args.outdir}/points (run with --stark).")
+        return
+
     grid_path = args.grid or os.path.join(args.outdir, "grid.json")
     if not os.path.exists(grid_path):
         sys.exit(f"grid.json not found at {grid_path}; run `prepare` first.")
     config, points = load_grid(args.outdir if not args.grid
                                else os.path.dirname(args.grid) or ".")
+
+    # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
+    # mode and the node allocation), not something baked into the grid: parallelize
+    # in mode=point (one task = one point, so use the task's cores), keep it serial
+    # in mode=local (points are already pooled -> avoid nested oversubscription).
+    if args.mode == "point":
+        config["stark_jobs"] = int(args.stark_jobs if args.stark_jobs is not None
+                                   else os.environ.get("SLURM_CPUS_PER_TASK", 1))
+    elif args.mode == "local":
+        if args.stark_jobs and int(args.stark_jobs) > 1:
+            print("note: mode=local pools points; forcing stark_jobs=1 (no nested pools).")
+        config["stark_jobs"] = 1
 
     # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
     # mode and the node allocation), not something baked into the grid: parallelize

@@ -92,36 +92,56 @@ def operating_eta(config: Dict[str, Any], t_g: float, amp_scale: float) -> float
 
 def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                           wp_offset_GHz: float, window_ns: float,
-                          spec_abs_GHz: Optional[float] = None):
-    """(a, b, coupler[, spectator]) system driven by a CONSTANT pump of peak
-    |eta| = eta_op held over [0, window_ns], with the pump frequency offset from
-    |w_b - w_a| by wp_offset_GHz. Anharmonicity / qutrit levels are included.
+                          spec_abs_GHz: Optional[float] = None,
+                          shape: str = "constant", t_g_ns: Optional[float] = None,
+                          drag_beat_GHz: Optional[float] = None,
+                          amp_scale: float = 1.0):
+    """(a, b, coupler[, spectator]) system driven by a probe pump, with the pump
+    frequency offset from |w_b - w_a| by wp_offset_GHz. Anharmonicity / qutrit
+    levels are included.
+
+    Two probe shapes:
+      * ``shape="constant"`` (default) -- a CONSTANT pump of peak |eta| = eta_op
+        held over [0, window_ns]. Amplitude-robust; it has d eta/dt = 0, so it
+        cannot see the DRAG-quadrature Stark shift.
+      * ``shape="raised_cosine"`` -- the ACTUAL gate pulse: a Hann full iSWAP over
+        [0, t_g_ns] normalized on (a, b) and scaled by amp_scale, with the DRAG
+        quadrature applied when ``drag_beat_GHz`` is given (tuned to that beat).
+        This DOES carry the DRAG-quadrature shift, so the located resonance is the
+        DRAG-ON resonance.
 
     With ``spec_abs_GHz`` given, a 4th spectator mode is added at that ABSOLUTE
-    frequency (participation lam_b, ``spec_levels`` levels, ``anharm_spec_GHz``),
-    so the located resonance reflects the spectator's dispersive pull on the a<->b
-    iSWAP. With ``spec_abs_GHz=None`` the system is the bare 3-mode pair (the
-    spectator-free baseline).
+    frequency (participation lam_b, ``spec_levels`` levels, ``anharm_spec_GHz``).
 
     Parameters
     ----------
     config : dict
         Merged device configuration.
     eta_op : float
-        Constant pump strength |eta| to hold (the operating amplitude).
+        Constant pump strength |eta| (used only for ``shape="constant"``).
     wp_offset_GHz : float
         Offset added to the bare pump frequency w_b - w_a (GHz).
     window_ns : float
-        Envelope duration (ns); the pump stays on for the whole scan window.
+        Evolution window (ns); for the constant shape the pump is held over it.
     spec_abs_GHz : float, optional
         Spectator ABSOLUTE frequency (GHz). None -> no spectator (bare pair).
+    shape : str, default "constant"
+        "constant" or "raised_cosine".
+    t_g_ns : float, optional
+        Gate time (ns) for the raised-cosine pulse; required if shape="raised_cosine".
+    drag_beat_GHz : float, optional
+        DRAG beat detuning delta = Delta - w_p (GHz). If given (raised-cosine only),
+        apply the first-order DRAG quadrature tuned to it.
+    amp_scale : float, default 1.0
+        Amplitude-scale correction applied after the full-iSWAP normalization
+        (raised-cosine only).
 
     Returns
     -------
     (ZhouCoupler, float)
         The coupler and its pump frequency w_p (GHz).
     """
-    from zhou_coupler import ZhouCoupler, PumpTone, ConstantPulse
+    from zhou_coupler import ZhouCoupler, PumpTone, ConstantPulse, RaisedCosine
 
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     ws = float(config["coupler_freq_GHz"])
@@ -146,9 +166,21 @@ def build_chevron_coupler(config: Dict[str, Any], eta_op: float,
                       participations=participations,
                       nonlinearities=nonlin, levels=levels,
                       anharmonicities_GHz=anharm)
-    # constant pump at fixed |eta| (is_eta=True, no normalization): peak_eta == eta_op
-    cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=ConstantPulse(amp=eta_op, t_g=window_ns),
-                          is_eta=True), normalize_iswap=None)
+
+    if shape == "raised_cosine":
+        # The actual gate pulse: Hann full iSWAP over t_g, DRAG tuned to the beat.
+        # Built exactly as run_sweep_zhou.build_point does (normalize then scale).
+        t_g = float(t_g_ns if t_g_ns is not None else window_ns)
+        env = RaisedCosine(amp=1.0, t_g=t_g)
+        cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
+                              drag=(drag_beat_GHz is not None),
+                              delta_drag_GHz=drag_beat_GHz),
+                     normalize_iswap=(0, 1))
+        cpl.scale_pump_amplitude(float(amp_scale))
+    else:
+        # constant pump at fixed |eta| (is_eta=True, no normalization): peak_eta == eta_op
+        cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=ConstantPulse(amp=eta_op, t_g=window_ns),
+                              is_eta=True), normalize_iswap=None)
     return cpl, w_p_GHz
 
 
@@ -163,10 +195,11 @@ def _resolve_jobs(n_jobs: Optional[int]) -> int:
 
 def _chevron_worker(args: Tuple) -> np.ndarray:
     """One pump-offset column: P(|01>->|10>) over the time grid. Works for the
-    3-mode bare pair or the 4-mode pair+spectator (state/index built from n_modes)."""
-    config, eta_op, wp_offset, times, solver, spec_abs_GHz = args
+    3-mode bare pair or the 4-mode pair+spectator (state/index built from n_modes),
+    and for constant or shaped(+DRAG) probe pulses (``build_kw``)."""
+    config, eta_op, wp_offset, times, solver, spec_abs_GHz, build_kw = args
     cpl, _w_p = build_chevron_coupler(config, eta_op, wp_offset, float(times[-1]),
-                                      spec_abs_GHz=spec_abs_GHz)
+                                      spec_abs_GHz=spec_abs_GHz, **build_kw)
     init = [0] * cpl.n_modes; init[1] = 1          # |01...> : qubit b excited
     tgt = [0] * cpl.n_modes; tgt[0] = 1            # |10...> : qubit a excited
     states = cpl.evolve_trajectory(init, times, **solver)
@@ -223,7 +256,9 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
          offsets_GHz: np.ndarray, window_ns: float, n_time: int,
          solver: Optional[Dict[str, Any]] = None,
          n_jobs: Optional[int] = None,
-         spec_abs_GHz: Optional[float] = None) -> Dict[str, Any]:
+         spec_abs_GHz: Optional[float] = None,
+         shape: str = "constant",
+         drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
     """Run the pump-frequency chevron and locate the Stark-shifted resonance.
 
     Parameters
@@ -253,12 +288,16 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
     -------
     dict
         offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer [n_off],
-        eta_op, w_p_bare_GHz, resonance_offset_GHz, resonance_w_p_GHz.
+        eta_op, w_p_bare_GHz, resonance_offset_GHz, resonance_w_p_GHz, and the
+        probe metadata shape, drag_beat_GHz, spec_abs_GHz.
     """
     solver = solver or {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000}
     eta_op = operating_eta(config, t_g, amp_scale)
     times = np.linspace(0.0, window_ns, n_time)
-    args = [(config, eta_op, float(off), times, solver, spec_abs_GHz)
+    build_kw = {"shape": shape, "t_g_ns": float(t_g),
+                "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else None),
+                "amp_scale": float(amp_scale)}
+    args = [(config, eta_op, float(off), times, solver, spec_abs_GHz, build_kw)
             for off in offsets_GHz]
 
     jobs = _resolve_jobs(n_jobs)
@@ -277,22 +316,28 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
             "P10": P10, "max_transfer": max_transfer, "eta_op": float(eta_op),
             "w_p_bare_GHz": float(w_p_bare),
             "resonance_offset_GHz": float(res_off),
-            "resonance_w_p_GHz": float(w_p_bare + res_off)}
+            "resonance_w_p_GHz": float(w_p_bare + res_off),
+            "shape": shape,
+            "drag_beat_GHz": (float(drag_beat_GHz) if drag_beat_GHz is not None else np.nan),
+            "spec_abs_GHz": (float(spec_abs_GHz) if spec_abs_GHz is not None else np.nan)}
 
 
 # ---------------------------------------------------------------------------
 # Plot
 # ---------------------------------------------------------------------------
-def plot_chevron(npz_path: str, png_path: str) -> None:
-    """Render the chevron heatmap P(|10>)(offset, time) and the max-transfer
-    envelope with the located resonance marked.
+def render_chevron(chev: Dict[str, Any], png_path: str, title_suffix: str = "") -> None:
+    """Render one chevron (heatmap + max-transfer envelope) from a dict of arrays.
 
     Parameters
     ----------
-    npz_path : str
-        .npz produced by main().
+    chev : dict
+        Must contain offsets_GHz, times_ns, P10 [n_off, n_time], max_transfer,
+        resonance_offset_GHz, eta_op; optional shape / drag_beat_GHz / spec_abs_GHz
+        annotate the title.
     png_path : str
         Output PNG.
+    title_suffix : str, default ""
+        Extra text appended to the figure title (e.g. the point index / detuning).
 
     Returns
     -------
@@ -307,25 +352,42 @@ def plot_chevron(npz_path: str, png_path: str) -> None:
     except Exception:
         pass
 
-    d = np.load(npz_path)
-    off_MHz = d["offsets_GHz"] * 1e3
-    res_MHz = float(d["resonance_offset_GHz"]) * 1e3
-    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12.4, 4.6), layout="constrained")
+    off_MHz = np.asarray(chev["offsets_GHz"]) * 1e3
+    res_MHz = float(chev["resonance_offset_GHz"]) * 1e3
+    shape = str(chev.get("shape", "constant"))
+    drag_beat = float(chev.get("drag_beat_GHz", np.nan))
+    probe = ("raised-cosine" if shape == "raised_cosine" else "constant")
+    if shape == "raised_cosine" and np.isfinite(drag_beat):
+        probe += rf" + DRAG($\delta$={drag_beat*1e3:+.0f} MHz)"
 
-    mesh = ax0.pcolormesh(off_MHz, d["times_ns"], d["P10"].T, shading="auto",
-                          cmap="viridis", vmin=0, vmax=1)
+    fig, (ax0, ax1) = plt.subplots(1, 2, figsize=(12.4, 4.6), layout="constrained")
+    mesh = ax0.pcolormesh(off_MHz, np.asarray(chev["times_ns"]), np.asarray(chev["P10"]).T,
+                          shading="auto", cmap="viridis", vmin=0, vmax=1)
     ax0.axvline(res_MHz, color="r", ls="--", lw=1.6, label=f"resonance {res_MHz:+.1f} MHz")
     ax0.set_xlabel(r"pump offset from $|w_b-w_a|$ (MHz)"); ax0.set_ylabel("time (ns)")
-    ax0.set_title("chevron: $P(|01\\rangle\\to|10\\rangle)$"); ax0.legend(loc="upper right", framealpha=0.9)
+    ax0.set_title(rf"chevron ({probe}): $P(|01\rangle\to|10\rangle)$")
+    ax0.legend(loc="upper right", framealpha=0.9)
     fig.colorbar(mesh, ax=ax0, label=r"$P(|10\rangle)$")
 
-    ax1.plot(off_MHz, d["max_transfer"], "o-", ms=3)
+    ax1.plot(off_MHz, np.asarray(chev["max_transfer"]), "o-", ms=3)
     ax1.axvline(res_MHz, color="r", ls="--", lw=1.6)
     ax1.set_xlabel(r"pump offset from $|w_b-w_a|$ (MHz)")
     ax1.set_ylabel(r"max-over-time $P(|10\rangle)$")
-    ax1.set_title(f"resonance offset = {res_MHz:+.1f} MHz  ($|\\eta|$={float(d['eta_op']):.3f})")
+    ax1.set_title(rf"offset = {res_MHz:+.1f} MHz  ($|\eta|$={float(chev['eta_op']):.3f})  {title_suffix}")
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_chevron(npz_path: str, png_path: str) -> None:
+    """Load a chevron .npz (from main()) and render it via render_chevron."""
+    d = np.load(npz_path)
+    chev = {"offsets_GHz": d["offsets_GHz"], "times_ns": d["times_ns"],
+            "P10": d["P10"], "max_transfer": d["max_transfer"],
+            "resonance_offset_GHz": float(d["resonance_offset_GHz"]),
+            "eta_op": float(d["eta_op"]),
+            "shape": str(d["shape"]) if "shape" in d.files else "constant",
+            "drag_beat_GHz": float(d["drag_beat_GHz"]) if "drag_beat_GHz" in d.files else np.nan}
+    render_chevron(chev, png_path)
 
 
 # ---------------------------------------------------------------------------
