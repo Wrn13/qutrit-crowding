@@ -12,7 +12,7 @@
 #SBATCH --error=snail_sweep_%A_%a.err
 #SBATCH --array=0-59%32          # OVERRIDE on submit: sbatch --array=0-<M-1> snail_sweep.slurm
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
+#SBATCH --cpus-per-task=12        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
                                  # so the per-point chevron parallelizes over its offsets
                                  # (mode=point auto-uses SLURM_CPUS_PER_TASK). Override:
                                  #   sbatch --cpus-per-task=12 --array=... slurm/snail_sweep.slurm
