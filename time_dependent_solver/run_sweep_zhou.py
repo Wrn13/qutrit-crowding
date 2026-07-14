@@ -151,6 +151,9 @@ DEFAULT_CONFIG = {
     "stark_points":   21,            # per-point chevron offset samples
     "stark_window_factor": 2.0,      # chevron time window = factor * t_g
     "stark_time_points":   120,      # chevron time samples
+    "stark_jobs":     1,             # processes for the per-point chevron's offset scan
+                                     #   (>1 only in mode=point, where one task = one point;
+                                     #    mode=local pools points and forces this to 1)
     "calibrate_points": False,       # per-point amplitude+Stark tune-up (calibrate_gate)
     "calibrate_iters":  1,           # amplitude/frequency rounds per point
     "cal_amp_lo":       0.6,         # per-point amplitude-scale search bounds
@@ -327,8 +330,10 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     contrast. With ``spec_abs_GHz`` given, the spectator is INCLUDED in the chevron
     at that absolute frequency, so the located resonance carries the spectator's
     (detuning-dependent) dispersive pull -- the offset then varies point to point.
-    With ``spec_abs_GHz=None`` it is the bare a<->b resonance. Serial (n_jobs=1)
-    because the caller may already be in a pool.
+    With ``spec_abs_GHz=None`` it is the bare a<->b resonance. The offset scan
+    parallelizes over ``config['stark_jobs']`` processes: keep it at 1 when the
+    caller is itself in a pool (mode=local) and raise it to cpus-per-task in
+    mode=point, where one task runs a single point.
 
     Parameters
     ----------
@@ -361,7 +366,7 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     window = float(config.get("stark_window_factor", 2.0)) * float(t_g)
     n_time = int(config.get("stark_time_points", 120))
     res = FS.scan(sub, float(t_g), float(amp_scale), offsets, window, n_time,
-                  solver, n_jobs=1,
+                  solver, n_jobs=int(config.get("stark_jobs", 1)),
                   spec_abs_GHz=(None if spec_abs_GHz is None else float(spec_abs_GHz)))
     return float(res["resonance_offset_GHz"])
 
@@ -900,6 +905,11 @@ def main() -> None:
     ap.add_argument("--index", type=int, help="point index (mode=point)")
     ap.add_argument("--grid", help="path to grid.json (default: <outdir>/grid.json)")
     ap.add_argument("--nproc", type=int, default=4, help="processes for mode=local")
+    ap.add_argument("--stark-jobs", type=int, default=None,
+                    help="processes for the per-point --stark chevron's offset scan. "
+                         "mode=point: defaults to SLURM_CPUS_PER_TASK (parallelize the "
+                         "chevron across the task's cores); mode=local: forced to 1 "
+                         "(points are already pooled).")
     ap.add_argument("--sweep", choices=["spectator", "target"], default="spectator",
                     help="spectator sweep (default) or target-frequency allocation sweep")
     ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta = w_b - w_spec (GHz)")
@@ -1037,6 +1047,18 @@ def main() -> None:
         sys.exit(f"grid.json not found at {grid_path}; run `prepare` first.")
     config, points = load_grid(args.outdir if not args.grid
                                else os.path.dirname(args.grid) or ".")
+
+    # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
+    # mode and the node allocation), not something baked into the grid: parallelize
+    # in mode=point (one task = one point, so use the task's cores), keep it serial
+    # in mode=local (points are already pooled -> avoid nested oversubscription).
+    if args.mode == "point":
+        config["stark_jobs"] = int(args.stark_jobs if args.stark_jobs is not None
+                                   else os.environ.get("SLURM_CPUS_PER_TASK", 1))
+    elif args.mode == "local":
+        if args.stark_jobs and int(args.stark_jobs) > 1:
+            print("note: mode=local pools points; forcing stark_jobs=1 (no nested pools).")
+        config["stark_jobs"] = 1
 
     if args.mode == "point":
         if args.index is None:
