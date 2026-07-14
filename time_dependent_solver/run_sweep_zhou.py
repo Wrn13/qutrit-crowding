@@ -147,7 +147,6 @@ DEFAULT_CONFIG = {
     "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_gate.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
     "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
-    "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
     "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
     "stark_points":   21,            # per-point chevron offset samples
     "stark_window_factor": 2.0,      # chevron time window = factor * t_g
@@ -339,15 +338,6 @@ def _stark_offset_GHz(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     parallelizes over ``config['stark_jobs']`` processes: keep it at 1 when the
     caller is itself in a pool (mode=local) and raise it to cpus-per-task in
     mode=point, where one task runs a single point.
-    Runs the chevron of find_stark_resonance.py at this point's (w_a, w_b) and
-    operating amplitude, returning the offset from |w_b - w_a| that maximises swap
-    contrast. With ``spec_abs_GHz`` given, the spectator is INCLUDED in the chevron
-    at that absolute frequency, so the located resonance carries the spectator's
-    (detuning-dependent) dispersive pull -- the offset then varies point to point.
-    With ``spec_abs_GHz=None`` it is the bare a<->b resonance. The offset scan
-    parallelizes over ``config['stark_jobs']`` processes: keep it at 1 when the
-    caller is itself in a pool (mode=local) and raise it to cpus-per-task in
-    mode=point, where one task runs a single point.
 
     Parameters
     ----------
@@ -428,9 +418,6 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     ws = config["coupler_freq_GHz"] * TWO_PI
     w_p = abs(wb - wa)                              # iSWAP pump = |detuning| (fixed)
     w_p_GHz = w_p / TWO_PI + float(config.get("wp_offset_GHz", 0.0))   # calibrated offset
-    w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
-    freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
-
     w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
     freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
@@ -1024,20 +1011,8 @@ def main() -> None:
                          "mode=point: defaults to SLURM_CPUS_PER_TASK (parallelize the "
                          "chevron across the task's cores); mode=local: forced to 1 "
                          "(points are already pooled).")
-    ap.add_argument("--stark-jobs", type=int, default=None,
-                    help="processes for the per-point --stark chevron's offset scan. "
-                         "mode=point: defaults to SLURM_CPUS_PER_TASK (parallelize the "
-                         "chevron across the task's cores); mode=local: forced to 1 "
-                         "(points are already pooled).")
     ap.add_argument("--sweep", choices=["spectator", "target"], default="spectator",
                     help="spectator sweep (default) or target-frequency allocation sweep")
-    ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta = w_b - w_spec (GHz)")
-    ap.add_argument("--beats", help="[spectator] comma list of BEAT detunings delta = Delta - w_p "
-                                    "(GHz); 0 = on the collision. Sets spec_freq = w_p + delta.")
-    ap.add_argument("--beat-span-MHz", type=float, default=None,
-                    help="[spectator] auto beat sweep: +/-span/2 about the collision (delta=0)")
-    ap.add_argument("--beat-points", type=int, default=13,
-                    help="[spectator] number of points for --beat-span-MHz (default 13)")
     ap.add_argument("--specfreqs", help="comma list of spectator freqs Delta = w_b - w_spec (GHz)")
     ap.add_argument("--beats", help="[spectator] comma list of BEAT detunings delta = Delta - w_p "
                                     "(GHz); 0 = on the collision. Sets spec_freq = w_p + delta.")
@@ -1160,23 +1135,6 @@ def main() -> None:
             print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz")
         else:
             specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
-        # Detuning axis. Most intuitive is the BEAT delta = spec_freq - w_p (0 = on
-        # the collision); convert to spec_freq = w_p + delta. Fall back to explicit
-        # --specfreqs (Delta = w_b - w_spec) or the default broad axis.
-        wa_g, wb_g = (float(x) for x in config["qubit_freqs_GHz"])
-        w_p = abs(wb_g - wa_g) + float(config.get("wp_offset_GHz", 0.0))
-        if args.beat_span_MHz is not None:
-            half = float(args.beat_span_MHz) / 2000.0            # MHz full-width -> GHz half
-            beats = np.linspace(-half, half, int(args.beat_points))
-            specfreqs = [round(w_p + float(b), 6) for b in beats]
-            print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz; "
-                  f"delta in +/-{args.beat_span_MHz/2:.0f} MHz, {args.beat_points} points")
-        elif args.beats:
-            beats = _parse_list(args.beats, float)
-            specfreqs = [round(w_p + float(b), 6) for b in beats]
-            print(f"beat-centered sweep: collision at spec_freq = w_p = {w_p:.4f} GHz")
-        else:
-            specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
         drags = _bool_list(args.drags) or DEFAULT_DRAGS
         points = build_grid(specfreqs, drags)
         path = write_grid(args.outdir, config, points)
@@ -1207,18 +1165,6 @@ def main() -> None:
         sys.exit(f"grid.json not found at {grid_path}; run `prepare` first.")
     config, points = load_grid(args.outdir if not args.grid
                                else os.path.dirname(args.grid) or ".")
-
-    # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
-    # mode and the node allocation), not something baked into the grid: parallelize
-    # in mode=point (one task = one point, so use the task's cores), keep it serial
-    # in mode=local (points are already pooled -> avoid nested oversubscription).
-    if args.mode == "point":
-        config["stark_jobs"] = int(args.stark_jobs if args.stark_jobs is not None
-                                   else os.environ.get("SLURM_CPUS_PER_TASK", 1))
-    elif args.mode == "local":
-        if args.stark_jobs and int(args.stark_jobs) > 1:
-            print("note: mode=local pools points; forcing stark_jobs=1 (no nested pools).")
-        config["stark_jobs"] = 1
 
     # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
     # mode and the node allocation), not something baked into the grid: parallelize
