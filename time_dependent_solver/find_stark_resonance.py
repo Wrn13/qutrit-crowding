@@ -309,11 +309,25 @@ def scan(config: Dict[str, Any], t_g: float, amp_scale: float,
 
     P10 = np.array(cols)                       # [n_off, n_time]
     max_transfer = P10.max(axis=1)
-    res_off = locate_resonance(np.asarray(offsets_GHz, dtype=float), max_transfer)
+    # Resonance criterion: for the CONSTANT probe, max-over-time = max Rabi contrast.
+    # For the SHAPED full-iSWAP the gate is evaluated at t_g (the pump is off after),
+    # so locate on P(|10>) AT t_g -- max-over-time would credit off-resonant offsets
+    # with their best mid-pulse value, broadening the peak and pulling the resonance
+    # off the frequency that actually completes the swap at t_g.
+    if shape == "raised_cosine":
+        k_tg = int(np.argmin(np.abs(np.asarray(times, dtype=float) - float(t_g))))
+        metric = P10[:, k_tg]
+        metric_label = f"P(|10>) at t_g={float(t_g):.0f} ns"
+    else:
+        metric = max_transfer
+        metric_label = "max-over-time P(|10>)"
+    res_off = locate_resonance(np.asarray(offsets_GHz, dtype=float), metric)
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     w_p_bare = abs(wb - wa)
     return {"offsets_GHz": np.asarray(offsets_GHz, dtype=float), "times_ns": times,
-            "P10": P10, "max_transfer": max_transfer, "eta_op": float(eta_op),
+            "P10": P10, "max_transfer": max_transfer,
+            "resonance_metric": metric, "metric_label": metric_label,
+            "eta_op": float(eta_op),
             "w_p_bare_GHz": float(w_p_bare),
             "resonance_offset_GHz": float(res_off),
             "resonance_w_p_GHz": float(w_p_bare + res_off),
@@ -369,10 +383,11 @@ def render_chevron(chev: Dict[str, Any], png_path: str, title_suffix: str = "") 
     ax0.legend(loc="upper right", framealpha=0.9)
     fig.colorbar(mesh, ax=ax0, label=r"$P(|10\rangle)$")
 
-    ax1.plot(off_MHz, np.asarray(chev["max_transfer"]), "o-", ms=3)
+    ax1.plot(off_MHz, np.asarray(chev.get("resonance_metric", chev["max_transfer"])),
+             "o-", ms=3)
     ax1.axvline(res_MHz, color="r", ls="--", lw=1.6)
     ax1.set_xlabel(r"pump offset from $|w_b-w_a|$ (MHz)")
-    ax1.set_ylabel(r"max-over-time $P(|10\rangle)$")
+    ax1.set_ylabel(str(chev.get("metric_label", "max-over-time $P(|10\\rangle)$")))
     ax1.set_title(rf"offset = {res_MHz:+.1f} MHz  ($|\eta|$={float(chev['eta_op']):.3f})  {title_suffix}")
     fig.savefig(png_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -387,6 +402,9 @@ def plot_chevron(npz_path: str, png_path: str) -> None:
             "eta_op": float(d["eta_op"]),
             "shape": str(d["shape"]) if "shape" in d.files else "constant",
             "drag_beat_GHz": float(d["drag_beat_GHz"]) if "drag_beat_GHz" in d.files else np.nan}
+    if "resonance_metric" in d.files:
+        chev["resonance_metric"] = d["resonance_metric"]
+        chev["metric_label"] = str(d["metric_label"]) if "metric_label" in d.files else ""
     render_chevron(chev, png_path)
 
 

@@ -115,7 +115,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 TWO_PI = 2.0 * np.pi
-_DELTA_EPS_GHz = 5e-4   # |beat| below this: collision is essentially on-resonance
+_DELTA_EPS_GHz = 5e-4   # |beat| below this: collision is essentially on-resonance (a hard
+                       # floor; the DRAG-skip decision uses the config value below instead)
+
+
+def _drag_skip_GHz(config: Dict[str, Any]) -> float:
+    """|beat| (GHz) below which DRAG is skipped. The first-order quadrature ~ 1/beat
+    diverges toward the collision, so it must not be applied within ~a few x g_iswap
+    of it. Configurable via ``drag_skip_below_MHz`` (default 5 MHz)."""
+    return max(float(config.get("drag_skip_below_MHz", 5.0)) / 1e3, _DELTA_EPS_GHz)
 
 # ---------------------------------------------------------------------------
 # Default device + simulation configuration (override with --device cfg.json).
@@ -141,6 +149,11 @@ DEFAULT_CONFIG = {
     "min_detuning_GHz":  0.05,       # drop placements with |w_b-w_a| below this
     "drag_compare":         False,   # target sweep: also run DRAG-on in the near-collision window
     "drag_compare_below_MHz": 100.0, # |nearest beat| window (MHz) for the DRAG comparison
+    "drag_skip_below_MHz":    5.0,   # |beat| below this -> DRAG is SKIPPED: the first-order
+                                     #   quadrature ~ 1/beat diverges as beat -> 0, so applying
+                                     #   it inside ~a few x g_iswap of the collision blows the
+                                     #   gate up (population dumped into the coupler). Set to a
+                                     #   few x g_iswap for your device.
     # pulse / solver
     "t_g_ns":   60.0,
     "envelope": "raised_cosine",
@@ -436,7 +449,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         # DRAG beat for the chevron uses the pre-Stark pump (the ~MHz Stark offset is
         # negligible vs the beat in the DRAG quadrature); skip DRAG on-collision.
         _chev_beat = pt.spec_freq_GHz - w_p_GHz
-        _chev_drag = (_chev_beat if (pt.drag and abs(_chev_beat) >= _DELTA_EPS_GHz)
+        _chev_drag = (_chev_beat if (pt.drag and abs(_chev_beat) >= _drag_skip_GHz(config))
                       else None)
         _chevron = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
                                      float(config["t_g_ns"]),
@@ -476,7 +489,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     beat_GHz = pt.spec_freq_GHz - w_p_GHz
     use_drag = bool(pt.drag)
     status_drag = "ok"
-    if pt.drag and abs(beat_GHz) < _DELTA_EPS_GHz:
+    if pt.drag and abs(beat_GHz) < _drag_skip_GHz(config):
         use_drag = False
         status_drag = "drag_skipped_resonant_spectator"
 
@@ -622,7 +635,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                 if _cb is None or abs(_bt) < abs(_cb):
                     _cb = float(_bt)
         _chev_drag = (_cb if (bool(config.get("drag_always", False))
-                              and abs(_cb) >= _DELTA_EPS_GHz) else None)
+                              and abs(_cb) >= _drag_skip_GHz(config)) else None)
         _chevron = _stark_offset_GHz(config, wa_GHz, wb_GHz,
                                      float(config["t_g_ns"]), amp_scale_used, _sv,
                                      spec_abs_GHz=wspec_GHz, drag_beat_GHz=_chev_drag)
@@ -670,7 +683,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     beat_abs = round(abs(drag_beat), 6)
     thr_GHz = float(config.get("drag_compare_below_MHz", 100.0)) / 1000.0
     drag_compare = bool(config.get("drag_compare", False))
-    in_window = (_DELTA_EPS_GHz < beat_abs < thr_GHz)
+    in_window = (_drag_skip_GHz(config) < beat_abs < thr_GHz)
 
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
     amp_scale = amp_scale_used                          # per-point calibrated (or config default)
@@ -695,7 +708,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         base_drag = bool(pt.drag) or bool(config.get("drag_always", False))
         status_drag = "ok"
-        if base_drag and abs(drag_beat) < _DELTA_EPS_GHz:
+        if base_drag and abs(drag_beat) < _drag_skip_GHz(config):
             base_drag = False
             status_drag = "drag_skipped_resonant_collision"
 
@@ -796,6 +809,9 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
                  "chev_times_ns": np.asarray(chev["times_ns"], dtype=float),
                  "chev_P10": np.asarray(chev["P10"], dtype=float),
                  "chev_max_transfer": np.asarray(chev["max_transfer"], dtype=float),
+                 "chev_resonance_metric": np.asarray(
+                     chev.get("resonance_metric", chev["max_transfer"]), dtype=float),
+                 "chev_metric_label": str(chev.get("metric_label", "max-over-time P(|10>)")),
                  "chev_resonance_offset_GHz": float(chev["resonance_offset_GHz"]),
                  "chev_eta_op": float(chev["eta_op"]),
                  "chev_shape": str(chev.get("shape", "constant")),
@@ -924,6 +940,10 @@ def plot_chevrons(outdir: str, indices: Optional[List[int]] = None) -> List[str]
                 "eta_op": float(d["chev_eta_op"]),
                 "shape": str(d["chev_shape"]),
                 "drag_beat_GHz": float(d["chev_drag_beat_GHz"])}
+        if "chev_resonance_metric" in d.files:
+            chev["resonance_metric"] = d["chev_resonance_metric"]
+            chev["metric_label"] = (str(d["chev_metric_label"])
+                                    if "chev_metric_label" in d.files else "")
         bits: List[str] = []
         if "spec_freq_GHz" in meta:
             bits.append(rf"$\Delta$={float(meta['spec_freq_GHz']):.3f} GHz")
@@ -1070,6 +1090,9 @@ def main() -> None:
         config["stark_drive"] = True
     if args.stark_match_pulse:
         config["stark_match_pulse"] = True
+        if not config.get("stark_drive"):
+            print("note: --stark-match-pulse also needs --stark to do anything "
+                  "(it shapes the per-point Stark chevron).")
     if args.calibrate:
         config["calibrate_points"] = True
     if args.calibrate_iters is not None:
@@ -1165,6 +1188,18 @@ def main() -> None:
         sys.exit(f"grid.json not found at {grid_path}; run `prepare` first.")
     config, points = load_grid(args.outdir if not args.grid
                                else os.path.dirname(args.grid) or ".")
+
+    # load_grid replaces `config` with the grid's copy, so execution flags meant to
+    # be settable at run time (not just at prepare) must be RE-APPLIED here. Only
+    # force-on when explicitly passed (store_true), so a value baked in at prepare is
+    # preserved when the flag is absent. This removes the trap where --stark-match-pulse
+    # passed at point/local time was silently dropped.
+    if args.stark:
+        config["stark_drive"] = True
+    if args.stark_match_pulse:
+        config["stark_match_pulse"] = True
+    if config.get("stark_match_pulse") and not config.get("stark_drive"):
+        print("note: stark_match_pulse has no effect without --stark (no per-point chevron).")
 
     # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
     # mode and the node allocation), not something baked into the grid: parallelize
