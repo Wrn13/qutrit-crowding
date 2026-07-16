@@ -177,9 +177,9 @@ DEFAULT_CONFIG = {
     "cal_amp_points":   9,
     "drag_always":      False,       # force DRAG on for every allocation point
     "drag_subharmonic": False,       # [target] also let DRAG target the nearest SUBHARMONIC
-                                     #   transmon collision w_p = w_i/2 (pump's 2nd harmonic
-                                     #   drives transmon i at w_i = 2 w_p; i in {a, b, spectator}),
-                                     #   not just the one-pump swap |w_q - w_spec| = w_p
+                                     #   collision w_p = w_i/2 (pump's 2nd harmonic drives mode i
+                                     #   at w_i = 2 w_p; i in {a, b, spectator, coupler}), not
+                                     #   just the one-pump swap |w_q - w_spec| = w_p
     "integrate": True,               # set False for the instant analytic map only
     "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
     "nsteps": 500000,                # max internal solver steps between outputs
@@ -642,7 +642,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                 if _cb is None or abs(_bt) < abs(_cb):
                     _cb = float(_bt)
         if bool(config.get("drag_subharmonic", False)):
-            for _wi in (wa_GHz, wb_GHz, wspec_GHz):
+            for _wi in (wa_GHz, wb_GHz, wspec_GHz, ws_GHz):
                 _bt = 0.5 * _wi - w_p_GHz
                 if _cb is None or abs(_bt) < abs(_cb):
                     _cb = float(_bt)
@@ -689,12 +689,13 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
             beat = sep - harm
             if nearest is None or abs(beat) < nearest[0]:
                 nearest = (abs(beat), float(beat), kind, q_label, q_idx)
-    # Subharmonic transmon collisions (drag_subharmonic): the pump sits at half a
-    # transmon frequency, w_p = w_i/2, so the pump's second harmonic drives transmon
-    # i at w_i = 2 w_p. beat = w_i/2 - w_p (deviation of the pump from the subharmonic
-    # point). Checked for every transmon i in {a, b, spectator}.
+    # Subharmonic collisions (drag_subharmonic): the pump sits at half a mode frequency,
+    # w_p = w_i/2, so the pump's second harmonic drives mode i at w_i = 2 w_p. beat =
+    # w_i/2 - w_p. Checked for every mode i in {a, b, spectator, coupler} (the coupler
+    # is the driven SNAIL, but it has its own subharmonic w_s/2 like any mode).
     if bool(config.get("drag_subharmonic", False)):
-        for lab, idx, wi in (("a", a, wa_GHz), ("b", b, wb_GHz), ("spec", spec, wspec_GHz)):
+        for lab, idx, wi in (("a", a, wa_GHz), ("b", b, wb_GHz),
+                             ("spec", spec, wspec_GHz), ("s", coupler, ws_GHz)):
             beat = 0.5 * wi - w_p_GHz
             if abs(beat) < nearest[0]:
                 nearest = (abs(beat), float(beat), "subharm", lab, idx)
@@ -1135,10 +1136,10 @@ def main() -> None:
     ap.add_argument("--drag", action="store_true",
                     help="force DRAG on for every allocation point (tuned to the nearest beat)")
     ap.add_argument("--drag-subharmonic", action="store_true",
-                    help="[target] let DRAG target the nearest SUBHARMONIC transmon collision "
-                         "w_p = w_i/2 (pump's 2nd harmonic drives transmon i at w_i = 2 w_p, "
-                         "for i in {a, b, spectator}) in addition to the one-pump swap; "
-                         "DRAG follows whichever channel is closest")
+                    help="[target] let DRAG target the nearest SUBHARMONIC collision "
+                         "w_p = w_i/2 (pump's 2nd harmonic drives mode i at w_i = 2 w_p, "
+                         "for i in {a, b, spectator, coupler}) in addition to the one-pump "
+                         "swap; DRAG follows whichever channel is closest")
     ap.add_argument("--stark-span-MHz", type=float, default=None,
                     help="per-point Stark chevron width (default 60)")
     ap.add_argument("--stark-points", type=int, default=None,
