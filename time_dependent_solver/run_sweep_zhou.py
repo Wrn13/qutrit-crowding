@@ -176,6 +176,10 @@ DEFAULT_CONFIG = {
     "cal_amp_hi":       1.4,
     "cal_amp_points":   9,
     "drag_always":      False,       # force DRAG on for every allocation point
+    "drag_subharmonic": False,       # [target] also let DRAG target the nearest SUBHARMONIC
+                                     #   transmon collision w_p = w_i/2 (pump's 2nd harmonic
+                                     #   drives transmon i at w_i = 2 w_p; i in {a, b, spectator}),
+                                     #   not just the one-pump swap |w_q - w_spec| = w_p
     "integrate": True,               # set False for the instant analytic map only
     "rtol": 1e-8, "atol": 1e-10,     # QuTiP ODE tolerances
     "nsteps": 500000,                # max internal solver steps between outputs
@@ -627,11 +631,19 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
         # nearest collision from the pre-Stark pump, for the DRAG-matched chevron
-        # (only meaningful when DRAG is forced on every point via drag_always).
+        # (only meaningful when DRAG is forced on every point via drag_always). Same
+        # channels as the gate below: one-pump/static exchanges, plus -- when enabled --
+        # the subharmonic transmon collisions w_p = w_i/2 (beat = w_i/2 - w_p).
         _cb = None
         for _wq in (wa_GHz, wb_GHz):
             _sep = abs(_wq - wspec_GHz)
-            for _bt in (_sep - w_p_GHz, _sep):
+            for _h in (w_p_GHz, 0.0):
+                _bt = _sep - _h
+                if _cb is None or abs(_bt) < abs(_cb):
+                    _cb = float(_bt)
+        if bool(config.get("drag_subharmonic", False)):
+            for _wi in (wa_GHz, wb_GHz, wspec_GHz):
+                _bt = 0.5 * _wi - w_p_GHz
                 if _cb is None or abs(_bt) < abs(_cb):
                     _cb = float(_bt)
         _chev_drag = (_cb if (bool(config.get("drag_always", False))
@@ -666,15 +678,26 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                       participations=participations, nonlinearities=nonlin, levels=levels,
                       anharmonicities_GHz=anharm)
 
-    # --- nearest collision: spectator vs {a, b}, pump-assisted and direct -----
-    # pump-assisted exchange a_q^d a_spec is resonant at |w_q - w_spec| = w_p; the
-    # direct (no-pump) exchange is resonant at w_q = w_spec. Track the closest.
-    nearest = None   # (|beat|, signed beat, kind, q_label, q_idx)
+    # --- nearest collision: spectator vs {a, b} ------------------------------
+    # Exchange channels (per qubit): the one-pump swap a_q^d a_spec (resonant
+    # |w_q - w_spec| = w_p, the "qubit-qubit"-type swap) and the direct/static
+    # exchange (w_q = w_spec). beat = |w_q - w_spec| - n*w_p, n in {1, 0}.
+    nearest = None   # (|beat|, signed beat, kind, target_label, target_idx)
     for q_idx, q_freq, q_label in ((a, wa_GHz, "a"), (b, wb_GHz, "b")):
         sep = abs(q_freq - wspec_GHz)
-        for beat, kind in ((sep - w_p_GHz, "onepump"), (sep, "static")):
+        for kind, harm in (("onepump", w_p_GHz), ("static", 0.0)):
+            beat = sep - harm
             if nearest is None or abs(beat) < nearest[0]:
                 nearest = (abs(beat), float(beat), kind, q_label, q_idx)
+    # Subharmonic transmon collisions (drag_subharmonic): the pump sits at half a
+    # transmon frequency, w_p = w_i/2, so the pump's second harmonic drives transmon
+    # i at w_i = 2 w_p. beat = w_i/2 - w_p (deviation of the pump from the subharmonic
+    # point). Checked for every transmon i in {a, b, spectator}.
+    if bool(config.get("drag_subharmonic", False)):
+        for lab, idx, wi in (("a", a, wa_GHz), ("b", b, wb_GHz), ("spec", spec, wspec_GHz)):
+            beat = 0.5 * wi - w_p_GHz
+            if abs(beat) < nearest[0]:
+                nearest = (abs(beat), float(beat), "subharm", lab, idx)
 
     # near-collision window where DRAG is meant to help (off-resonant but close).
     # Round the beat to 1 kHz so placements exactly at the threshold classify
@@ -715,7 +738,11 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     _configure(base_drag)
     eta_peak = cpl.peak_eta()
     g_iswap = cpl.iswap_rate(a, b)
-    g_coll = cpl.effective_rate([nearest[4], spec], n=3, C=6)   # 6 g3 l_q l_spec |eta|
+    if nearest[2] == "subharm":
+        g_coll = float("nan")     # subharmonic drive is higher-order (g4); the cubic
+                                  # pair rate below does not model it
+    else:
+        g_coll = cpl.effective_rate([nearest[4], spec], n=3, C=6)   # 6 g3 l_q l_spec |eta|
 
     out = {
         "index": pt.index, "kind": "target",
@@ -1010,6 +1037,39 @@ def _log_line(res: Dict[str, Any]) -> str:
             f"eta={res['eta_peak']:.3f} g_spec={res['g_spec_eff_MHz']:.3f}MHz F={f_str}")
 
 
+def _print_submit_hint(outdir: str, m: int, max_array: int = 1000) -> None:
+    """Print the sbatch submission line, chunking the array when the point count would
+    exceed a typical SLURM ``MaxArraySize``. One array task then runs CHUNK contiguous
+    points, so the array size is ceil(m / CHUNK).
+
+    Parameters
+    ----------
+    outdir : str
+        Sweep output directory.
+    m : int
+        Number of grid points.
+    max_array : int, default 1000
+        Conservative MaxArraySize assumption; the true value is site-specific
+        (``scontrol show config | grep MaxArraySize``).
+
+    Returns
+    -------
+    None
+    """
+    import math
+    base = f"RUNNER=run_sweep_zhou.py OUTDIR={outdir}"
+    if m <= max_array:
+        print(f"Submit with:\n  {base} sbatch --array=0-{m - 1} slurm/snail_sweep.slurm")
+        return
+    chunk = math.ceil(m / max_array)
+    ntasks = math.ceil(m / chunk)
+    print(f"Submit with (N={m} exceeds a typical MaxArraySize={max_array}, so CHUNK the array):")
+    print(f"  {base} CHUNK={chunk} sbatch --array=0-{ntasks - 1} slurm/snail_sweep.slurm")
+    print(f"  -> {ntasks} tasks x {chunk} points/task. Check your site limit with "
+          f"`scontrol show config | grep MaxArraySize` and raise --array/lower CHUNK if it allows.")
+    print(f"  (raise #SBATCH --time accordingly: each task now runs {chunk} points in series.)")
+
+
 def main() -> None:
     """Command-line entry point.
 
@@ -1023,7 +1083,11 @@ def main() -> None:
     ap.add_argument("mode", choices=["prepare", "point", "local", "collect", "chevrons"])
     ap.add_argument("--outdir", default="results_zhou")
     ap.add_argument("--device", help="JSON file overriding DEFAULT_CONFIG")
-    ap.add_argument("--index", type=int, help="point index (mode=point)")
+    ap.add_argument("--index", type=int, help="point index (mode=point); with --chunk N "
+                    "this is the CHUNK index and the task runs points [index*N, (index+1)*N)")
+    ap.add_argument("--chunk", type=int, default=1,
+                    help="points per array task (mode=point). Use >1 when the number of "
+                         "points exceeds SLURM MaxArraySize: array size becomes ceil(N/chunk).")
     ap.add_argument("--grid", help="path to grid.json (default: <outdir>/grid.json)")
     ap.add_argument("--nproc", type=int, default=4, help="processes for mode=local")
     ap.add_argument("--stark-jobs", type=int, default=None,
@@ -1040,6 +1104,10 @@ def main() -> None:
                     help="[spectator] auto beat sweep: +/-span/2 about the collision (delta=0)")
     ap.add_argument("--beat-points", type=int, default=13,
                     help="[spectator] number of points for --beat-span-MHz (default 13)")
+    ap.add_argument("--clip-band", action="store_true",
+                    help="[spectator] drop points whose ABSOLUTE spectator frequency "
+                         "w_spec = w_b - Delta falls outside the physical band [w_a, w_b] "
+                         "(a spectator qubit lives between the computational qubits)")
     ap.add_argument("--drags", help="comma list of bools, e.g. false,true")
     ap.add_argument("--wb-GHz", help="[target] comma list of partner (w_b) freqs (GHz)")
     ap.add_argument("--spec-GHz", help="[target] comma list of spectator ABSOLUTE freqs (GHz)")
@@ -1066,6 +1134,11 @@ def main() -> None:
                     help="amplitude/frequency rounds per point for --calibrate (default 1)")
     ap.add_argument("--drag", action="store_true",
                     help="force DRAG on for every allocation point (tuned to the nearest beat)")
+    ap.add_argument("--drag-subharmonic", action="store_true",
+                    help="[target] let DRAG target the nearest SUBHARMONIC transmon collision "
+                         "w_p = w_i/2 (pump's 2nd harmonic drives transmon i at w_i = 2 w_p, "
+                         "for i in {a, b, spectator}) in addition to the one-pump swap; "
+                         "DRAG follows whichever channel is closest")
     ap.add_argument("--stark-span-MHz", type=float, default=None,
                     help="per-point Stark chevron width (default 60)")
     ap.add_argument("--stark-points", type=int, default=None,
@@ -1099,6 +1172,8 @@ def main() -> None:
         config["calibrate_iters"] = int(args.calibrate_iters)
     if args.drag:
         config["drag_always"] = True
+    if args.drag_subharmonic:
+        config["drag_subharmonic"] = True
     if args.stark_span_MHz is not None:
         config["stark_span_MHz"] = float(args.stark_span_MHz)
     if args.stark_points is not None:
@@ -1138,8 +1213,7 @@ def main() -> None:
                       f"{config.get('drag_compare_below_MHz', 100.0):.0f} MHz")
             print(f"integrate = {config['integrate']}  "
                   f"({'FULL sim per point' if config['integrate'] else 'analytic map only'})")
-            print(f"Submit with:\n  RUNNER=run_sweep_zhou.py OUTDIR={args.outdir} "
-                  f"sbatch --array=0-{m-1} slurm/snail_sweep.slurm")
+            _print_submit_hint(args.outdir, m)
             return
         # Detuning axis. Most intuitive is the BEAT delta = spec_freq - w_p (0 = on
         # the collision); convert to spec_freq = w_p + delta. Fall back to explicit
@@ -1159,14 +1233,33 @@ def main() -> None:
         else:
             specfreqs = _parse_list(args.specfreqs, float) or DEFAULT_SPECFREQS_GHz
         drags = _bool_list(args.drags) or DEFAULT_DRAGS
+        # Physical spectator band: a spectator qubit sits BETWEEN the computational
+        # qubits, so w_spec in [w_a, w_b]. spec_freq is the DETUNING Delta = w_b - w_spec,
+        # hence w_spec = w_b - Delta; beat = Delta - w_p > 0 places w_spec below w_a.
+        band_lo, band_hi = min(wa_g, wb_g), max(wa_g, wb_g)
+        wspec = [round(wb_g - float(sf), 6) for sf in specfreqs]
+        oob = [(sf, ws) for sf, ws in zip(specfreqs, wspec)
+               if not (band_lo <= ws <= band_hi)]
+        if oob:
+            print(f"WARNING: {len(oob)}/{len(specfreqs)} spectator points are OUTSIDE the "
+                  f"physical band [{band_lo:.3f}, {band_hi:.3f}] GHz: absolute w_spec in "
+                  f"[{min(w for _, w in oob):.3f}, {max(w for _, w in oob):.3f}] GHz "
+                  f"(w_spec = w_b - Delta). Visualize with plot_allocation.py.")
+            if args.clip_band:
+                kept = [sf for sf, ws in zip(specfreqs, wspec) if band_lo <= ws <= band_hi]
+                print(f"         --clip-band: keeping {len(kept)} in-band points, "
+                      f"dropping {len(specfreqs) - len(kept)}.")
+                specfreqs = kept
+            else:
+                print("         (pass --clip-band to drop them, or --allow it by ignoring "
+                      "this warning if you are deliberately probing out-of-band.)")
         points = build_grid(specfreqs, drags)
         path = write_grid(args.outdir, config, points)
         m = len(points)
         print(f"Wrote {m} points -> {path}")
         print(f"integrate = {config['integrate']}  "
               f"({'FULL sim per point' if config['integrate'] else 'analytic map only'})")
-        print(f"Submit with:\n  RUNNER=run_sweep_zhou.py OUTDIR={args.outdir} "
-              f"sbatch --array=0-{m-1} slurm/snail_sweep.slurm")
+        _print_submit_hint(args.outdir, m)
         return
 
     if args.mode == "collect":
@@ -1198,6 +1291,8 @@ def main() -> None:
         config["stark_drive"] = True
     if args.stark_match_pulse:
         config["stark_match_pulse"] = True
+    if args.drag_subharmonic:
+        config["drag_subharmonic"] = True
     if config.get("stark_match_pulse") and not config.get("stark_drive"):
         print("note: stark_match_pulse has no effect without --stark (no per-point chevron).")
 
@@ -1216,11 +1311,26 @@ def main() -> None:
     if args.mode == "point":
         if args.index is None:
             sys.exit("mode=point requires --index")
-        if not (0 <= args.index < len(points)):
-            sys.exit(f"index {args.index} out of range 0..{len(points)-1}")
-        res = run_point(points[args.index], config)
-        path = save_point(res, args.outdir)
-        print(f"[point {args.index}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
+        chunk = max(1, int(args.chunk))
+        if chunk == 1:
+            # one array task == one point (original behaviour)
+            if not (0 <= args.index < len(points)):
+                sys.exit(f"index {args.index} out of range 0..{len(points)-1}")
+            res = run_point(points[args.index], config)
+            path = save_point(res, args.outdir)
+            print(f"[point {args.index}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
+            return
+        # chunked: array task K runs points [K*chunk, (K+1)*chunk) -> keeps the array
+        # size = ceil(N/chunk) under SLURM's MaxArraySize for large sweeps.
+        lo = args.index * chunk
+        hi = min(lo + chunk, len(points))
+        if lo >= len(points):
+            print(f"[chunk {args.index}] no points in [{lo}, {hi}) (N={len(points)}); nothing to do.")
+            return
+        for i in range(lo, hi):
+            res = run_point(points[i], config)
+            path = save_point(res, args.outdir)
+            print(f"[point {i}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
         return
 
     if args.mode == "local":
