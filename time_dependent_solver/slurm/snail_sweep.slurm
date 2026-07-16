@@ -12,7 +12,7 @@
 #SBATCH --error=snail_sweep_%A_%a.err
 #SBATCH --array=0-59%32          # OVERRIDE on submit: sbatch --array=0-<M-1> snail_sweep.slurm
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
+#SBATCH --cpus-per-task=1        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
                                  # so the per-point chevron parallelizes over its offsets
                                  # (mode=point auto-uses SLURM_CPUS_PER_TASK). Override:
                                  #   sbatch --cpus-per-task=12 --array=... slurm/snail_sweep.slurm
@@ -39,6 +39,8 @@ set -euo pipefail
 OUTDIR="${OUTDIR:-results/results_zhou}"
 RUNNER="${RUNNER:-run_sweep_zhou.py}"   # the Zhou-coupler sweep driver
 LAUNCHER="${LAUNCHER:-uv run python}"   # how to invoke python; e.g. "python" after activating a venv
+CHUNK="${CHUNK:-1}"                      # points per array task; set >1 when N > MaxArraySize
+                                        #   (array size = ceil(N/CHUNK)); e.g. CHUNK=25 for 11551 pts
 GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax; also add "#SBATCH --gres=gpu:1"
 mkdir -p "${OUTDIR}/points"
 
@@ -63,6 +65,7 @@ echo "host=$(hostname) job=${SLURM_ARRAY_JOB_ID} task=${SLURM_ARRAY_TASK_ID} run
 srun ${LAUNCHER} "${RUNNER}" point ${GPU_FLAG} \
     --outdir "${OUTDIR}" \
     --grid   "${OUTDIR}/grid.json" \
+    --chunk  "${CHUNK}" \
     --index  "${SLURM_ARRAY_TASK_ID}"
 
 echo "done task=${SLURM_ARRAY_TASK_ID} end=$(date -Is)"
