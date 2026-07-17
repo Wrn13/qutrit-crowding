@@ -439,30 +439,58 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     w_spec = wb - pt.spec_freq_GHz * TWO_PI         # move ONLY the spectator
     freqs_GHz = [wa / TWO_PI, wb / TWO_PI, ws / TWO_PI, w_spec / TWO_PI]
 
-    # optional: drive at the AC-Stark-shifted resonance (needs the integrated run).
-    # The chevron INCLUDES the spectator at w_spec, so the located offset carries the
-    # spectator's dispersive pull and varies point to point (largest near the
-    # collision beat -> 0). With config['stark_match_pulse'] the chevron uses the
-    # ACTUAL pulse (raised-cosine, + DRAG when this point uses it), so DRAG-on points
-    # are calibrated on the DRAG-ON resonance (the DRAG-quadrature Stark shift). This
-    # is one extra chevron per point; else precompute once + wp_offset_GHz.
+    # --- per-point calibration (needs the integrated run) -------------------
+    # calibrate_points -> full amplitude + Stark tune-up (calibrate_gate) with the
+    #   spectator LOADED at w_spec, and DRAG on if this point uses it (hardware-style);
+    #   sets amp_scale AND wp_offset for THIS point.
+    # stark_drive -> frequency only (cheaper): shift w_p to the spectator-aware Stark
+    #   resonance at the configured amplitude. The chevron INCLUDES the spectator, so
+    #   the offset carries its dispersive pull (largest as the collision beat -> 0); with
+    #   stark_match_pulse it uses the ACTUAL pulse (+ DRAG), i.e. the DRAG-on resonance.
+    amp_scale_used = float(config.get("amp_scale", 1.0))
+    wp_offset_used_GHz = float(config.get("wp_offset_GHz", 0.0))
     stark_offset_GHz = 0.0
     _chevron = None
-    if bool(config.get("integrate", True)) and bool(config.get("stark_drive", False)):
+    _w_p_nom_GHz = w_p / TWO_PI
+    _wspec_abs_GHz = w_spec / TWO_PI
+    if bool(config.get("integrate", True)) and bool(config.get("calibrate_points", False)):
+        import calibrate_gate as CG
+        _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
+                   nsteps=int(config.get("nsteps", 500000)))
+        sub = dict(config); sub["qubit_freqs_GHz"] = [wa / TWO_PI, wb / TWO_PI]
+        # DRAG on during calibration if this point runs DRAG, tuned to the anchor beat
+        # (Delta - w_p) from the nominal pump; skip on-collision (beat -> 0 is singular).
+        _cb = pt.spec_freq_GHz - _w_p_nom_GHz
+        _cal_drag = (_cb if (bool(pt.drag) and abs(_cb) >= _drag_skip_GHz(config)) else None)
+        rec = CG.run_calibration(
+            sub, float(config["t_g_ns"]),
+            iters=int(config.get("calibrate_iters", 1)),
+            amp_bounds=(float(config.get("cal_amp_lo", 0.6)),
+                        float(config.get("cal_amp_hi", 1.4))),
+            amp_points=int(config.get("cal_amp_points", 9)),
+            span_MHz=float(config.get("stark_span_MHz", 60.0)),
+            chevron_points=int(config.get("stark_points", 21)),
+            window_factor=float(config.get("stark_window_factor", 2.0)),
+            time_points=int(config.get("stark_time_points", 120)),
+            solver=_sv, n_jobs=1,
+            spec_abs_GHz=_wspec_abs_GHz, drag_beat_GHz=_cal_drag)["final"]
+        amp_scale_used = float(rec["amp_scale"])
+        wp_offset_used_GHz = float(rec["wp_offset_GHz"])          # measured from nominal
+    elif bool(config.get("integrate", True)) and bool(config.get("stark_drive", False)):
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
         # DRAG beat for the chevron uses the pre-Stark pump (the ~MHz Stark offset is
         # negligible vs the beat in the DRAG quadrature); skip DRAG on-collision.
-        _chev_beat = pt.spec_freq_GHz - w_p_GHz
+        _chev_beat = pt.spec_freq_GHz - (_w_p_nom_GHz + wp_offset_used_GHz)
         _chev_drag = (_chev_beat if (pt.drag and abs(_chev_beat) >= _drag_skip_GHz(config))
                       else None)
         _chevron = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
-                                     float(config["t_g_ns"]),
-                                     float(config.get("amp_scale", 1.0)), _sv,
-                                     spec_abs_GHz=w_spec / TWO_PI,
+                                     float(config["t_g_ns"]), amp_scale_used, _sv,
+                                     spec_abs_GHz=_wspec_abs_GHz,
                                      drag_beat_GHz=_chev_drag)
         stark_offset_GHz = float(_chevron["resonance_offset_GHz"])
-        w_p_GHz += stark_offset_GHz
+        wp_offset_used_GHz += stark_offset_GHz
+    w_p_GHz = _w_p_nom_GHz + wp_offset_used_GHz               # calibrated / configured pump
 
     # --- spectator: a single 3-level anharmonic transmon --------------------
     spec_levels = int(config["spec_levels"])
@@ -506,7 +534,7 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                           delta_drag_GHz=(beat_GHz if use_drag else None)),
                  normalize_iswap=(a, b))
     # calibrated amplitude correction (1.0 = raw analytic pi/2 normalization)
-    cpl.scale_pump_amplitude(float(config.get("amp_scale", 1.0)))
+    cpl.scale_pump_amplitude(amp_scale_used)
 
     # --- ANALYTIC collision prediction (free; Eq. 62) ---------------------
     # For a single-tone, pure-g3 (n=3) coupler the spectator's only collision in
@@ -529,6 +557,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "g_spec_eff_MHz": round(float(g_spec / TWO_PI * 1e3), 4),
         "w_p_GHz": round(float(w_p_GHz), 6),
         "stark_offset_MHz": round(float(stark_offset_GHz) * 1e3, 4),
+        "amp_scale_used": round(float(amp_scale_used), 5),
+        "wp_offset_used_MHz": round(float(wp_offset_used_GHz) * 1e3, 4),
         "w_spec_GHz": round(float(w_spec / TWO_PI), 6),
         "t_g_ns": float(config["t_g_ns"]),
         "status": status_drag if status_drag != "ok" else "analytic",
@@ -1191,6 +1221,9 @@ def main() -> None:
                   "(it shapes the per-point Stark chevron).")
     if args.calibrate:
         config["calibrate_points"] = True
+        if not config.get("integrate", True):
+            print("note: --calibrate needs the integrated run; it has no effect with "
+                  "--no-integrate (analytic map only).")
     if args.calibrate_iters is not None:
         config["calibrate_iters"] = int(args.calibrate_iters)
     if args.drag:
