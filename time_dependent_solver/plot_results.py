@@ -173,8 +173,8 @@ def series_column(data: Dict[str, np.ndarray]) -> str:
 # the beat detuning delta = Delta - w_p (0 = on the collision). Set by main().
 _XAXIS = "spec_freq_GHz"
 _XLABELS = {
-    "spec_freq_GHz": r"spectator frequency $\Delta = w_b - w_\mathrm{spec}$ (GHz)",
-    "beat_GHz": r"beat detuning $\delta = \Delta - w_p$ (GHz)",
+    "spec_freq_GHz": r"$\Delta = w_b - w_\mathrm{spec}$ (GHz)",
+    "beat_GHz": r"Detuning $\delta = \Delta - w_p$ (GHz)",
 }
 
 

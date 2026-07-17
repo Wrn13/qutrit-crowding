@@ -16,7 +16,7 @@ deterministic grid+zoom optimizer (numpy only, unit-testable without QuTiP).
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
@@ -87,8 +87,9 @@ def auto_t_g(g3_GHz: float, lam_a: float, lam_b: float, target_eta: float) -> fl
 
 
 def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
-                  wp_offset_GHz: float):
-    """Build the spectator-free (qubit a, qubit b, coupler) gate with the pump
+                  wp_offset_GHz: float, spec_abs_GHz: Optional[float] = None,
+                  drag_beat_GHz: Optional[float] = None):
+    """Build the (qubit a, qubit b, coupler[, spectator]) gate with the pump
     normalized to a full iSWAP and scaled by amp_scale (anharmonicity included).
 
     Parameters
@@ -101,6 +102,13 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
         Multiplicative correction on the normalized pump amplitude.
     wp_offset_GHz : float
         Offset added to the pump frequency w_b - w_a (GHz).
+    spec_abs_GHz : float, optional
+        If given, add a 4th spectator mode at this ABSOLUTE frequency (participation
+        lam_b, ``spec_levels`` levels, ``anharm_spec_GHz``) so the tune-up sees the
+        spectator, i.e. a hardware-style per-point calibration. None -> bare (a, b) pair.
+    drag_beat_GHz : float, optional
+        If given, apply a DRAG quadrature tuned to this beat (GHz) on the pump, so the
+        calibration matches a DRAG-on gate. None -> no DRAG.
 
     Returns
     -------
@@ -119,19 +127,30 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
         nonlin[4] = float(config["g4_GHz"])
 
     aq = float(config.get("anharm_qubit_GHz", 0.0))
-    cpl = ZhouCoupler(mode_freqs_GHz=[wa, wb, ws], coupler_index=2,
-                      participations={0: float(config["lam_a"]), 1: float(config["lam_b"])},
-                      nonlinearities=nonlin, levels=levels,
-                      anharmonicities_GHz={0: aq, 1: aq})
+    freqs = [wa, wb, ws]
+    participations = {0: float(config["lam_a"]), 1: float(config["lam_b"])}
+    anharm = {0: aq, 1: aq}
+    if spec_abs_GHz is not None:                    # add the spectator as a 4th mode
+        freqs.append(float(spec_abs_GHz))
+        levels.append(int(config.get("spec_levels", 3)))
+        participations[3] = float(config["lam_b"])              # spectator participation = lam_b
+        anharm[3] = float(config.get("anharm_spec_GHz", 0.0))
+    cpl = ZhouCoupler(mode_freqs_GHz=freqs, coupler_index=2,
+                      participations=participations, nonlinearities=nonlin, levels=levels,
+                      anharmonicities_GHz=anharm)
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
-    cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True),
+    cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True,
+                          drag=(drag_beat_GHz is not None),
+                          delta_drag_GHz=(drag_beat_GHz if drag_beat_GHz is not None else 0.0)),
                  normalize_iswap=(0, 1))
     cpl.scale_pump_amplitude(amp_scale)
     return cpl, w_p_GHz, cpl.peak_eta()
 
 
 def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
-                         wp_offset_GHz: float, solver: Dict[str, Any]) -> float:
+                         wp_offset_GHz: float, solver: Dict[str, Any],
+                         spec_abs_GHz: Optional[float] = None,
+                         drag_beat_GHz: Optional[float] = None) -> float:
     """Single-shot swap probability P(|01> -> |10>) at t_g (QuTiP sesolve): a fast
     one-trajectory proxy for the rotation angle, used as a search objective.
 
@@ -147,15 +166,22 @@ def transfer_probability(config: Dict[str, Any], t_g: float, amp_scale: float,
         Pump-frequency offset to test (GHz).
     solver : dict
         QuTiP integrator options (atol, rtol, nsteps).
+    spec_abs_GHz : float, optional
+        Spectator absolute frequency (GHz); adds the spectator mode (ground) to the
+        Hilbert space so the probe sees it. None -> bare (a, b) pair.
+    drag_beat_GHz : float, optional
+        DRAG beat (GHz) for the probe pump. None -> no DRAG.
 
     Returns
     -------
     float
-        P(|10>) starting from |01>.
+        P(|10>) starting from |01>, with any spectator left in its ground state.
     """
-    cpl, _w_p, _eta = build_coupler(config, t_g, amp_scale, wp_offset_GHz)
-    state = cpl.evolve_state([1, 0, 0], t_g, **solver)
-    return float(np.abs(state[cpl.fock_index([0, 1, 0])]) ** 2)
+    cpl, _w_p, _eta = build_coupler(config, t_g, amp_scale, wp_offset_GHz,
+                                    spec_abs_GHz, drag_beat_GHz)
+    tail = [0] if spec_abs_GHz is not None else []       # spectator stays in |0>
+    state = cpl.evolve_state([1, 0, 0] + tail, t_g, **solver)
+    return float(np.abs(state[cpl.fock_index([0, 1, 0] + tail)]) ** 2)
 
 
 def maximize_1d(func: Callable[[float], float], lo: float, hi: float,

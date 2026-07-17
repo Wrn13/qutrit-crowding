@@ -170,7 +170,8 @@ DEFAULT_CONFIG = {
     "stark_match_pulse": False,      # per-point chevron uses the ACTUAL pulse (raised-cosine,
                                      #   + DRAG for DRAG-on points) instead of a constant probe,
                                      #   so DRAG-on points land on the DRAG-on resonance
-    "calibrate_points": False,       # per-point amplitude+Stark tune-up (calibrate_gate)
+    "calibrate_points": False,       # per-point amplitude+Stark tune-up (calibrate_gate),
+                                     #   spectator-present + DRAG-aware (hardware-style)
     "calibrate_iters":  1,           # amplitude/frequency rounds per point
     "cal_amp_lo":       0.6,         # per-point amplitude-scale search bounds
     "cal_amp_hi":       1.4,
@@ -565,6 +566,50 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
+                       ws_GHz: float, wspec_GHz: float, w_p_GHz: float):
+    """Nearest spectator/mode collision to the pump for a target point.
+
+    Candidates: the per-qubit exchange channels -- one-pump swap (resonant at
+    ``|w_q - w_spec| = w_p``) and static exchange (``w_q = w_spec``) -- with
+    ``beat = |w_q - w_spec| - n*w_p`` (n in {1, 0}); and, when ``drag_subharmonic``
+    is set, the subharmonic drives ``w_p = w_i/2`` for every mode i in
+    {a, b, spectator, coupler}, with ``beat = w_i/2 - w_p``. The beat is the detuning
+    from the channel's resonance (the DRAG detuning). Uses target-sweep mode indices
+    a=0, b=1, coupler=2, spectator=3.
+
+    Parameters
+    ----------
+    config : dict
+        Merged device configuration.
+    wa_GHz, wb_GHz, ws_GHz, wspec_GHz : float
+        Absolute mode frequencies (GHz).
+    w_p_GHz : float
+        Pump frequency (GHz) to reference the beats against (nominal or calibrated).
+
+    Returns
+    -------
+    tuple
+        ``(|beat|, signed beat, kind, target_label, target_idx)`` for the nearest
+        channel; ``kind`` in {"onepump", "static", "subharm"}.
+    """
+    a, b, coupler, spec = 0, 1, 2, 3
+    nearest = None
+    for q_idx, q_freq, q_label in ((a, wa_GHz, "a"), (b, wb_GHz, "b")):
+        sep = abs(q_freq - wspec_GHz)
+        for kind, harm in (("onepump", w_p_GHz), ("static", 0.0)):
+            beat = sep - harm
+            if nearest is None or abs(beat) < nearest[0]:
+                nearest = (abs(beat), float(beat), kind, q_label, q_idx)
+    if bool(config.get("drag_subharmonic", False)):
+        for lab, idx, wi in (("a", a, wa_GHz), ("b", b, wb_GHz),
+                             ("spec", spec, wspec_GHz), ("s", coupler, ws_GHz)):
+            beat = 0.5 * wi - w_p_GHz
+            if abs(beat) < nearest[0]:
+                nearest = (abs(beat), float(beat), "subharm", lab, idx)
+    return nearest
+
+
 def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     """Allocation point: fixed w_a and w_s; the partner sits at w_b and a single
     spectator at absolute w_spec. Analytic collision search always; full iSWAP
@@ -598,21 +643,28 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     lam_spec = float(config["lam_b"])                  # spectator participation = lam_b
     integrate = bool(config.get("integrate", True))
 
-    # Per-point calibration (w_b varies across the allocation sweep, so both the
-    # optimal amplitude and the Stark shift move point to point). Two levels:
-    #   calibrate_points -> full amplitude + Stark tune-up (calibrate_gate), sets
-    #                       both amp_scale and wp_offset for THIS point;
+    # Per-point calibration (w_b AND the spectator vary across the sweep, so the optimal
+    # amplitude and the Stark shift move point to point). Two levels:
+    #   calibrate_points -> full amplitude + Stark tune-up (calibrate_gate) with the
+    #                       spectator loaded (hardware-style), sets amp_scale + wp_offset;
     #   stark_drive      -> frequency only (cheaper): shift w_p to the Stark
     #                       resonance at the configured amplitude.
-    # Both need the integrated run and use the spectator-free (a,b) gate.
+    # Both need the integrated run and drive the (a,b) iSWAP.
     amp_scale_used = float(config.get("amp_scale", 1.0))
     wp_offset_used_GHz = float(config.get("wp_offset_GHz", 0.0))
     _chevron = None
+    _w_p_nom = abs(wb_GHz - wa_GHz)
+    _use_drag = bool(config.get("drag_always", False)) or bool(pt.drag)
     if integrate and bool(config.get("calibrate_points", False)):
         import calibrate_gate as CG
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
         sub = dict(config); sub["qubit_freqs_GHz"] = [wa_GHz, wb_GHz]
+        # Hardware-style: calibrate with the spectator present at wspec_GHz, and with
+        # DRAG on (tuned to the nearest-collision beat from the nominal pump) if this
+        # point runs DRAG, so the tune-up matches the gate as actually operated.
+        _cb = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, _w_p_nom)[1]
+        _cal_drag = (_cb if (_use_drag and abs(_cb) >= _drag_skip_GHz(config)) else None)
         rec = CG.run_calibration(
             sub, float(config["t_g_ns"]),
             iters=int(config.get("calibrate_iters", 1)),
@@ -623,7 +675,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
             chevron_points=int(config.get("stark_points", 21)),
             window_factor=float(config.get("stark_window_factor", 2.0)),
             time_points=int(config.get("stark_time_points", 120)),
-            solver=_sv, n_jobs=1)["final"]
+            solver=_sv, n_jobs=1,
+            spec_abs_GHz=wspec_GHz, drag_beat_GHz=_cal_drag)["final"]
         amp_scale_used = float(rec["amp_scale"])
         wp_offset_used_GHz = float(rec["wp_offset_GHz"])
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
@@ -631,21 +684,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         _sv = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                    nsteps=int(config.get("nsteps", 500000)))
         # nearest collision from the pre-Stark pump, for the DRAG-matched chevron
-        # (only meaningful when DRAG is forced on every point via drag_always). Same
-        # channels as the gate below: one-pump/static exchanges, plus -- when enabled --
-        # the subharmonic transmon collisions w_p = w_i/2 (beat = w_i/2 - w_p).
-        _cb = None
-        for _wq in (wa_GHz, wb_GHz):
-            _sep = abs(_wq - wspec_GHz)
-            for _h in (w_p_GHz, 0.0):
-                _bt = _sep - _h
-                if _cb is None or abs(_bt) < abs(_cb):
-                    _cb = float(_bt)
-        if bool(config.get("drag_subharmonic", False)):
-            for _wi in (wa_GHz, wb_GHz, wspec_GHz, ws_GHz):
-                _bt = 0.5 * _wi - w_p_GHz
-                if _cb is None or abs(_bt) < abs(_cb):
-                    _cb = float(_bt)
+        # (only meaningful when DRAG is forced on every point via drag_always).
+        _cb = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, w_p_GHz)[1]
         _chev_drag = (_cb if (bool(config.get("drag_always", False))
                               and abs(_cb) >= _drag_skip_GHz(config)) else None)
         _chevron = _stark_offset_GHz(config, wa_GHz, wb_GHz,
@@ -678,27 +718,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                       participations=participations, nonlinearities=nonlin, levels=levels,
                       anharmonicities_GHz=anharm)
 
-    # --- nearest collision: spectator vs {a, b} ------------------------------
-    # Exchange channels (per qubit): the one-pump swap a_q^d a_spec (resonant
-    # |w_q - w_spec| = w_p, the "qubit-qubit"-type swap) and the direct/static
-    # exchange (w_q = w_spec). beat = |w_q - w_spec| - n*w_p, n in {1, 0}.
-    nearest = None   # (|beat|, signed beat, kind, target_label, target_idx)
-    for q_idx, q_freq, q_label in ((a, wa_GHz, "a"), (b, wb_GHz, "b")):
-        sep = abs(q_freq - wspec_GHz)
-        for kind, harm in (("onepump", w_p_GHz), ("static", 0.0)):
-            beat = sep - harm
-            if nearest is None or abs(beat) < nearest[0]:
-                nearest = (abs(beat), float(beat), kind, q_label, q_idx)
-    # Subharmonic collisions (drag_subharmonic): the pump sits at half a mode frequency,
-    # w_p = w_i/2, so the pump's second harmonic drives mode i at w_i = 2 w_p. beat =
-    # w_i/2 - w_p. Checked for every mode i in {a, b, spectator, coupler} (the coupler
-    # is the driven SNAIL, but it has its own subharmonic w_s/2 like any mode).
-    if bool(config.get("drag_subharmonic", False)):
-        for lab, idx, wi in (("a", a, wa_GHz), ("b", b, wb_GHz),
-                             ("spec", spec, wspec_GHz), ("s", coupler, ws_GHz)):
-            beat = 0.5 * wi - w_p_GHz
-            if abs(beat) < nearest[0]:
-                nearest = (abs(beat), float(beat), "subharm", lab, idx)
+    # --- nearest collision: spectator vs {a, b}, referenced to the calibrated pump ---
+    nearest = _nearest_collision(config, wa_GHz, wb_GHz, ws_GHz, wspec_GHz, w_p_GHz)
 
     # near-collision window where DRAG is meant to help (off-resonant but close).
     # Round the beat to 1 kHz so placements exactly at the threshold classify
@@ -1130,7 +1151,8 @@ def main() -> None:
                          "(captures the DRAG-quadrature Stark shift)")
     ap.add_argument("--calibrate", action="store_true",
                     help="per-point amplitude+Stark tune-up (calibrate_gate) before each "
-                         "gate -- the 'better calibration' allocation; slowest, most faithful")
+                         "gate, with the SPECTATOR LOADED and DRAG on if the point uses it "
+                         "(hardware-style per-point calibration); slowest, most faithful")
     ap.add_argument("--calibrate-iters", type=int, default=None,
                     help="amplitude/frequency rounds per point for --calibrate (default 1)")
     ap.add_argument("--drag", action="store_true",

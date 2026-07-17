@@ -62,7 +62,8 @@ _DEFAULT_SOLVER: Dict[str, Any] = {"atol": 1e-10, "rtol": 1e-8, "nsteps": 500000
 # ---------------------------------------------------------------------------
 def amplitude_scan(config: Dict[str, Any], t_g: float, wp_offset_GHz: float,
                    amp_bounds: Tuple[float, float], n_points: int,
-                   solver: Dict[str, Any]) -> Dict[str, Any]:
+                   solver: Dict[str, Any], spec_abs_GHz: Optional[float] = None,
+                   drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
     """Amplitude (Rabi) calibration: sweep the pump-amplitude scale at a fixed
     pump frequency and maximise the |01>->|10> transfer.
 
@@ -80,6 +81,10 @@ def amplitude_scan(config: Dict[str, Any], t_g: float, wp_offset_GHz: float,
         Grid points per refinement round.
     solver : dict
         QuTiP integrator options.
+    spec_abs_GHz : float, optional
+        Spectator absolute frequency (GHz) to include in the build. None -> bare pair.
+    drag_beat_GHz : float, optional
+        DRAG beat (GHz) for the pump. None -> no DRAG.
 
     Returns
     -------
@@ -88,10 +93,11 @@ def amplitude_scan(config: Dict[str, Any], t_g: float, wp_offset_GHz: float,
         transfer_best.
     """
     grid = np.linspace(amp_bounds[0], amp_bounds[1], n_points)
-    curve = np.array([transfer_probability(config, t_g, float(a), wp_offset_GHz, solver)
-                      for a in grid])
+    curve = np.array([transfer_probability(config, t_g, float(a), wp_offset_GHz, solver,
+                                           spec_abs_GHz, drag_beat_GHz) for a in grid])
     amp_best, transfer_best, _n = maximize_1d(
-        lambda s: transfer_probability(config, t_g, s, wp_offset_GHz, solver),
+        lambda s: transfer_probability(config, t_g, s, wp_offset_GHz, solver,
+                                       spec_abs_GHz, drag_beat_GHz),
         amp_bounds[0], amp_bounds[1], n_points=n_points)
     return {"amps": grid, "transfer": curve,
             "amp_best": float(amp_best), "transfer_best": float(transfer_best)}
@@ -100,8 +106,10 @@ def amplitude_scan(config: Dict[str, Any], t_g: float, wp_offset_GHz: float,
 def frequency_chevron(config: Dict[str, Any], t_g: float, amp_scale: float,
                       span_MHz: float, n_points: int, window_factor: float,
                       time_points: int, solver: Dict[str, Any],
-                      n_jobs: Optional[int]) -> Dict[str, Any]:
-    """Frequency (Stark) calibration: constant-pump chevron at the calibrated
+                      n_jobs: Optional[int], spec_abs_GHz: Optional[float] = None,
+                      drag_beat_GHz: Optional[float] = None,
+                      shape: str = "constant") -> Dict[str, Any]:
+    """Frequency (Stark) calibration: pump-frequency chevron at the calibrated
     amplitude; the resonance offset maximises swap contrast. Thin wrapper over
     find_stark_resonance.scan that keeps the arrays for plotting.
 
@@ -125,6 +133,15 @@ def frequency_chevron(config: Dict[str, Any], t_g: float, amp_scale: float,
         QuTiP integrator options.
     n_jobs : int, optional
         Worker processes for the offset scan.
+    spec_abs_GHz : float, optional
+        Spectator absolute frequency (GHz) to include, so the resonance is located with
+        the spectator present. None -> bare pair.
+    drag_beat_GHz : float, optional
+        DRAG beat (GHz); when given, the chevron uses the shaped pulse with DRAG so the
+        resonance matches a DRAG-on gate.
+    shape : str, default "constant"
+        Chevron pulse shape ("constant" or "raised_cosine"); forced to the shaped pulse
+        by the caller when a DRAG beat is supplied.
 
     Returns
     -------
@@ -135,7 +152,8 @@ def frequency_chevron(config: Dict[str, Any], t_g: float, amp_scale: float,
     span = span_MHz / 1000.0
     offsets = np.linspace(-span / 2.0, span / 2.0, n_points)
     return FS.scan(config, t_g, amp_scale, offsets, window_factor * t_g,
-                   time_points, solver, n_jobs=n_jobs)
+                   time_points, solver, n_jobs=n_jobs, spec_abs_GHz=spec_abs_GHz,
+                   shape=shape, drag_beat_GHz=drag_beat_GHz)
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +187,12 @@ def conditional_phase(U: np.ndarray) -> float:
 
 
 def final_test(config: Dict[str, Any], t_g: float, amp_scale: float,
-               wp_offset_GHz: float, solver: Dict[str, Any]) -> Dict[str, Any]:
+               wp_offset_GHz: float, solver: Dict[str, Any],
+               spec_abs_GHz: Optional[float] = None,
+               drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
     """Validate the calibrated gate: leakage-aware F_avg, transfer, leakage, the
-    residual conditional phase, and the operating |eta|.
+    residual conditional phase, and the operating |eta|. With ``spec_abs_GHz`` the
+    spectator is in the Hilbert space, so F_avg/leakage reflect it (hardware-style).
 
     Parameters
     ----------
@@ -185,6 +206,10 @@ def final_test(config: Dict[str, Any], t_g: float, amp_scale: float,
         Calibrated pump-frequency offset (GHz).
     solver : dict
         QuTiP integrator options.
+    spec_abs_GHz : float, optional
+        Spectator absolute frequency (GHz) to include. None -> bare pair.
+    drag_beat_GHz : float, optional
+        DRAG beat (GHz) for the pump. None -> no DRAG.
 
     Returns
     -------
@@ -192,9 +217,11 @@ def final_test(config: Dict[str, Any], t_g: float, amp_scale: float,
         amp_scale, wp_offset_GHz, w_p_GHz, eta_peak, F_avg, leakage, transfer,
         conditional_phase_rad.
     """
-    cpl, w_p_GHz, eta_peak = build_coupler(config, t_g, amp_scale, wp_offset_GHz)
+    cpl, w_p_GHz, eta_peak = build_coupler(config, t_g, amp_scale, wp_offset_GHz,
+                                           spec_abs_GHz, drag_beat_GHz)
     F_avg, leakage, U = cpl.iswap_fidelity(0, 1, t_g, fit_virtual_z=True, **solver)
-    transfer = transfer_probability(config, t_g, amp_scale, wp_offset_GHz, solver)
+    transfer = transfer_probability(config, t_g, amp_scale, wp_offset_GHz, solver,
+                                    spec_abs_GHz, drag_beat_GHz)
     return {"amp_scale": round(float(amp_scale), 5),
             "wp_offset_GHz": round(float(wp_offset_GHz), 6),
             "w_p_GHz": round(float(w_p_GHz), 6),
@@ -213,7 +240,9 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
                     span_MHz: float = 60.0, chevron_points: int = 21,
                     window_factor: float = 2.0, time_points: int = 160,
                     solver: Optional[Dict[str, Any]] = None,
-                    n_jobs: Optional[int] = None) -> Dict[str, Any]:
+                    n_jobs: Optional[int] = None,
+                    spec_abs_GHz: Optional[float] = None,
+                    drag_beat_GHz: Optional[float] = None) -> Dict[str, Any]:
     """Iterate Stark-frequency and amplitude calibration to self-consistency, then
     run the final gate test.
 
@@ -253,6 +282,10 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
     solver = solver or dict(_DEFAULT_SOLVER)
     amp_scale, wp_offset = 1.0, 0.0
     history: List[Dict[str, Any]] = []
+    # DRAG only applies to a shaped pulse; when a DRAG beat is given, locate the
+    # resonance with the shaped (raised-cosine) chevron so the tune-up matches the
+    # DRAG-on gate. Otherwise keep the cheaper amplitude-robust constant chevron.
+    chev_shape = "raised_cosine" if drag_beat_GHz is not None else "constant"
 
     for it in range(iters):
         # Frequency FIRST: the chevron's contrast-based vertex is (to leading order)
@@ -262,9 +295,12 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
         # amplitude ON it. The chevron probe amplitude still tracks amp_scale, so a
         # second round refines the (~eta^2) Stark magnitude at the calibrated amp.
         chev = frequency_chevron(config, t_g, amp_scale, span_MHz, chevron_points,
-                                 window_factor, time_points, solver, n_jobs)
+                                 window_factor, time_points, solver, n_jobs,
+                                 spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz,
+                                 shape=chev_shape)
         wp_offset = float(chev["resonance_offset_GHz"])
-        amp = amplitude_scan(config, t_g, wp_offset, amp_bounds, amp_points, solver)
+        amp = amplitude_scan(config, t_g, wp_offset, amp_bounds, amp_points, solver,
+                             spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz)
         amp_scale = amp["amp_best"]
         history.append({"iter": it, "amp_scale": amp_scale, "wp_offset_GHz": wp_offset,
                         "eta_op": float(chev["eta_op"]),
@@ -273,7 +309,8 @@ def run_calibration(config: Dict[str, Any], t_g: float, *, iters: int = 2,
               f"amp_scale={amp_scale:.4f}  |eta|={chev['eta_op']:.3f}  "
               f"peak_contrast={chev['max_transfer'].max():.4f}")
 
-    final = final_test(config, t_g, amp_scale, wp_offset, solver)
+    final = final_test(config, t_g, amp_scale, wp_offset, solver,
+                       spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz)
     print(f"  final: F_avg={final['F_avg']:.4f}  leakage={final['leakage']:.4f}  "
           f"transfer={final['transfer']:.4f}  "
           f"phi_cond={final['conditional_phase_rad']:+.3f} rad")
