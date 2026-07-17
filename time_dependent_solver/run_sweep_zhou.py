@@ -1161,6 +1161,13 @@ def main() -> None:
                          "w_spec = w_b - Delta falls outside the physical band [w_a, w_b] "
                          "(a spectator qubit lives between the computational qubits)")
     ap.add_argument("--drags", help="comma list of bools, e.g. false,true")
+    ap.add_argument("--t-g-ns", type=float, default=None,
+                    help="gate duration t_g (ns); overrides the device/default value")
+    ap.add_argument("--target-eta", type=float, default=None,
+                    help="set t_g via auto_t_g so the raised-cosine full-iSWAP pump has "
+                         "peak |eta| = TARGET_ETA (t_g = 2*area/eta; on this device "
+                         "eta=1.2 -> ~115.7 ns, eta=1.5 -> ~92.6 ns); takes precedence "
+                         "over --t-g-ns")
     ap.add_argument("--wb-GHz", help="[target] comma list of partner (w_b) freqs (GHz)")
     ap.add_argument("--spec-GHz", help="[target] comma list of spectator ABSOLUTE freqs (GHz)")
     ap.add_argument("--drag-compare", action="store_true",
@@ -1210,6 +1217,21 @@ def main() -> None:
     if args.device:
         with open(resolve_device(args.device)) as f:      # bare name -> devices/
             config.update(json.load(f))
+    # gate duration: explicit --t-g-ns, or --target-eta -> auto_t_g (raised-cosine peak
+    # |eta|). target_eta wins if both are given. Baked into the grid config at prepare.
+    if args.t_g_ns is not None:
+        config["t_g_ns"] = float(args.t_g_ns)
+    if args.target_eta is not None:
+        from device_utils import auto_t_g
+        config["t_g_ns"] = float(auto_t_g(float(config["g3_GHz"]), float(config["lam_a"]),
+                                          float(config["lam_b"]), float(args.target_eta)))
+        _env = config.get("envelope", "raised_cosine")
+        print(f"target_eta={args.target_eta} -> t_g = {config['t_g_ns']:.3f} ns "
+              f"(auto_t_g, raised-cosine peak |eta|)")
+        if _env != "raised_cosine":
+            print(f"  warning: auto_t_g assumes a raised-cosine (Hann) pump; envelope is "
+                  f"'{_env}', so the actual peak |eta| will differ (constant pulse: "
+                  f"eta = area/t_g, not the Hann 2*area/t_g).")
     if args.no_integrate:
         config["integrate"] = False
     if args.stark:
