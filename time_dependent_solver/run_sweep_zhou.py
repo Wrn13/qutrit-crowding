@@ -107,6 +107,7 @@ for _v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
 import argparse
 import glob
 import json
+import math
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -934,7 +935,8 @@ def collect(outdir: str) -> None:
     spec_cols = ["index", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
                  "beat_GHz", "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
-                 "w_p_GHz", "stark_offset_MHz", "w_spec_GHz", "t_g_ns", "wall_s"]
+                 "w_p_GHz", "stark_offset_MHz", "amp_scale_used", "wp_offset_used_MHz",
+                 "w_spec_GHz", "t_g_ns", "wall_s"]
     target_cols = ["index", "kind", "wa_GHz", "wb_GHz", "w_snail_GHz",
                    "spec_GHz", "detuning_GHz", "w_p_GHz", "stark_offset_MHz",
                    "amp_scale_used", "wp_offset_used_MHz", "lam_spec", "drag",
@@ -956,6 +958,18 @@ def collect(outdir: str) -> None:
                         index=np.array(idx_stack)[order],
                         U_proj=np.array(U_stack)[order])
     print(f"Collected {len(rows)} points -> {csv_path} and combined.npz")
+
+    # Flag gaps against the grid so a partial (timed-out) sweep is obvious here, not just
+    # in `missing`. Cheap: reads grid.json only if present.
+    try:
+        _cfg, _pts = load_grid(outdir)
+        got = {r["index"] for r in rows}
+        gaps = sorted(set(range(len(_pts))) - got)
+        if gaps:
+            print(f"  WARNING: {len(gaps)}/{len(_pts)} grid points have no file "
+                  f"(unfinished). Run `missing` to list and resubmit them.")
+    except Exception:
+        pass  # no grid.json (e.g. collecting a hand-assembled points dir)
 
     # For an integrated allocation sweep, report the best placement (allowing DRAG
     # where it was compared) and, if present, the DRAG gain in the <threshold window.
@@ -1122,6 +1136,95 @@ def _print_submit_hint(outdir: str, m: int, max_array: int = 1000) -> None:
     print(f"  (raise #SBATCH --time accordingly: each task now runs {chunk} points in series.)")
 
 
+def _compress_ranges(indices: List[int]) -> str:
+    """Collapse a sorted index list into a SLURM ``--array`` spec, e.g.
+    ``[3, 7, 8, 9, 20]`` -> ``"3,7-9,20"``.
+
+    Parameters
+    ----------
+    indices : list of int
+        Sorted, unique, non-negative indices.
+
+    Returns
+    -------
+    str
+        Comma-separated runs of contiguous indices.
+    """
+    if not indices:
+        return ""
+    parts: List[str] = []
+    lo = prev = indices[0]
+    for i in indices[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        parts.append(f"{lo}" if lo == prev else f"{lo}-{prev}")
+        lo = prev = i
+    parts.append(f"{lo}" if lo == prev else f"{lo}-{prev}")
+    return ",".join(parts)
+
+
+def find_missing(outdir: str, max_array: int = 1000) -> None:
+    """Report grid points with no saved ``point_XXXXX.npz`` (i.e. they never finished),
+    write a resume list, and print ready-to-run resubmission commands.
+
+    A point file is written only after :func:`run_point` returns, so a missing file means
+    the task timed out or died before saving. Points that finished but produced a bad
+    result (e.g. ``F_avg`` is nan) are *not* caught here -- those have a file; check the
+    ``status``/``F_avg`` columns of ``summary.csv`` after ``collect`` for those.
+
+    Parameters
+    ----------
+    outdir : str
+        Sweep directory containing ``grid.json`` and ``points/point_*.npz``.
+    max_array : int, optional
+        Assumed SLURM ``MaxArraySize`` for choosing between a direct index-list array and
+        a chunked resume array. Confirm your site's value with
+        ``scontrol show config | grep MaxArraySize``.
+    """
+    _config, points = load_grid(outdir)
+    n = len(points)
+    done: set[int] = set()
+    for p in glob.glob(os.path.join(outdir, "points", "point_*.npz")):
+        stem = os.path.basename(p)[len("point_"):-len(".npz")]
+        try:
+            done.add(int(stem))
+        except ValueError:
+            pass
+    missing = sorted(set(range(n)) - done)
+    extra = sorted(i for i in done if i >= n)  # stray files from a stale/edited grid
+    print(f"{n} grid points: {n - len(missing)} finished, {len(missing)} missing.")
+    if extra:
+        print(f"  note: {len(extra)} saved point file(s) have index >= {n} "
+              f"(stale grid?): {_compress_ranges(extra)}")
+    if not missing:
+        print("nothing to resubmit.")
+        return
+
+    listpath = os.path.join(outdir, "missing.txt")
+    with open(listpath, "w") as f:
+        f.write("\n".join(str(i) for i in missing) + "\n")
+    print(f"wrote {listpath}  ({len(missing)} indices)")
+    print(f"  indices: {_compress_ranges(missing)}")
+
+    m = len(missing)
+    print("\nResubmit (robust for any indices -- array is 0..M-1, points read from the list):")
+    if m <= max_array:
+        print(f"  RESUME={listpath} OUTDIR={outdir} sbatch "
+              f"--array=0-{m - 1} slurm/snail_sweep.slurm")
+    else:
+        chunk = math.ceil(m / max_array)
+        ntasks = math.ceil(m / chunk)
+        print(f"  RESUME={listpath} OUTDIR={outdir} CHUNK={chunk} sbatch "
+              f"--array=0-{ntasks - 1} slurm/snail_sweep.slurm")
+        print(f"  ({ntasks} tasks x {chunk} points/task; raise #SBATCH --time to match.)")
+    if missing and missing[-1] < max_array:
+        print("Or directly (only if the largest index is below MaxArraySize):")
+        print(f"  OUTDIR={outdir} CHUNK=1 sbatch "
+              f"--array={_compress_ranges(missing)} slurm/snail_sweep.slurm")
+    print("Then re-run `collect` once the resubmitted tasks finish.")
+
+
 def main() -> None:
     """Command-line entry point.
 
@@ -1132,7 +1235,8 @@ def main() -> None:
     """
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("mode", choices=["prepare", "point", "local", "collect", "chevrons"])
+    ap.add_argument("mode", choices=["prepare", "point", "local", "collect", "chevrons",
+                                     "missing"])
     ap.add_argument("--outdir", default="results_zhou")
     ap.add_argument("--device", help="JSON file overriding DEFAULT_CONFIG")
     ap.add_argument("--index", type=int, help="point index (mode=point); with --chunk N "
@@ -1163,6 +1267,10 @@ def main() -> None:
     ap.add_argument("--drags", help="comma list of bools, e.g. false,true")
     ap.add_argument("--t-g-ns", type=float, default=None,
                     help="gate duration t_g (ns); overrides the device/default value")
+    ap.add_argument("--resume-list", default=None,
+                    help="[point] file of point indices (one per line, e.g. missing.txt); "
+                         "--index selects the chunk-th slice of this list instead of the "
+                         "full grid range. Written by `missing`.")
     ap.add_argument("--target-eta", type=float, default=None,
                     help="set t_g via auto_t_g so the raised-cosine full-iSWAP pump has "
                          "peak |eta| = TARGET_ETA (t_g = 2*area/eta; on this device "
@@ -1344,6 +1452,10 @@ def main() -> None:
         collect(args.outdir)
         return
 
+    if args.mode == "missing":
+        find_missing(args.outdir)
+        return
+
     if args.mode == "chevrons":
         idxs = [args.index] if args.index is not None else None
         paths = plot_chevrons(args.outdir, idxs)
@@ -1390,22 +1502,31 @@ def main() -> None:
         if args.index is None:
             sys.exit("mode=point requires --index")
         chunk = max(1, int(args.chunk))
-        if chunk == 1:
-            # one array task == one point (original behaviour)
-            if not (0 <= args.index < len(points)):
-                sys.exit(f"index {args.index} out of range 0..{len(points)-1}")
-            res = run_point(points[args.index], config)
-            path = save_point(res, args.outdir)
-            print(f"[point {args.index}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
-            return
-        # chunked: array task K runs points [K*chunk, (K+1)*chunk) -> keeps the array
-        # size = ceil(N/chunk) under SLURM's MaxArraySize for large sweeps.
-        lo = args.index * chunk
-        hi = min(lo + chunk, len(points))
-        if lo >= len(points):
-            print(f"[chunk {args.index}] no points in [{lo}, {hi}) (N={len(points)}); nothing to do.")
-            return
-        for i in range(lo, hi):
+        if args.resume_list:
+            # --index is the CHUNK position into the resume list, not a point index;
+            # the actual point indices come from the file (one per line). This keeps the
+            # array size = ceil(len(list)/chunk) regardless of how large/scattered the
+            # missing indices are.
+            with open(args.resume_list) as f:
+                order = [int(x) for x in f.read().split()]
+            lo, hi = args.index * chunk, min(args.index * chunk + chunk, len(order))
+            if lo >= len(order):
+                print(f"[resume {args.index}] no entries in [{lo}, {hi}) of {len(order)}; "
+                      f"nothing to do.")
+                return
+            todo = order[lo:hi]
+        else:
+            # array task K runs points [K*chunk, (K+1)*chunk); chunk=1 -> one point.
+            lo, hi = args.index * chunk, min(args.index * chunk + chunk, len(points))
+            if lo >= len(points):
+                print(f"[chunk {args.index}] no points in [{lo}, {hi}) (N={len(points)}); "
+                      f"nothing to do.")
+                return
+            todo = list(range(lo, hi))
+        for i in todo:
+            if not (0 <= i < len(points)):
+                print(f"[point {i}] out of range 0..{len(points)-1}; skipping.")
+                continue
             res = run_point(points[i], config)
             path = save_point(res, args.outdir)
             print(f"[point {i}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
