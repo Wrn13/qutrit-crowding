@@ -173,8 +173,8 @@ def series_column(data: Dict[str, np.ndarray]) -> str:
 # the beat detuning delta = Delta - w_p (0 = on the collision). Set by main().
 _XAXIS = "spec_freq_GHz"
 _XLABELS = {
-    "spec_freq_GHz": r"$\Delta = w_b - w_\mathrm{spec}$ (GHz)",
-    "beat_GHz": r"Detuning $\delta = \Delta - w_p$ (GHz)",
+    "spec_freq_GHz": r"spectator frequency $\Delta = w_b - w_\mathrm{spec}$ (GHz)",
+    "beat_GHz": r"beat detuning $\delta = \Delta - w_p$ (GHz)",
 }
 
 
@@ -215,6 +215,47 @@ def _resonance_GHz(data: Dict[str, np.ndarray]) -> Optional[float]:
     if "w_p_GHz" in data and np.isfinite(data["w_p_GHz"]).any():
         return float(np.nanmedian(data["w_p_GHz"]))
     return None
+
+
+def _resonance_xs(data: Dict[str, np.ndarray], xcol: str,
+                  wres: Optional[float]) -> list:
+    """Delta locations of the one-pump collision on the spectator-frequency axis.
+
+    The b<->spec (or a<->spec) one-pump swap is resonant at |w_q - w_spec| = w_p,
+    i.e. Delta = w_b - w_spec = +/- w_p, so a spectator collides from below w_b
+    (Delta = +w_p) or above it (Delta = -w_p). Returns whichever of +/- w_p lies
+    within the swept Delta range, so a one-sided sweep marks the collision it
+    actually contains rather than drawing on the empty mirror side (which also
+    stretched the axis). Only meaningful on the ``spec_freq_GHz`` (Delta) axis;
+    the beat axis marks the collision at 0 via ``_mark_collision``.
+
+    Parameters
+    ----------
+    data : dict[str, ndarray]
+        Loaded summary columns.
+    xcol : str
+        Active x column (``spec_freq_GHz`` or ``beat_GHz``).
+    wres : float or None
+        Pump magnitude w_p (GHz); the collision half-separation on the Delta axis.
+
+    Returns
+    -------
+    list of float
+        Delta locations (GHz) at which to draw the resonance line; empty when
+        not applicable (no pump column, or a non-Delta axis).
+    """
+    if wres is None or xcol != "spec_freq_GHz" or xcol not in data:
+        return []
+    xv = np.asarray(data[xcol], dtype=float)
+    xv = xv[np.isfinite(xv)]
+    if xv.size == 0:
+        return [wres]
+    lo, hi = float(np.min(xv)), float(np.max(xv))
+    xs = [w for w in (wres, -wres) if lo - 1e-9 <= w <= hi + 1e-9]
+    if xs:
+        return xs
+    # collision outside the swept window: mark the side the sweep is on
+    return [-wres if (lo + hi) < 0.0 else wres]
 
 
 # ---------------------------------------------------------------------------
@@ -267,9 +308,11 @@ def fig_infidelity_vs_frequency(data: Dict[str, np.ndarray],
                         ls="-" if drag else "--",
                         marker="o", mfc=(colors[lam] if drag else "white"),
                         mec=colors[lam])
-        if wres is not None and xc == "spec_freq_GHz":
-            ax.axvline(wres, color="0.5", lw=0.8, ls=":", zorder=0)
-            ax.text(wres, 1.0, "  spectator\n  resonance", transform=
+        _xres = _resonance_xs(data, xc, wres)
+        for _xr in _xres:
+            ax.axvline(_xr, color="0.5", lw=0.8, ls=":", zorder=0)
+        if _xres:
+            ax.text(_xres[0], 1.0, "  spectator\n  resonance", transform=
                     ax.get_xaxis_transform(), va="top", ha="left",
                     fontsize=6.8, color="0.4")
         _mark_collision(ax, xc)
@@ -345,8 +388,8 @@ def fig_leakage_vs_frequency(data: Dict[str, np.ndarray],
                 ax.plot(x[o], np.clip(y[o], 1e-12, None), color=mcolor[met],
                         ls="-" if drag else "--", marker="o",
                         mfc=(mcolor[met] if drag else "white"), mec=mcolor[met])
-        if wres is not None and xc == "spec_freq_GHz":
-            ax.axvline(wres, color="0.5", lw=0.8, ls=":", zorder=0)
+        for _xr in _resonance_xs(data, xc, wres):
+            ax.axvline(_xr, color="0.5", lw=0.8, ls=":", zorder=0)
         _mark_collision(ax, xc)
         ax.set_yscale("log")
         ax.set_xlabel(_XLABELS[xc])
@@ -439,8 +482,9 @@ def fig_collision_heatmap(data: Dict[str, np.ndarray], metric: str = "F_avg",
                 im = ax.pcolormesh(_edges(xs), _edges(ys), transform(Z),
                                    cmap=cmap, vmin=vmin, vmax=vmax,
                                    shading="auto", rasterized=True)
-                if wres is not None and xc == "spec_freq_GHz":
-                    ax.axvline(wres, color="w", lw=0.8, ls=":")
+                if xc == "spec_freq_GHz":
+                    for _xr in _resonance_xs(data, xc, wres):
+                        ax.axvline(_xr, color="w", lw=0.8, ls=":")
                 elif xc == "beat_GHz":
                     ax.axvline(0.0, color="w", lw=0.8, ls=":")
             if i == nr - 1:
@@ -503,8 +547,8 @@ def fig_analytic_map(data: Dict[str, np.ndarray],
         axes[0].text(axes[0].get_xlim()[1], g_is, r" $g^\mathrm{eff}_\mathrm{iSWAP}$",
                      va="center", ha="right", fontsize=7.5, color="0.4")
     for ax in axes:
-        if wres is not None and xc == "spec_freq_GHz":
-            ax.axvline(wres, color="0.5", lw=0.8, ls=":", zorder=0)
+        for _xr in _resonance_xs(data, xc, wres):
+            ax.axvline(_xr, color="0.5", lw=0.8, ls=":", zorder=0)
         _mark_collision(ax, xc)
         ax.set_xlabel(_XLABELS[xc])
     axes[0].set_ylabel(r"exchange rate $g^\mathrm{eff}_\mathrm{spec}/2\pi$ (MHz)")

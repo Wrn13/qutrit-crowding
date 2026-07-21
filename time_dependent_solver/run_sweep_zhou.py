@@ -29,9 +29,11 @@ Sweep axes  (spec_freq x drag)
 * spec_freq : spectator transition frequency Delta = w_b - w_spec (GHz), swept
               broadly. For a single-tone, pure-g3 coupler the spectator's only
               collision in the qubit band is the one-pump exchange with the
-              anchor, resonant at Delta = w_p (beat = Delta - w_p). Two-mode
-              higher-order collisions require g4 or a second pump tone; the FULL
-              sim still captures whatever is actually present.
+              anchor, resonant at |Delta| = w_p (beat = |Delta| - w_p); the |.|
+              picks the nearer collision, so the spectator may sit below w_b
+              (Delta = +w_p) or above it (Delta = -w_p). Two-mode higher-order
+              collisions require g4 or a second pump tone; the FULL sim still
+              captures whatever is actually present.
 * drag      : first-order DRAG quadrature (Motzoi et al., PRL 103, 110501 (2009))
               on the pump, eta(t) -> eta(t) - i d eta/dt / (2 pi * beat), tuned to
               the spectator's beat detuning. Suppresses the OFF-resonant spectator;
@@ -461,7 +463,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         sub = dict(config); sub["qubit_freqs_GHz"] = [wa / TWO_PI, wb / TWO_PI]
         # DRAG on during calibration if this point runs DRAG, tuned to the anchor beat
         # (Delta - w_p) from the nominal pump; skip on-collision (beat -> 0 is singular).
-        _cb = pt.spec_freq_GHz - _w_p_nom_GHz
+        _cb = _nearest_collision(config, wa / TWO_PI, wb / TWO_PI, ws / TWO_PI,
+                                 _wspec_abs_GHz, _w_p_nom_GHz)[1]
         _cal_drag = (_cb if (bool(pt.drag) and abs(_cb) >= _drag_skip_GHz(config)) else None)
         rec = CG.run_calibration(
             sub, float(config["t_g_ns"]),
@@ -482,7 +485,9 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                    nsteps=int(config.get("nsteps", 500000)))
         # DRAG beat for the chevron uses the pre-Stark pump (the ~MHz Stark offset is
         # negligible vs the beat in the DRAG quadrature); skip DRAG on-collision.
-        _chev_beat = pt.spec_freq_GHz - (_w_p_nom_GHz + wp_offset_used_GHz)
+        _chev_beat = _nearest_collision(config, wa / TWO_PI, wb / TWO_PI, ws / TWO_PI,
+                                        _wspec_abs_GHz,
+                                        _w_p_nom_GHz + wp_offset_used_GHz)[1]
         _chev_drag = (_chev_beat if (pt.drag and abs(_chev_beat) >= _drag_skip_GHz(config))
                       else None)
         _chevron = _stark_offset_GHz(config, wa / TWO_PI, wb / TWO_PI,
@@ -517,10 +522,18 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         anharmonicities_GHz=anharm,
     )
 
-    # DRAG targets the off-resonant spectator<->anchor exchange, detuned from the
-    # pump by beat = spec_freq - w_p. It is singular as beat -> 0 (an on-resonant
-    # collision needs frequency allocation, not DRAG), so skip it there.
-    beat_GHz = pt.spec_freq_GHz - w_p_GHz
+    # DRAG targets the off-resonant spectator exchange, detuned from the pump by the
+    # NEAREST collision across channels (via _nearest_collision, matching the target
+    # sweep): the one-pump swaps |w_q - w_spec| = w_p and static exchanges w_q = w_spec
+    # for q in {a, b} (and, with --drag-subharmonic, the w_i/2 = w_p subharmonics).
+    # Because it uses |w_q - w_spec|, the spectator may sit below OR above w_b; for a
+    # below-w_b spectator whose nearest channel is the b<->spec one-pump, this reduces
+    # to the old spec_freq - w_p. It is singular as beat -> 0 (an on-resonant collision
+    # needs frequency allocation, not DRAG), so skip it there. nearest_kind/target say
+    # WHICH channel it is.
+    _nearest = _nearest_collision(config, wa / TWO_PI, wb / TWO_PI, ws / TWO_PI,
+                                  _wspec_abs_GHz, w_p_GHz)
+    beat_GHz = _nearest[1]
     use_drag = bool(pt.drag)
     status_drag = "ok"
     if pt.drag and abs(beat_GHz) < _drag_skip_GHz(config):
@@ -553,6 +566,8 @@ def run_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "drag": bool(pt.drag),
         "drag_applied": bool(use_drag),
         "beat_GHz": round(float(beat_GHz), 6),
+        "nearest_kind": _nearest[2],
+        "nearest_target": _nearest[3],
         "eta_peak": round(float(eta_peak), 5),
         "g_iswap_eff_MHz": round(float(g_iswap / TWO_PI * 1e3), 4),
         "g_spec_eff_MHz": round(float(g_spec / TWO_PI * 1e3), 4),
@@ -933,7 +948,8 @@ def collect(outdir: str) -> None:
 
     rows.sort(key=lambda r: r["index"])
     spec_cols = ["index", "spec_freq_GHz", "lam_spec", "drag", "drag_applied",
-                 "beat_GHz", "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
+                 "beat_GHz", "nearest_kind", "nearest_target",
+                 "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
                  "w_p_GHz", "stark_offset_MHz", "amp_scale_used", "wp_offset_used_MHz",
                  "w_spec_GHz", "t_g_ns", "wall_s"]
@@ -1278,6 +1294,15 @@ def main() -> None:
                          "over --t-g-ns")
     ap.add_argument("--wb-GHz", help="[target] comma list of partner (w_b) freqs (GHz)")
     ap.add_argument("--spec-GHz", help="[target] comma list of spectator ABSOLUTE freqs (GHz)")
+    ap.add_argument("--spec-min-GHz", type=float, default=None,
+                    help="[target] lower edge of the auto spectator band (GHz); "
+                         "default min(w_a, min w_b) - 0.40")
+    ap.add_argument("--spec-max-GHz", type=float, default=None,
+                    help="[target] upper edge of the auto spectator band (GHz); "
+                         "default max(w_a, max w_b) + 0.40, i.e. above w_b. Raise this "
+                         "to place the spectator well above the partner qubit.")
+    ap.add_argument("--spec-step-GHz", type=float, default=None,
+                    help="[target] spectator grid step for the auto band (GHz); default 0.10")
     ap.add_argument("--drag-compare", action="store_true",
                     help="[target] also run DRAG-on where |nearest beat| < --drag-compare-below-MHz")
     ap.add_argument("--drag-compare-below-MHz", type=float, default=None,
@@ -1375,9 +1400,23 @@ def main() -> None:
             wa_GHz = float(nominal[0])                                   # fixed
             wb_default = [round(float(nominal[1]) - 0.30 + 0.02 * k, 3) for k in range(31)]
             wb_list = _parse_list(args.wb_GHz, float) or wb_default
-            # default spectator band: across the qubit band around the pair
-            lo = min(wa_GHz, float(nominal[1])) - 0.40
-            spec_default = [round(lo + 0.02 * k, 3) for k in range(41)]
+            # default spectator band spans from below the lower qubit to ABOVE the
+            # highest w_b, so spectators higher than the partner qubit are included.
+            # Override the window with --spec-min-GHz/--spec-max-GHz/--spec-step-GHz,
+            # or give an explicit list with --spec-GHz.
+            wb_lo = min(float(w) for w in wb_list)
+            wb_hi = max(float(w) for w in wb_list)
+            band_lo = min(wa_GHz, wb_lo) - 0.40
+            band_hi = max(wa_GHz, wb_hi) + 0.40
+            spec_lo = band_lo if args.spec_min_GHz is None else float(args.spec_min_GHz)
+            spec_hi = band_hi if args.spec_max_GHz is None else float(args.spec_max_GHz)
+            spec_step = 0.10 if args.spec_step_GHz is None else float(args.spec_step_GHz)
+            if spec_step <= 0:
+                sys.exit("--spec-step-GHz must be > 0")
+            if spec_hi < spec_lo:
+                sys.exit("--spec-max-GHz must be >= --spec-min-GHz")
+            n_spec = int(round((spec_hi - spec_lo) / spec_step)) + 1
+            spec_default = [round(spec_lo + spec_step * k, 6) for k in range(max(n_spec, 1))]
             spec_list = _parse_list(args.spec_GHz, float) or spec_default
             if config.get("drag_compare"):
                 if args.drags:
@@ -1394,6 +1433,9 @@ def main() -> None:
                   f"spectator lam={config['lam_b']} (3-level anharmonic)")
             print(f"  scan: w_b ({len(wb_list)}) x w_spec ({len(spec_list)}) x drag ({len(drags)}) "
                   f"[dropped |detuning|<{config.get('min_detuning_GHz', 0.05)} GHz]")
+            _above = sum(1 for s in spec_list if s > wb_hi)
+            print(f"  spectator band: {min(spec_list):.3f}..{max(spec_list):.3f} GHz "
+                  f"({_above} point(s) above the highest w_b = {wb_hi:.3f} GHz)")
             if config.get("drag_compare"):
                 print(f"  DRAG comparison ON for |nearest beat| < "
                       f"{config.get('drag_compare_below_MHz', 100.0):.0f} MHz")
