@@ -1,12 +1,12 @@
 {
   "qubit_freqs_GHz": [
-    3.5,
-    4.5
+    4.6,
+    5.7
   ],
   "qubit_levels": 3,
   "lam_a": 0.1,
   "lam_b": 0.1,
-  "coupler_freq_GHz": 4.7,
+  "coupler_freq_GHz": 4.2,
   "coupler_levels": 5,
   "g3_GHz": 0.06,
   "g4_GHz": 0.0,  

@@ -12,12 +12,12 @@
 #SBATCH --error=snail_sweep_%A_%a.err
 #SBATCH --array=0-59%32          # OVERRIDE on submit: sbatch --array=0-<M-1> snail_sweep.slurm
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
+#SBATCH --cpus-per-task=12        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
                                  # so the per-point chevron parallelizes over its offsets
                                  # (mode=point auto-uses SLURM_CPUS_PER_TASK). Override:
                                  #   sbatch --cpus-per-task=12 --array=... slurm/snail_sweep.slurm
 #SBATCH --mem-per-cpu=4G
-#SBATCH --time=00:30:00          # per-point wall limit; raise for large N / long t_g
+#SBATCH --time=12:30:00          # per-point wall limit; raise for large N / long t_g
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=wcalphon@syr.edu   # NOTE: on an array, ALL e-mails per task (120!);
                                        # use --mail-type=END,FAIL to cut the volume
