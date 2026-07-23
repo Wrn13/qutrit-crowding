@@ -59,9 +59,9 @@ for txt, col in zip(leg.get_texts(), (BLUE, RED)):
     txt.set_color(col)
 
 fig.tight_layout()
-fig.savefig("drag_iq_figure.png", dpi=300,
+fig.savefig("src/notebooks/simple_figures/drag_iq_figure.png", dpi=300,
             bbox_inches="tight", facecolor="white")
-fig.savefig("drag_iq_figure.pdf",
+fig.savefig("src/notebooks/simple_figures/drag_iq_figure.pdf",
             bbox_inches="tight", facecolor="white")
 print("saved drag_iq_figure.png / .pdf ; Q/I peak ratio =",
       round(np.max(np.abs(Omega_Q)) / np.max(Omega_I), 3),
@@ -155,8 +155,8 @@ for txt, col in zip(leg.get_texts(), (BLUE, RED)):
     txt.set_color(col)
 
 fig.tight_layout()
-fig.savefig("drag_fourier_figure.png", dpi=300,
+fig.savefig("src/notebooks/simple_figures/drag_fourier_figure.png", dpi=300,
             bbox_inches="tight", facecolor="white")
-fig.savefig("drag_fourier_figure.pdf",
+fig.savefig("src/notebooks/simple_figures/drag_fourier_figure.pdf",
             bbox_inches="tight", facecolor="white")
 print("saved drag_fourier_figure.png / .pdf")
