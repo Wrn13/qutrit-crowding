@@ -83,9 +83,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     wb_GHz = float(pt.wb_GHz)                           # swept
     wspec_GHz = float(pt.spec_abs_GHz)                  # swept (absolute)
     w_p_GHz = abs(wb_GHz - wa_GHz) + float(config.get("wp_offset_GHz", 0.0))
-    lam_spec = float(config["lam_b"])                  # spectator participation = lam_b
-    if bool(config.get("no_spectator", False)):
-        lam_spec = 0.0                                 # bare a-b-coupler gate (decoupled)
+    no_spec = bool(config.get("no_spectator", False))  # true 3-mode bare a-b-coupler gate
+    lam_spec = 0.0 if no_spec else float(config["lam_b"])   # spectator participation
     integrate = bool(config.get("integrate", True))
 
     # Per-point calibration (w_b AND the spectator vary across the sweep, so the optimal
@@ -121,7 +120,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
             window_factor=float(config.get("stark_window_factor", 2.0)),
             time_points=int(config.get("stark_time_points", 120)),
             solver=_sv, n_jobs=1,
-            spec_abs_GHz=wspec_GHz, drag_beat_GHz=_cal_drag)["final"]
+            spec_abs_GHz=(None if no_spec else wspec_GHz), drag_beat_GHz=_cal_drag)["final"]
         amp_scale_used = float(rec["amp_scale"])
         wp_offset_used_GHz = float(rec["wp_offset_GHz"])
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
@@ -135,7 +134,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
                               and abs(_cb) >= _drag_skip_GHz(config)) else None)
         _chevron = _stark_offset_GHz(config, wa_GHz, wb_GHz,
                                      float(config["t_g_ns"]), amp_scale_used, _sv,
-                                     spec_abs_GHz=wspec_GHz, drag_beat_GHz=_chev_drag)
+                                     spec_abs_GHz=(None if no_spec else wspec_GHz),
+                                     drag_beat_GHz=_chev_drag)
         wp_offset_used_GHz += float(_chevron["resonance_offset_GHz"])
         w_p_GHz = abs(wb_GHz - wa_GHz) + wp_offset_used_GHz
 
@@ -147,17 +147,23 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     else:
         q_lv = c_lv = s_lv = 2
 
-    freqs_GHz = [wa_GHz, wb_GHz, ws_GHz, wspec_GHz]
-    participations = {a: float(config["lam_a"]), b: float(config["lam_b"]),
-                      spec: lam_spec}
-    levels = [q_lv, q_lv, c_lv, s_lv]
+    aq = float(config.get("anharm_qubit_GHz", 0.0))
+    if no_spec:
+        # true 3-mode bare gate [a, b, coupler] -- no spectator Hilbert dimension
+        freqs_GHz = [wa_GHz, wb_GHz, ws_GHz]
+        participations = {a: float(config["lam_a"]), b: float(config["lam_b"])}
+        levels = [q_lv, q_lv, c_lv]
+        anharm = {a: aq, b: aq}
+    else:
+        freqs_GHz = [wa_GHz, wb_GHz, ws_GHz, wspec_GHz]
+        participations = {a: float(config["lam_a"]), b: float(config["lam_b"]),
+                          spec: lam_spec}
+        levels = [q_lv, q_lv, c_lv, s_lv]
+        anharm = {a: aq, b: aq, spec: float(config.get("anharm_spec_GHz", 0.0))}
 
     nonlin = {3: float(config["g3_GHz"])}
     if float(config.get("g4_GHz", 0.0)) != 0.0:
         nonlin[4] = float(config["g4_GHz"])
-
-    aq = float(config.get("anharm_qubit_GHz", 0.0))
-    anharm = {a: aq, b: aq, spec: float(config.get("anharm_spec_GHz", 0.0))}
 
     cpl = ZhouCoupler(mode_freqs_GHz=freqs_GHz, coupler_index=coupler,
                       participations=participations, nonlinearities=nonlin, levels=levels,
@@ -205,16 +211,17 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     _configure(base_drag)
     eta_peak = cpl.peak_eta()
     g_iswap = cpl.iswap_rate(a, b)
-    if nearest[2] == "subharm":
-        g_coll = float("nan")     # subharmonic drive is higher-order (g4); the cubic
-                                  # pair rate below does not model it
+    if no_spec or nearest[2] == "subharm":
+        g_coll = float("nan")     # no spectator, or a higher-order (g4) subharmonic drive;
+                                  # the cubic pair rate below models neither
     else:
         g_coll = cpl.effective_rate([nearest[4], spec], n=3, C=6)   # 6 g3 l_q l_spec |eta|
 
     out = {
         "index": pt.index, "kind": "target",
         "wa_GHz": round(wa_GHz, 6), "wb_GHz": round(wb_GHz, 6),
-        "w_snail_GHz": round(ws_GHz, 6), "spec_GHz": round(wspec_GHz, 6),
+        "w_snail_GHz": round(ws_GHz, 6),
+        "spec_GHz": ("" if no_spec else round(wspec_GHz, 6)),
         "detuning_GHz": round(wb_GHz - wa_GHz, 6), "w_p_GHz": round(w_p_GHz, 6),
         "stark_offset_MHz": round((wp_offset_used_GHz
                                    - float(config.get("wp_offset_GHz", 0.0))) * 1e3, 4),
@@ -247,10 +254,11 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     solver = dict(atol=float(config["atol"]), rtol=float(config["rtol"]),
                   nsteps=int(config.get("nsteps", 500000)))
 
-    occ0 = [0, 0, 0, 0]; occ0[a] = 1
+    n_modes = 3 if no_spec else 4
+    occ0 = [0] * n_modes; occ0[a] = 1
     pops = np.abs(cpl.evolve_state(occ0, t_g, **solver)) ** 2
-    occ_b = [0, 0, 0, 0]; occ_b[b] = 1
-    out["n_spec"] = float(cpl.mean_occupation(pops, spec))
+    occ_b = [0] * n_modes; occ_b[b] = 1
+    out["n_spec"] = "" if no_spec else float(cpl.mean_occupation(pops, spec))
     out["n_coupler"] = float(cpl.mean_occupation(pops, coupler))
     out["p_transfer"] = float(pops[cpl.fock_index(occ_b)])
 

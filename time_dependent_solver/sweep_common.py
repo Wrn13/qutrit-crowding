@@ -513,7 +513,9 @@ def _log_line(res: Dict[str, Any]) -> str:
         tail = ""
         if isinstance(res.get("dF_drag"), (int, float)):
             tail = f" dF_drag={res['dF_drag']:+.4f}"
-        return (f"wb={res['wb_GHz']:.3f} wspec={res['spec_GHz']:.3f} wp={res['w_p_GHz']:.3f} "
+        _ws = res.get("spec_GHz", "")
+        wspec_str = f"{_ws:.3f}" if isinstance(_ws, (int, float)) else "bare"
+        return (f"wb={res['wb_GHz']:.3f} wspec={wspec_str} wp={res['w_p_GHz']:.3f} "
                 f"nearest={res['nearest_beat_GHz']:+.3f}GHz({res['nearest_kind']}) "
                 f"g_coll={res['g_collision_MHz']}MHz F={f_str}{tail}")
     return (f"beat={res['beat_GHz']:+.3f}GHz drag={res['drag_applied']} "
