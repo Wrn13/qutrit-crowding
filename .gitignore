@@ -1,5 +1,7 @@
 .vscode
 
+.DS_Store
+
 #ruff
 .ruff_cache
 
