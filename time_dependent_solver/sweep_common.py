@@ -408,10 +408,20 @@ def collect(outdir: str) -> None:
             best = max(scored, key=_best_F)
             with_drag = (isinstance(best.get("F_avg_drag"), (int, float))
                          and best["F_avg_drag"] >= best.get("F_avg", -1))
-            print(f"Best allocation: w_b={best['wb_GHz']:.4f} GHz, "
-                  f"w_spec={best['spec_GHz']:.4f} GHz "
+
+            def _num(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+            _wb, _ws, _nb = (_num(best.get("wb_GHz")), _num(best.get("spec_GHz")),
+                             _num(best.get("nearest_beat_GHz")))
+            wb_str = f"{_wb:.4f}" if _wb is not None else str(best.get("wb_GHz"))
+            ws_str = f"{_ws:.4f} GHz" if _ws is not None else "bare (no spectator)"
+            nb_str = f"{_nb:+.3f}" if _nb is not None else str(best.get("nearest_beat_GHz"))
+            print(f"Best allocation: w_b={wb_str} GHz, w_spec={ws_str} "
                   f"({'with' if with_drag else 'no'} DRAG) -> F={_best_F(best):.5f}, "
-                  f"nearest_beat={best['nearest_beat_GHz']:+.3f} GHz")
+                  f"nearest_beat={nb_str} GHz")
         gains = [r["dF_drag"] for r in rows if isinstance(r.get("dF_drag"), (int, float))]
         if gains:
             g = np.array(gains)
