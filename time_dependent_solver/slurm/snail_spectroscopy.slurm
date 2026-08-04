@@ -29,6 +29,13 @@
 #       F_LO=1.5 F_HI=3.8 F_POINTS=192 AMP_HI=3.0 AMP_POINTS=61 PROBE=200 \
 #       sbatch --array=0-15 slurm/snail_spectroscopy.slurm
 #
+# Map the iSWAP gate itself (an exchange, so it needs a starting excitation), with
+# PROBE set to the gate length so a complete swap shows up as full transfer:
+#   DEVICE=warren_clean.json PREFIX=results/iswap_map NSHARDS=16 \
+#       F_LO=1.04 F_HI=1.16 F_POINTS=61 PROBE=92.6 \
+#       AMP_LO=0 AMP_HI=2.5 AMP_POINTS=51 INIT=0,1,0 TARGET_MODE=0 REDUCE=max \
+#       sbatch --array=0-15 slurm/snail_spectroscopy.slurm
+#
 # Then merge + plot (chain it so it waits for the array):
 #   JID=$(... sbatch --parsable ...)
 #   PREFIX=results/ge_map sbatch --dependency=afterok:${JID} slurm/snail_spectroscopy.slurm
@@ -79,6 +86,12 @@ COMMON=(--f-lo "${F_LO}" --f-hi "${F_HI}" --f-points "${F_POINTS}"
         --envelope "${ENVELOPE}" --reduce "${REDUCE}" --level "${LEVEL}"
         --target-mode "${TARGET_MODE}")
 [ -n "${SPEC_ABS:-}" ] && COMMON+=(--spec-abs-GHz "${SPEC_ABS}")
+# INIT: initial Fock occupations, one per mode (e.g. INIT=0,1,0). Default is |g>.
+# An EXCHANGE resonance such as the iSWAP conserves excitation number and so is
+# invisible from the ground state at any drive frequency -- to map the a<->b gate at
+# |w_b - w_a| set INIT=0,1,0 with TARGET_MODE=0, which records the transfer
+# probability. Mode count must match the build (3 without a spectator, 4 with).
+[ -n "${INIT:-}" ] && COMMON+=(--init "${INIT}")
 
 # ----------------------------------------------------------------- merge mode
 if [ "${MERGE:-0}" = "1" ]; then
