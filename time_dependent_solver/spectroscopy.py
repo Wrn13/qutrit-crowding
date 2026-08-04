@@ -100,7 +100,8 @@ def _reduce_populations(pops: np.ndarray, reduce: str) -> float:
 # scan
 # --------------------------------------------------------------------------- #
 def transition_lines(config: Dict[str, Any], mode: int = 0,
-                     orders: Sequence[int] = (1, 2, 3)) -> Dict[str, float]:
+                     orders: Sequence[int] = (1, 2, 3),
+                     exchange: bool = True) -> Dict[str, float]:
     """Expected drive frequencies of ge / ef features and their subharmonics.
 
     ``ge`` sits at the mode frequency and ``ef`` one anharmonicity below it; the
@@ -113,6 +114,16 @@ def transition_lines(config: Dict[str, Any], mode: int = 0,
     for n in orders:
         out[f"ge/{n}" if n > 1 else "ge"] = w_ge / n
         out[f"ef/{n}" if n > 1 else "ef"] = (w_ge + alpha) / n
+    if exchange and len(freqs) > 1:
+        # pump-driven exchange (iSWAP) resonances: |w_i - w_j|. Only visible when the
+        # initial state carries an excitation -- an exchange annihilates |gg>.
+        for j, w_j in enumerate(freqs):
+            if j == mode:
+                continue
+            out[f"swap({mode}-{j})"] = abs(w_ge - float(w_j))
+        w_c = config.get("coupler_freq_GHz")
+        if w_c is not None:
+            out[f"swap({mode}-c)"] = abs(w_ge - float(w_c))
     return out
 
 
@@ -154,14 +165,23 @@ def _scan_column(task: Tuple[int, float, Dict[str, Any], Dict[str, Any]]
     cpl, _wp, _eta = build_coupler(config, t_g=probe_ns, amp_scale=1.0,
                                    wp_offset_GHz=0.0,
                                    spec_abs_GHz=prm["spec_abs_GHz"])
-    occ0 = [0] * len(cpl.dims)                                 # all modes in |g>
+    occ0 = prm.get("init_occ") or [0] * len(cpl.dims)
+    if len(occ0) != len(cpl.dims):
+        raise SystemExit(f"--init has {len(occ0)} entries but the system has "
+                         f"{len(cpl.dims)} modes {list(cpl.dims)}")
     times = (np.linspace(0.0, probe_ns, int(prm["n_times"]))
              if reduce in ("max", "mean") else None)
+
+    # population of the observable in the UNDRIVEN initial state: the zero-amplitude
+    # baseline (0 from |g>, but 1 if the observable coincides with the initial state)
+    base = np.zeros(cpl.dim)
+    base[cpl.fock_index(occ0)] = 1.0
+    base_pop = marginal_population(base, cpl.dims, prm["target_mode"], prm["level"])
 
     col = np.empty(len(amps))
     for ia, amp in enumerate(amps):
         if amp == 0.0:
-            col[ia] = 0.0                                      # no drive, stays in |g>
+            col[ia] = base_pop                                 # no drive: unchanged
             continue
         # amp IS the peak |eta| for this envelope (verified: amp -> peak_eta)
         cpl.set_pump(PumpTone(w_p_GHz=f_d, envelope=EnvCls(amp=float(amp),
@@ -187,6 +207,7 @@ def scan_ge(config: Dict[str, Any], *, f_lo: float, f_hi: float, f_points: int =
             n_times: int = 41, rtol: float = 1e-8, atol: float = 1e-10,
             nsteps: int = 500000,
             spec_abs_GHz: Optional[float] = None,
+            init_occ: Optional[Sequence[int]] = None,
             nproc: int = 1, columns: Optional[Sequence[int]] = None,
             verbose: bool = True) -> Dict[str, Any]:
     """Scan drive frequency x drive amplitude, recording a level population.
@@ -229,6 +250,17 @@ def scan_ge(config: Dict[str, Any], *, f_lo: float, f_hi: float, f_points: int =
         Maximum internal solver steps between outputs.
     spec_abs_GHz : float, optional
         Include a spectator at this absolute frequency.
+    init_occ : sequence of int, optional
+        Initial Fock occupations per mode; default all zero (|g>).
+
+        This choice decides WHICH resonances the map can show. From the ground
+        state only excitation-CREATING processes appear -- the direct ge/ef lines,
+        their subharmonics, pair creation. An EXCHANGE resonance such as the iSWAP
+        (a^dag b + a b^dag) conserves excitation number and annihilates |gg>, so it
+        is invisible from |g> at any drive frequency or power. To map the iSWAP,
+        start with one excitation in the partner (e.g. ``[0, 1, 0]``) and record the
+        target qubit's |e> population: that is the transfer probability, and the
+        bright line then appears at the pump frequency |w_b - w_a|.
     nproc : int
         Worker processes over frequency columns (1 = serial).
     columns : sequence of int, optional
@@ -249,7 +281,8 @@ def scan_ge(config: Dict[str, Any], *, f_lo: float, f_hi: float, f_points: int =
 
     params = dict(amps=amps, probe_ns=probe_ns, target_mode=target_mode, level=level,
                   envelope=envelope, reduce=reduce, n_times=n_times,
-                  rtol=rtol, atol=atol, nsteps=nsteps, spec_abs_GHz=spec_abs_GHz)
+                  rtol=rtol, atol=atol, nsteps=nsteps, spec_abs_GHz=spec_abs_GHz,
+                  init_occ=(list(init_occ) if init_occ is not None else None))
     tasks = [(jf, float(freqs[jf]), config, params) for jf in todo]
 
     if nproc and nproc > 1 and len(tasks) > 1:
@@ -285,6 +318,7 @@ def scan_ge(config: Dict[str, Any], *, f_lo: float, f_hi: float, f_points: int =
                           envelope=envelope, reduce=reduce, n_times=n_times,
                           solver="qutip_sesolve_exact", rtol=rtol, atol=atol,
                           spec_abs_GHz=spec_abs_GHz,
+                          init_occ=(list(init_occ) if init_occ is not None else None),
                           columns=list(todo), f_points=int(f_points),
                           qubit_freqs_GHz=list(np.asarray(
                               config["qubit_freqs_GHz"], dtype=float)),
@@ -516,6 +550,12 @@ def main() -> None:
                          "fixed-duration measurement (shows Rabi fringes, and "
                          "speckles on a coarse grid); 'max' maps where transitions "
                          "live without Rabi-phase aliasing")
+    ap.add_argument("--init", default=None,
+                    help="initial Fock occupations, comma-separated per mode (e.g. "
+                         "'0,1,0'). Default all-zero (|g>). NOTE an exchange "
+                         "resonance like the iSWAP is invisible from |g> -- it "
+                         "conserves excitation number -- so use e.g. --init 0,1,0 "
+                         "and --target-mode 0 to map the a<->b transfer.")
     ap.add_argument("--spec-abs-GHz", type=float, default=None)
     ap.add_argument("--nproc", type=int, default=1,
                     help="worker processes over frequency columns (within one node)")
@@ -582,6 +622,8 @@ def main() -> None:
                          envelope=args.envelope, reduce=args.reduce,
                          n_times=args.n_times, rtol=args.rtol, atol=args.atol,
                          nsteps=args.nsteps,
+                         init_occ=([int(v) for v in args.init.split(',') if v.strip()]
+                                   if args.init else None),
                          spec_abs_GHz=args.spec_abs_GHz,
                          nproc=args.nproc, columns=columns)
         if args.save_data:
