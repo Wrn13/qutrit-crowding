@@ -16,7 +16,7 @@
   "min_detuning_GHz": 0.05,
   "drag_compare": false,
   "drag_compare_below_MHz": 100.0, 
-  "t_g_ns":   100.0,
+  "t_g_ns":   70.0,
   "envelope": "raised_cosine",
   "amp_scale": 1.0,
   "wp_offset_GHz": 0,
