@@ -383,6 +383,64 @@ def merge_shards(prefix: str, out_npz: Optional[str] = None) -> Dict[str, Any]:
     return merged
 
 
+def missing_columns(result: Dict[str, Any]) -> List[int]:
+    """Indices of frequency columns with no finite data (the white stripes)."""
+    Z = np.asarray(result["Z"])
+    return [int(j) for j in range(Z.shape[1]) if not np.isfinite(Z[:, j]).any()]
+
+
+def report_missing(prefix: str, nshards: Optional[int] = None) -> Dict[str, Any]:
+    """Diagnose gaps in a sharded scan and print how to fill them.
+
+    White vertical stripes in a merged map are all-NaN columns: shards that never
+    completed. Because sharding is strided, column j belongs to shard
+    ``j % nshards``, so the missing columns map back to a small set of shard indices
+    to resubmit -- no need to rerun the whole scan.
+
+    Parameters
+    ----------
+    prefix : str
+        Shard prefix (``<prefix>_shard*.npz``).
+    nshards : int, optional
+        Shard count the scan was launched with. Required to map columns back to
+        shards; without it only the column list is reported.
+
+    Returns
+    -------
+    dict
+        missing (column indices), shards (indices to resubmit), array_spec.
+    """
+    merged = merge_shards(prefix)
+    missing = missing_columns(merged)
+    out: Dict[str, Any] = dict(missing=missing, shards=[], array_spec="")
+    n_tot = int(merged["Z"].shape[1])
+    if not missing:
+        print(f"no gaps: all {n_tot} columns present")
+        return out
+    print(f"{len(missing)}/{n_tot} column(s) missing")
+    if nshards:
+        shards = sorted({j % int(nshards) for j in missing})
+        out["shards"] = shards
+        try:
+            from sweep_common import _compress_ranges
+            spec = _compress_ranges(shards)
+        except Exception:
+            spec = ",".join(str(i) for i in shards)
+        out["array_spec"] = spec
+        # a shard whose columns are ALL missing never ran; a partially-missing shard
+        # died midway -- both are fixed by rerunning that shard index.
+        print(f"belongs to {len(shards)} shard(s) of {nshards}: {shards}")
+        print(f"resubmit just those:\n"
+              f"  PREFIX={prefix} NSHARDS={nshards} <other env...> \\\n"
+              f"      sbatch --array={spec} slurm/snail_spectroscopy.slurm")
+        if max(shards) >= int(nshards):
+            print("NOTE: a missing shard index is >= NSHARDS -- the array was smaller "
+                  "than NSHARDS, so those shards were never submitted.")
+    else:
+        print("pass --nshards to map these columns back to shard indices")
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # plot
 # --------------------------------------------------------------------------- #
@@ -411,6 +469,15 @@ def plot_spectroscopy(result: Dict[str, Any], out: str = "figs/ge_map.png",
             ax.text(f0, amps[-1], f" {label}", color="w", fontsize=8.5,
                     rotation=90, va="top", ha="left", zorder=4)
 
+    gaps = [j for j in range(Z.shape[1]) if not np.isfinite(Z[:, j]).any()]
+    if gaps:
+        ax.text(0.02, 0.02, f"{len(gaps)} of {Z.shape[1]} columns missing "
+                            f"(incomplete shards)", transform=ax.transAxes,
+                ha="left", va="bottom", fontsize=8.5, color="w",
+                bbox=dict(boxstyle="round", fc="#B03A2EAA", ec="none"))
+        print(f"WARNING: {len(gaps)} all-NaN column(s) render as blank stripes; "
+              f"fill them with:  python spectroscopy.py --missing <prefix> "
+              f"--nshards <N>")
     ax.set_xlabel("drive frequency (GHz)")
     ax.set_ylabel(r"drive amplitude  $|\eta|$")
     ax.set_title(title or rf"${lname}$ population vs drive frequency and power",
@@ -458,6 +525,10 @@ def main() -> None:
                          "grows with drive frequency, balances across tasks.")
     ap.add_argument("--nshards", type=int, default=None,
                     help="array sharding: total number of shards")
+    ap.add_argument("--missing", default=None,
+                    help="diagnose blank stripes: report which columns (and with "
+                         "--nshards, which shard indices) are absent, and print the "
+                         "resubmit command")
     ap.add_argument("--merge", default=None,
                     help="merge <PREFIX>_shard*.npz into one grid and plot it")
     ap.add_argument("--save-data", default=None, help="write the grid to this .npz")
@@ -468,6 +539,9 @@ def main() -> None:
     ap.add_argument("--no-annotate", action="store_true")
     args = ap.parse_args()
 
+    if args.missing:
+        report_missing(args.missing, args.nshards)
+        return
     if args.merge:
         result = merge_shards(args.merge, out_npz=args.save_data)
     elif args.replot:
