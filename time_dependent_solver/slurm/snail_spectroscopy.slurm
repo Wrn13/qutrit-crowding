@@ -7,9 +7,10 @@
 #SBATCH --array=0-15             # one shard per task; NSHARDS must match this count
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8        # --nproc workers inside each task (columns)
-#SBATCH --mem-per-cpu=2G
-#SBATCH --time=08:00:00          # cost ~ f_points * amp_points * n_ctrl * n_sub, and
-                                 # n_sub grows with drive frequency -- start small
+#SBATCH --mem-per-cpu=4G   # QuTiP sesolve on the full Hilbert space
+#SBATCH --time=12:00:00          # exact sesolve per (frequency, amplitude) point; cost
+                                 # ~ f_points * amp_points * probe_ns, and REDUCE=max
+                                 # adds n_times outputs -- time one shard first
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=wcalphon@syr.edu
 # #SBATCH --partition=cpu
@@ -21,7 +22,8 @@
 #   * WITHIN a task: --nproc workers over that shard's columns.
 # Total parallelism is (array size) x (cpus-per-task).
 #
-# Needs NO QuTiP (scipy expm in the rotating frame), so a cheap CPU partition works.
+# Scan tasks integrate the EXACT Hamiltonian with QuTiP sesolve via the same
+# ZhouCoupler the sweeps use, so QuTiP IS required here (the MERGE=1 step is not).
 #
 #   DEVICE=warren_device.json PREFIX=results/ge_map NSHARDS=16 \
 #       F_LO=1.5 F_HI=3.8 F_POINTS=192 AMP_HI=3.0 AMP_POINTS=61 PROBE=200 \
@@ -54,8 +56,9 @@ AMP_LO="${AMP_LO:-0.0}"
 AMP_HI="${AMP_HI:-3.0}"
 AMP_POINTS="${AMP_POINTS:-41}"
 PROBE="${PROBE:-200}"
-CUTOFF="${CUTOFF:-0.6}"
-N_CTRL="${N_CTRL:-16}"
+N_TIMES="${N_TIMES:-41}"                # output times for REDUCE=max/mean
+RTOL="${RTOL:-1e-8}"
+ATOL="${ATOL:-1e-10}"
 ENVELOPE="${ENVELOPE:-constant}"      # constant (sharp lines) | raised_cosine
 REDUCE="${REDUCE:-max}"               # max avoids Rabi-phase aliasing; final = fixed duration
 LEVEL="${LEVEL:-1}"                   # 1 = |e>, 2 = |f>
@@ -72,7 +75,7 @@ mkdir -p "$(dirname "${PREFIX}")"
 
 COMMON=(--f-lo "${F_LO}" --f-hi "${F_HI}" --f-points "${F_POINTS}"
         --amp-lo "${AMP_LO}" --amp-hi "${AMP_HI}" --amp-points "${AMP_POINTS}"
-        --probe-ns "${PROBE}" --cutoff-GHz "${CUTOFF}" --n-ctrl "${N_CTRL}"
+        --probe-ns "${PROBE}" --n-times "${N_TIMES}" --rtol "${RTOL}" --atol "${ATOL}"
         --envelope "${ENVELOPE}" --reduce "${REDUCE}" --level "${LEVEL}"
         --target-mode "${TARGET_MODE}")
 [ -n "${SPEC_ABS:-}" ] && COMMON+=(--spec-abs-GHz "${SPEC_ABS}")
