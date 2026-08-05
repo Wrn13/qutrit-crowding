@@ -17,16 +17,25 @@ no rotating frame and no carrier cutoff here, so every multiphoton process the
 model contains appears -- and the map is directly comparable to sweep results,
 which use the same solver. QuTiP is therefore REQUIRED.
 
-WHAT THIS MODEL CAN AND CANNOT SHOW
------------------------------------
-The drive enters through the coupler nonlinearity ``sum_n g_n X(t)^n``. A cubic
-(g3) truncation gives at most two drive quanta alongside one mode operator, so it
-supports the direct line (ge) and the second subharmonic (ge/2) -- but NOT ge/3.
-For a third subharmonic the expansion must reach fourth order: put ``g4_GHz`` in
-the device (``nonlinearities={4: ...}``), and correspondingly higher orders for
-ge/6. If a published map shows ge/3 or eh/6, reproducing those features requires
-those higher-order terms; with g3 alone they are absent by construction, not
-because the scan missed them.
+MULTIPHOTON ORDERS
+------------------
+The drive enters through the coupler nonlinearity ``sum_n g_n X(t)^n``. At FIRST
+order in a cubic (g3) truncation the drive supplies at most two quanta alongside a
+mode operator, so only ge and ge/2 appear. But the solver integrates the exact
+Hamiltonian, and HIGHER orders in g3 generate higher multiphoton processes, so
+ge/3, ge/4, ... are present too -- progressively weaker. Verified against an
+independent lab-frame integration at g4 = 0 (w_a = 4.6 GHz, eta = 1.2, 85 ns):
+peak |e> population 0.99 at ge/2, 0.51 at ge/3, 0.05 at ge/4. Do NOT assume a
+subharmonic is absent because g4 = 0.
+
+ALLOCATION WARNING
+------------------
+These subharmonics are spurious excitation channels, and they can land on the gate
+pump. With w_q/n = w_p the iSWAP drive also drives a mode out of the ground state.
+For a pair (w_a, w_b) the dangerous coincidences are w_a/n = w_b - w_a, i.e.
+w_b = w_a (1 + 1/n): n=2 -> 1.5 w_a, n=3 -> 1.333 w_a, n=4 -> 1.25 w_a. The
+example device (4.6, 5.7) sits 50 MHz from the n=4 case (w_b = 5.75), so its
+ge/4 line at 1.150 GHz is only 50 MHz from the 1.100 GHz pump.
 
 CLI
 ---
@@ -100,12 +109,13 @@ def _reduce_populations(pops: np.ndarray, reduce: str) -> float:
 # scan
 # --------------------------------------------------------------------------- #
 def transition_lines(config: Dict[str, Any], mode: int = 0,
-                     orders: Sequence[int] = (1, 2, 3),
+                     orders: Sequence[int] = (1, 2, 3, 4),
                      exchange: bool = True) -> Dict[str, float]:
     """Expected drive frequencies of ge / ef features and their subharmonics.
 
     ``ge`` sits at the mode frequency and ``ef`` one anharmonicity below it; the
-    n-th subharmonic of a transition at w is at w / n.
+    n-th subharmonic of a transition at w is at w / n. Orders up to 4 are included
+    by default because higher orders in g3 populate them even when g4 = 0.
     """
     freqs = list(np.asarray(config["qubit_freqs_GHz"], dtype=float))
     w_ge = float(freqs[mode])
@@ -395,9 +405,30 @@ def merge_shards(prefix: str, out_npz: Optional[str] = None) -> Dict[str, Any]:
             merged = dict(freqs_GHz=part["freqs_GHz"], amps=part["amps"],
                           Z=np.full_like(part["Z"], np.nan),
                           lines=part["lines"], meta=dict(part["meta"]))
-        elif (len(part["freqs_GHz"]) != len(merged["freqs_GHz"])
-              or len(part["amps"]) != len(merged["amps"])):
-            raise SystemExit(f"{path}: axes do not match the other shards")
+        else:
+            # Validate axis VALUES, not just lengths: two runs with the same point
+            # count but different F_LO/F_HI would otherwise merge silently and
+            # relabel every feature's frequency.
+            for name in ("freqs_GHz", "amps"):
+                if len(part[name]) != len(merged[name]):
+                    raise SystemExit(f"{path}: {name} has {len(part[name])} points but "
+                                     f"the other shards have {len(merged[name])}")
+                if not np.allclose(part[name], merged[name], rtol=0, atol=1e-9):
+                    raise SystemExit(
+                        f"{path}: {name} values differ from the other shards "
+                        f"([{part[name][0]:.6g}..{part[name][-1]:.6g}] vs "
+                        f"[{merged[name][0]:.6g}..{merged[name][-1]:.6g}]). These "
+                        f"shards are from DIFFERENT scans -- merging them would put "
+                        f"data at the wrong frequencies. Re-run one scan with a "
+                        f"single set of axis settings.")
+            # physics settings must match too, or columns are not comparable
+            for key in ("probe_ns", "envelope", "reduce", "level", "target_mode",
+                        "init_occ", "qubit_freqs_GHz", "coupler_freq_GHz",
+                        "anharm_qubit_GHz", "g3_GHz", "g4_GHz", "spec_abs_GHz"):
+                a, b = merged["meta"].get(key), part["meta"].get(key)
+                if a != b:
+                    raise SystemExit(f"{path}: meta[{key!r}] = {b!r} but the other "
+                                     f"shards have {a!r}; these are different scans")
         cols = part["meta"].get("columns")
         cols = range(part["Z"].shape[1]) if cols is None else cols
         for jf in cols:
@@ -473,6 +504,44 @@ def report_missing(prefix: str, nshards: Optional[int] = None) -> Dict[str, Any]
     else:
         print("pass --nshards to map these columns back to shard indices")
     return out
+
+
+def inspect_scan(path: str) -> Dict[str, Any]:
+    """Print the axes and physics metadata stored with a scan.
+
+    Use this before trusting a map: it shows the frequency/amplitude axes actually
+    stored, the probe and reduction, the initial state, and the device parameters --
+    which together determine where features are EXPECTED, so a shifted line can be
+    checked against them rather than guessed at.
+    """
+    r = load_scan(path)
+    f, a, m = r["freqs_GHz"], r["amps"], r["meta"]
+    df = (f[1] - f[0]) * 1e3 if len(f) > 1 else float("nan")
+    print(f"{path}")
+    print(f"  freq axis : {f[0]:.6f} .. {f[-1]:.6f} GHz, {len(f)} pts, df = {df:.3f} MHz")
+    print(f"  amp axis  : {a[0]:.4f} .. {a[-1]:.4f}, {len(a)} pts")
+    print(f"  probe     : {m.get('probe_ns')} ns  -> linewidth ~ "
+          f"{1e3 / float(m.get('probe_ns', np.nan)):.2f} MHz")
+    print(f"  envelope  : {m.get('envelope')}   reduce: {m.get('reduce')}")
+    print(f"  observable: mode {m.get('target_mode')} level {m.get('level')}, "
+          f"init = {m.get('init_occ') or 'ground'}")
+    print(f"  device    : qubits {m.get('qubit_freqs_GHz')} coupler "
+          f"{m.get('coupler_freq_GHz')} alpha {m.get('anharm_qubit_GHz')} "
+          f"g3 {m.get('g3_GHz')} g4 {m.get('g4_GHz')}")
+    gaps = missing_columns(r)
+    if gaps:
+        print(f"  GAPS      : {len(gaps)} empty column(s)")
+    wq = m.get("qubit_freqs_GHz")
+    if wq and len(wq) > 1:
+        print(f"  expected swap |w_b - w_a| = {abs(float(wq[1]) - float(wq[0])):.6f} GHz")
+    # where the peak actually is, per amplitude row, for comparison
+    Z = r["Z"]
+    if np.isfinite(Z).any():
+        ia = int(np.nanargmax(np.nanmax(Z, axis=1)))
+        jf = int(np.nanargmax(Z[ia]))
+        print(f"  observed peak: {f[jf]:.6f} GHz at amp {a[ia]:.3f} "
+              f"(value {Z[ia, jf]:.4f})")
+    return r
 
 
 # --------------------------------------------------------------------------- #
@@ -565,6 +634,9 @@ def main() -> None:
                          "grows with drive frequency, balances across tasks.")
     ap.add_argument("--nshards", type=int, default=None,
                     help="array sharding: total number of shards")
+    ap.add_argument("--inspect", default=None,
+                    help="print the axes, probe, observable and device metadata "
+                         "stored in a .npz, plus where its peak actually is")
     ap.add_argument("--missing", default=None,
                     help="diagnose blank stripes: report which columns (and with "
                          "--nshards, which shard indices) are absent, and print the "
@@ -579,6 +651,9 @@ def main() -> None:
     ap.add_argument("--no-annotate", action="store_true")
     args = ap.parse_args()
 
+    if args.inspect:
+        inspect_scan(args.inspect)
+        return
     if args.missing:
         report_missing(args.missing, args.nshards)
         return
