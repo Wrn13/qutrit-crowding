@@ -1,74 +1,216 @@
 #!/bin/bash
 #SBATCH --job-name=snail_sweep
-# IMPORTANT: #SBATCH directives are parsed by sbatch BEFORE any shell runs, so
-# they CANNOT see $OUTDIR or any runtime variable, and the directory named here
-# must already exist or the task fails at launch with no log. We therefore write
-# logs to the submit directory (which always exists). To route logs into OUTDIR
-# instead, create it first and override on the CLI, e.g.:
-#   mkdir -p results_zhou/logs
-#   sbatch -o results_zhou/logs/point_%A_%a.out -e results_zhou/logs/point_%A_%a.err \
-#          --array=0-119 snail_sweep.slurm
+# NOTE: #SBATCH directives are parsed by sbatch BEFORE any shell runs, so they
+# CANNOT reference $OUTDIR/$DEVICE, and any directory in --output must already
+# exist. These land in the submit directory; move them afterwards if you prefer.
 #SBATCH --output=snail_sweep_%A_%a.out
 #SBATCH --error=snail_sweep_%A_%a.err
-#SBATCH --array=0-59%32          # OVERRIDE on submit: sbatch --array=0-<M-1> snail_sweep.slurm
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12        # 1 for plain sweeps; for --stark raise this (e.g. 8-16)
-                                 # so the per-point chevron parallelizes over its offsets
-                                 # (mode=point auto-uses SLURM_CPUS_PER_TASK). Override:
-                                 #   sbatch --cpus-per-task=12 --array=... slurm/snail_sweep.slurm
-#SBATCH --mem-per-cpu=4G
-#SBATCH --time=12:30:00          # per-point wall limit; raise for large N / long t_g
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=wcalphon@syr.edu   # NOTE: on an array, ALL e-mails per task (120!);
-                                       # use --mail-type=END,FAIL to cut the volume
-# --- REQUIRED ON MOST CLUSTERS: set these or sbatch will REJECT the job ------
-# (a rejected submit also shows nothing in squeue and writes no logs)
-# #SBATCH --partition=cpu        # uncomment / edit for your cluster
+#SBATCH --cpus-per-task=12        # one point per task. Cores are used by (a) the
+                                 # per-point --stark chevron when STARK=1
+                                 # (stark_jobs = cpus-per-task), else (b) BLAS on
+                                 # small matrices (dim 45-135), where gains are modest.
+#SBATCH --mem=8G
+#SBATCH --time=12:00:00          # PER TASK, and with CHUNK>1 one task runs CHUNK
+                                 # points IN SERIES -- scale this up accordingly.
+                                 # Rough per-point cost (integrate=true):
+                                 #   plain iSWAP fidelity ...... seconds to ~1 min
+                                 #   + --drag-compare .......... x2
+                                 #   + --stark ................. + chevron scan
+                                 #                               (stark_points x t)
+                                 #   + --calibrate ............. x(3-10), the tune-up
+                                 #   + GRAPE reduced ........... + ~1-5 min
+                                 #   + GRAPE qutip (GOAT/JOPT) . + ~10 min to hours
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=wcalphon@syr.edu
+# #SBATCH --partition=cpu        # set to your partition
 # #SBATCH --account=YOUR_ALLOC
-# ----------------------------------------------------------------------------
-
-# One array task == one (channel, spec_freq, lam_spec, drag) grid point.
-#   1) uv run run_sweep_zhou.py prepare --outdir results_zhou/   # prints the range
-#   2) RUNNER=run_sweep_zhou.py OUTDIR=results_zhou/ \
-#          sbatch --array=0-<M-1> snail_sweep.slurm              # use the printed range
-#   3) collect (dependent job, see snail_collect.slurm) or:
-#          uv run run_sweep_zhou.py collect --outdir results_zhou/
-# The `%32` in --array caps concurrently running tasks at 32.
+#
+# =============================================================================
+# ARRAY sweep driver for run_sweep_zhou.py  (mode=point, one point per task)
+# =============================================================================
+# The grid is written ONCE by `prepare` into <OUTDIR>/grid.json; each array task
+# then evaluates its own slice and writes <OUTDIR>/points/point_XXXXX.npz.
+# Requires QuTiP on the compute nodes (integrate=true drives qt.sesolve);
+# `prepare`/`collect`/`missing` need only numpy+scipy and run fine on a login node.
+#
+# -----------------------------------------------------------------------------
+# WORKFLOW  (copy-paste; run steps 1/3/5 on the login node)
+# -----------------------------------------------------------------------------
+# 1. Build the grid. ALL physics/grid choices go here (see PREPARE-TIME below):
+#      uv run python run_sweep_zhou.py prepare --sweep target \
+#          --device evan_device.json --target-eta 0.9 \
+#          --drag-compare --outdir results/allocation
+#    It prints the exact submit line, and switches to CHUNK automatically if the
+#    point count exceeds a typical SLURM MaxArraySize.
+#
+# 2. Submit exactly what step 1 printed, e.g.:
+#      OUTDIR=results/allocation sbatch --array=0-269 slurm/snail_sweep.slurm
+#    or, chunked (one task runs CHUNK points in series -- raise --time):
+#      OUTDIR=results/allocation CHUNK=4 sbatch --array=0-67 slurm/snail_sweep.slurm
+#
+# 3. Find gaps (a point file is written only on success, so a missing file = a
+#    failed/killed task):
+#      uv run python run_sweep_zhou.py missing --outdir results/allocation
+#    -> writes results/allocation/missing.txt and prints a RESUME= line.
+#
+# 4. Resubmit only the gaps (array is 0..M-1 over the LIST, so scattered indices
+#    are fine):
+#      RESUME=results/allocation/missing.txt OUTDIR=results/allocation \
+#          sbatch --array=0-11 slurm/snail_sweep.slurm
+#
+# 5. Collect to summary.csv (+ prints the best placement / mean DRAG gain):
+#      uv run python run_sweep_zhou.py collect --outdir results/allocation
+#      uv run python run_sweep_zhou.py chevrons --outdir results/allocation  # if --stark
+#
+# Small grids don't need the array at all -- pool them on one fat node:
+#      MODE=local NPROC=16 OUTDIR=results/allocation sbatch slurm/snail_sweep.slurm
+#
+# -----------------------------------------------------------------------------
+# WHICH FLAGS GO WHERE  (this trips people up -- read once)
+# -----------------------------------------------------------------------------
+# `mode=point` LOADS THE CONFIG FROM grid.json, which overwrites anything passed
+# on the command line. run_sweep_zhou re-applies only a specific set afterwards.
+#
+#   RUN-TIME (settable here, per task -- safe to add on a rerun of an existing grid):
+#       STARK, STARK_MATCH, STARK_JOBS, DRAG_SUBHARM, SUBHARM_MODES,
+#       and every GRAPE knob (GRAPE, GRAPE_BACKEND, GRAPE_ALG, GRAPE_NBASIS,
+#       GRAPE_NCTRL, GRAPE_CUTOFF, GRAPE_MAXITER, GRAPE_WARMSTART)
+#
+#   PREPARE-TIME ONLY (silently ignored if passed at task time -- they must be on
+#   the `prepare` command, because they are baked into grid.json):
+#       --device, --sweep, --t-g-ns / --target-eta, --calibrate,
+#       --calibrate-iters, --drag, --drag-compare, --drag-compare-below-MHz,
+#       --no-spectator, --no-integrate, --operating-point, --stark-span-MHz,
+#       --stark-points, and all grid axes (--wb-GHz, --spec-GHz, --specfreqs,
+#       --beats, --beat-span-MHz, --clip-band, --drags)
+#
+#   So: `--stark` can be turned on here, but its SPAN/POINTS come from the grid.
+#
+# -----------------------------------------------------------------------------
+# ENVIRONMENT VARIABLES
+# -----------------------------------------------------------------------------
+#   OUTDIR    (required) sweep directory containing grid.json
+#   RUNNER    driver script                              [run_sweep_zhou.py]
+#   MODE      point (array) | local (pool on one node)   [point]
+#   CHUNK     points per array task, in series           [1]
+#   RESUME    resume-list file from `missing`            [unset]
+#   NPROC     worker processes for MODE=local            [cpus-per-task]
+#   LAUNCHER  how to invoke python                       [uv run python]
+#   CODE_DIR  where the .py files live                   [submit dir]
+#   GRID      explicit path to grid.json                 [OUTDIR/grid.json]
+#
+#   STARK=1           per-point AC-Stark chevron (drive at the shifted resonance)
+#   STARK_MATCH=1     chevron uses the ACTUAL pulse (so DRAG-on points calibrate
+#                     onto the DRAG-on resonance); needs STARK=1
+#   STARK_JOBS=n      processes for the chevron's offset scan [cpus-per-task]
+#   DRAG_SUBHARM=1    include w_i/2 = w_p subharmonic channels in the DRAG target
+#   SUBHARM_MODES=a,b restrict which modes' subharmonics are considered
+#
+#   GRAPE=1           per-point optimal control; adds grape_baseline_F / F_grape /
+#                     dF_grape / leak_grape to summary.csv and stores the optimized
+#                     envelope in the point .npz. Needs the integrated run.
+#   GRAPE_BACKEND     qutip (qutip-qoc GOAT/JOPT, exact propagation, SLOW) |
+#                     reduced (in-house scipy over the rotating-frame model, fast)
+#                                                        [qutip]
+#   GRAPE_ALG         GOAT | JOPT   (qutip backend; JOPT needs qutip-jax + jax) [GOAT]
+#   GRAPE_NBASIS      sin() basis functions per quadrature (qutip backend)      [6]
+#   GRAPE_NCTRL       control points (reduced) / tlist resolution (qutip)       [24]
+#   GRAPE_CUTOFF      rotating-frame carrier cutoff in GHz                      [1.0]
+#   GRAPE_MAXITER     optimizer iteration cap                                   [200]
+#   GRAPE_WARMSTART=1 on DRAG-off points, seed from a DRAG pulse at the nearest
+#                     beat (better start near a collision; auto-skipped inside the
+#                     drag-skip window, where the 1/beat quadrature blows up)
+#
+# RECOMMENDED GRAPE STRATEGY: the qutip backend integrates the exact gradient
+# system every iteration, so it is minutes-to-hours PER POINT. Sweep broadly with
+# GRAPE_BACKEND=reduced, then re-run the interesting rows with GRAPE_BACKEND=qutip
+# as the exact cross-check:
+#   GRAPE=1 GRAPE_BACKEND=reduced OUTDIR=... sbatch --array=0-269 slurm/snail_sweep.slurm
+#   GRAPE=1 GRAPE_BACKEND=qutip RESUME=picked.txt OUTDIR=... sbatch --array=0-9 ...
+# (`picked.txt` is just a hand-written list of point indices, one per line -- the
+#  RESUME mechanism does not care that it came from `missing`.)
+# =============================================================================
 set -euo pipefail
 
-OUTDIR="${OUTDIR:-results/results_zhou}"
-RUNNER="${RUNNER:-run_sweep_zhou.py}"   # the Zhou-coupler sweep driver
-LAUNCHER="${LAUNCHER:-uv run python}"   # how to invoke python; e.g. "python" after activating a venv
-CHUNK="${CHUNK:-1}"                      # points per array task; set >1 when N > MaxArraySize
-                                        #   (array size = ceil(N/CHUNK)); e.g. CHUNK=25 for 11551 pts
-RESUME="${RESUME:-}"                     # path to a resume list (e.g. ${OUTDIR}/missing.txt) from
-                                        #   `missing`; --index then selects the chunk-th slice of it.
-RESUME_FLAG=""; [ -n "${RESUME}" ] && RESUME_FLAG="--resume-list ${RESUME}"
-GPU_FLAG=""; [ -n "${GPU:-}" ] && GPU_FLAG="--gpu"   # GPU=1 -> qutip-jax/diffrax; also add "#SBATCH --gres=gpu:1"
+OUTDIR="${OUTDIR:?set OUTDIR=<sweep dir containing grid.json>}"
+RUNNER="${RUNNER:-run_sweep_zhou.py}"
+MODE="${MODE:-point}"
+CHUNK="${CHUNK:-1}"
+LAUNCHER="${LAUNCHER:-uv run python}"
+NPROC="${NPROC:-${SLURM_CPUS_PER_TASK:-4}}"
+
+cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
+
+GRID_PATH="${GRID:-${OUTDIR}/grid.json}"
+if [ ! -f "${GRID_PATH}" ]; then
+    echo "ERROR: no grid at ${GRID_PATH} -- run \`${RUNNER} prepare\` first." >&2
+    exit 2
+fi
+
+if [ "${MODE}" != "local" ] && [ -z "${SLURM_ARRAY_TASK_ID:-}" ]; then
+    echo "ERROR: MODE=point needs an ARRAY job. Submit the line that \`prepare\` printed," >&2
+    echo "       e.g.  OUTDIR=${OUTDIR} sbatch --array=0-<N-1> slurm/snail_sweep.slurm" >&2
+    echo "       (or pool on a single node with  MODE=local NPROC=16 ...)" >&2
+    exit 2
+fi
+
+# ---- assemble the run-time flags that SURVIVE load_grid (see notes above) ----
+OPTS=""
+[ -n "${STARK:-}"         ] && OPTS="${OPTS} --stark"
+[ -n "${STARK_MATCH:-}"   ] && OPTS="${OPTS} --stark-match-pulse"
+[ -n "${STARK_JOBS:-}"    ] && OPTS="${OPTS} --stark-jobs ${STARK_JOBS}"
+[ -n "${DRAG_SUBHARM:-}"  ] && OPTS="${OPTS} --drag-subharmonic"
+[ -n "${SUBHARM_MODES:-}" ] && OPTS="${OPTS} --subharmonic-modes ${SUBHARM_MODES}"
+[ -n "${GRAPE:-}"           ] && OPTS="${OPTS} --grape"
+[ -n "${GRAPE_WARMSTART:-}" ] && OPTS="${OPTS} --grape-warmstart-drag"
+[ -n "${GRAPE_BACKEND:-}"   ] && OPTS="${OPTS} --grape-backend ${GRAPE_BACKEND}"
+[ -n "${GRAPE_ALG:-}"       ] && OPTS="${OPTS} --grape-alg ${GRAPE_ALG}"
+[ -n "${GRAPE_NBASIS:-}"    ] && OPTS="${OPTS} --grape-nbasis ${GRAPE_NBASIS}"
+[ -n "${GRAPE_NCTRL:-}"     ] && OPTS="${OPTS} --grape-nctrl ${GRAPE_NCTRL}"
+[ -n "${GRAPE_CUTOFF:-}"    ] && OPTS="${OPTS} --grape-cutoff-GHz ${GRAPE_CUTOFF}"
+[ -n "${GRAPE_MAXITER:-}"   ] && OPTS="${OPTS} --grape-maxiter ${GRAPE_MAXITER}"
+[ -n "${GRID:-}"            ] && OPTS="${OPTS} --grid ${GRID}"
+
+# ---- threads: avoid oversubscription when the job forks worker processes ------
+# The chevron (STARK) and MODE=local both fork; pin BLAS to 1 thread there.
+if [ "${MODE}" = "local" ] || [ -n "${STARK:-}" ]; then
+    export OMP_NUM_THREADS=1
+else
+    export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
+fi
+export MKL_NUM_THREADS="${OMP_NUM_THREADS}" OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
+export MPLBACKEND=Agg
+
+# module load python/3.12      # or: conda activate qsim
+# source .venv/bin/activate    # (then set LAUNCHER=python)
+# GRAPE_BACKEND=qutip additionally needs: pip install qutip-qoc  (+ qutip-jax jax for JOPT)
+
 mkdir -p "${OUTDIR}/points"
 
-# Keep numerical libraries single-threaded: we parallelize over array tasks.
-export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
+echo "host=$(hostname) job=${SLURM_JOB_ID:-none} array=${SLURM_ARRAY_JOB_ID:-none}:${SLURM_ARRAY_TASK_ID:-none}"
+echo "mode=${MODE} outdir=${OUTDIR} grid=${GRID_PATH} chunk=${CHUNK} opts=${OPTS:-<none>}"
+echo "start=$(date -Is)"
 
-# --- environment: pick ONE for your cluster (uv works from the project dir) --
-# module load python/3.12               # (Lmod site module), or:
-# source ~/miniconda3/etc/profile.d/conda.sh && conda activate qsim   # then LAUNCHER=python, or:
-# source /path/to/venv/bin/activate                                   # then LAUNCHER=python
-# GPU (optional): request a device and install a CUDA-enabled JAX, e.g.
-#   #SBATCH --gres=gpu:1
-#   module load cuda cudnn ; uv pip install "qutip-jax" "jax[cuda12]"
-#   GPU only helps for large Hilbert spaces (many modes/levels); small couplers are faster on CPU.
-# ----------------------------------------------------------------------------
+if [ "${MODE}" = "local" ]; then
+    # One node pools all points; no array needed.
+    srun ${LAUNCHER} "${RUNNER}" local --outdir "${OUTDIR}" --nproc "${NPROC}" ${OPTS}
+else
+    RESUME_OPT=""
+    if [ -n "${RESUME:-}" ]; then
+        [ -f "${RESUME}" ] || { echo "ERROR: RESUME file ${RESUME} not found" >&2; exit 2; }
+        RESUME_OPT="--resume-list ${RESUME}"
+        echo "resume-list=${RESUME} ($(wc -l < "${RESUME}") indices); --index is the CHUNK"
+        echo "  position into that list, not a grid index."
+    fi
+    srun ${LAUNCHER} "${RUNNER}" point \
+        --outdir "${OUTDIR}" \
+        --index "${SLURM_ARRAY_TASK_ID}" \
+        --chunk "${CHUNK}" \
+        ${RESUME_OPT} ${OPTS}
+fi
 
-# Run from the code root (the time_dependent_solver/ folder, parent of slurm/).
-# Submit from there:  sbatch slurm/snail_sweep.slurm   (or set CODE_DIR to that folder).
-cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
-echo "host=$(hostname) job=${SLURM_ARRAY_JOB_ID} task=${SLURM_ARRAY_TASK_ID} runner=${RUNNER} outdir=${OUTDIR} resume=${RESUME:-none} gpu=${GPU:-0} start=$(date -Is)"
-
-srun ${LAUNCHER} "${RUNNER}" point ${GPU_FLAG} ${RESUME_FLAG} \
-    --outdir "${OUTDIR}" \
-    --grid   "${OUTDIR}/grid.json" \
-    --chunk  "${CHUNK}" \
-    --index  "${SLURM_ARRAY_TASK_ID}"
-
-echo "done task=${SLURM_ARRAY_TASK_ID} end=$(date -Is)"
+echo "done end=$(date -Is)"
+echo
+echo "NEXT:  ${RUNNER} missing  --outdir ${OUTDIR}   # gaps + resubmit line"
+echo "       ${RUNNER} collect  --outdir ${OUTDIR}   # -> summary.csv"

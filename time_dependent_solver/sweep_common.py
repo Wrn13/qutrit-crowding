@@ -752,6 +752,7 @@ __all__ = [
     'load_grid',
     '_stark_offset_GHz',
     '_nearest_collision',
+    '_grape_augment',
     'save_point',
     'collect',
     'plot_chevrons',

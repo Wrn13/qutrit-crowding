@@ -516,6 +516,31 @@ def main() -> None:
     if config.get("stark_match_pulse") and not config.get("stark_drive"):
         print("note: stark_match_pulse has no effect without --stark (no per-point chevron).")
 
+    # GRAPE is a RUN-TIME choice too (it costs an optimization per point, so you may
+    # want it on a rerun of an existing grid, not baked in at prepare). Same
+    # convention: store_true only forces ON; a value already in the grid survives an
+    # absent flag, and the tunables override whenever explicitly passed.
+    if args.grape:
+        config["grape"] = True
+    if args.grape_warmstart_drag:
+        config["grape_warmstart_drag"] = True
+    if args.grape_backend is not None:
+        config["grape_backend"] = args.grape_backend
+    if args.grape_alg is not None:
+        config["grape_alg"] = args.grape_alg
+    if args.grape_nbasis is not None:
+        config["grape_nbasis"] = int(args.grape_nbasis)
+    if args.grape_nctrl is not None:
+        config["grape_nctrl"] = int(args.grape_nctrl)
+    if args.grape_cutoff_GHz is not None:
+        config["grape_cutoff_GHz"] = float(args.grape_cutoff_GHz)
+    if args.grape_maxiter is not None:
+        config["grape_maxiter"] = int(args.grape_maxiter)
+    if config.get("grape") and not config.get("integrate", True):
+        print("note: grape needs the integrated run; it has no effect with integrate=false.")
+    if config.get("grape_warmstart_drag") and not config.get("grape"):
+        print("note: grape_warmstart_drag has no effect without --grape.")
+
     # Per-point --stark chevron parallelism is a RUN-TIME choice (it depends on the
     # mode and the node allocation), not something baked into the grid: parallelize
     # in mode=point (one task = one point, so use the task's cores), keep it serial
