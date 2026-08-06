@@ -225,6 +225,17 @@ def main() -> None:
                          "(hardware-style per-point calibration); slowest, most faithful")
     ap.add_argument("--calibrate-iters", type=int, default=None,
                     help="amplitude/frequency rounds per point for --calibrate (default 1)")
+    ap.add_argument("--grape", action="store_true",
+                    help="per-point GRAPE optimal-control run (grape.optimize_pulse) on "
+                         "top of the integrated gate; records grape_baseline_F / F_grape / "
+                         "dF_grape / leak_grape and stores the optimized envelope. Opt-in "
+                         "and costly (an L-BFGS-B optimization per point); needs --integrate")
+    ap.add_argument("--grape-nctrl", type=int, default=None,
+                    help="GRAPE piecewise-constant control points (default 24)")
+    ap.add_argument("--grape-cutoff-GHz", type=float, default=None,
+                    help="GRAPE reduced-model carrier cutoff (default 1.0 GHz)")
+    ap.add_argument("--grape-maxiter", type=int, default=None,
+                    help="GRAPE L-BFGS-B iteration cap (default 200)")
     ap.add_argument("--drag", action="store_true",
                     help="force DRAG on for every allocation point (tuned to the nearest beat)")
     ap.add_argument("--operating-point", default=None,
@@ -327,6 +338,17 @@ def main() -> None:
         config["drag_compare"] = True
     if args.drag_compare_below_MHz is not None:
         config["drag_compare_below_MHz"] = float(args.drag_compare_below_MHz)
+    if args.grape:
+        config["grape"] = True
+        if not config.get("integrate", True):
+            print("note: --grape needs the integrated run; it has no effect with "
+                  "--no-integrate (nothing to optimize against).")
+    if args.grape_nctrl is not None:
+        config["grape_nctrl"] = int(args.grape_nctrl)
+    if args.grape_cutoff_GHz is not None:
+        config["grape_cutoff_GHz"] = float(args.grape_cutoff_GHz)
+    if args.grape_maxiter is not None:
+        config["grape_maxiter"] = int(args.grape_maxiter)
     if args.no_spectator:
         config["no_spectator"] = True
 

@@ -1,26 +1,39 @@
 """2D calibration landscape: pump frequency offset vs pump strength.
 
-Scans the (pump-frequency-offset, pump-amplitude) plane and evaluates the
-leakage-aware iSWAP fidelity (or the |01>->|10> transfer probability) at every
-point, so you can read off the global optimum directly instead of relying on
+Scans the (pump-frequency-offset, pump-amplitude) plane and scores each point by
+the leakage-aware iSWAP fidelity or the |01>->|10> transfer probability (the swap
+population), so the global optimum is read off directly instead of from
 alternating 1D amplitude/frequency scans (which rail when the AC-Stark shift and
-the Rabi amplitude feed back on each other). Propagation uses the same fast
-rotating-frame reduced model as ``grape.py`` (scipy expm, no QuTiP): the pump
-offset shifts the precomputed carriers, so the operator basis is built once.
+the Rabi amplitude feed back on each other).
 
-The output is a heatmap with the optimum marked. Validate the chosen
-(offset, amp) in the full QuTiP ``iswap_fidelity`` on the cluster.
+Two propagation engines, identical grid and output shape:
+  * engine='reduced' : the fast rotating-frame reduced model from ``grape.py``
+    (scipy expm, no QuTiP); the pump offset shifts precomputed carriers so the
+    operator basis is built once. Good for quick looks / weak-to-moderate drive.
+  * engine='qutip'   : compiled ``qt.sesolve`` on the FULL Hamiltonian via
+    ``ZhouCoupler.propagator_columns`` -- exact, the cluster path. A fresh coupler
+    is built per grid point through the usual ``build_coupler`` plumbing
+    (``build_system``), so the grid is embarrassingly parallel (``--jobs``) and
+    free of pump-mutation hazards, and DRAG / spectator context come along for
+    free exactly as in the reduced map.
+
+Results (offsets, amps, Z, leakage, optimum, operating point) are written to
+``--save-npz``; the heatmap with the optimum marked goes to ``--out``. At strong
+drive, raise the coupler truncation (``--coupler-levels``) and confirm the map is
+converged before trusting values in the bright/leaky region.
 
 CLI
 ---
     python calibration_map.py --device warren_device.json --t-g-ns 92.6 \
-        --wp-span-MHz 40 --amp-lo 0.6 --amp-hi 1.4 [--metric transfer]
+        --engine qutip --metric transfer --jobs 32 \
+        --wp-span-MHz 40 --amp-lo 0.6 --amp-hi 1.6 \
+        --save-npz figs/swap_map.npz --out figs/swap_map.png
 """
 from __future__ import annotations
 
 import argparse
 import os
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib
@@ -37,7 +50,7 @@ def scan(cpl, a: int, b: int, t_g: float, *,
          amp_lo: float = 0.6, amp_hi: float = 1.4, amp_points: int = 41,
          cutoff_GHz: float = 1.0, n_ctrl: int = 32, metric: str = "fidelity",
          carrier_resolution: float = 0.3) -> Dict[str, Any]:
-    """Scan (pump offset, amplitude) and score each point.
+    """Scan (pump offset, amplitude) and score each point with the REDUCED model.
 
     Parameters
     ----------
@@ -96,7 +109,60 @@ def scan(cpl, a: int, b: int, t_g: float, *,
     best = dict(amp_scale=float(amps[bi]), wp_offset_MHz=float(offsets[bj]),
                 score=float(Z[bi, bj]))
     return dict(offsets_MHz=offsets, amps=amps, Z=Z, best=best, metric=metric,
-                n_sub=n_sub, cutoff_GHz=cutoff_GHz, peak_eta=peak)
+                n_sub=n_sub, cutoff_GHz=cutoff_GHz, peak_eta=peak, engine="reduced")
+
+
+def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
+               t_g: float, *, wp_span_MHz: float = 40.0, wp_points: int = 41,
+               amp_lo: float = 0.6, amp_hi: float = 1.4, amp_points: int = 41,
+               metric: str = "transfer", atol: float = 1e-10, rtol: float = 1e-8,
+               nsteps: int = 500000, jobs: int = 1) -> Dict[str, Any]:
+    """QuTiP-exact analogue of ``scan``: identical grid and return shape, but every
+    point is a compiled ``qt.sesolve`` on the FULL Hamiltonian via
+    ``ZhouCoupler.propagator_columns`` -- no reduced model, no pruned terms.
+
+    ``build_fn(grid_amp, grid_off_MHz) -> (cpl, w_p, eta_pk)`` returns a FRESH
+    coupler with the grid point already folded into the pump (via the usual
+    ``build_system`` / ``device_utils.build_coupler`` plumbing), so points are
+    independent and safe to evaluate in parallel. Leakage is recorded for free
+    from the same 4x4 U. ``metric`` selects the colour ('transfer' = swap
+    population |U[2,1]|^2, or leakage-aware 'fidelity').
+    """
+    from zhou_coupler import ZhouCoupler
+    offsets = np.linspace(-wp_span_MHz / 2.0, wp_span_MHz / 2.0, wp_points)  # MHz
+    amps = np.linspace(amp_lo, amp_hi, amp_points)
+    _, _, eta_pk = build_fn(1.0, 0.0)                      # nominal amp=1 reference
+
+    def one(i: int, j: int, amp: float, off_MHz: float):
+        cpl, _w_p, _eta = build_fn(amp, off_MHz)
+        U = cpl.propagator_columns(0, 1, t_g, atol=atol, rtol=rtol, nsteps=nsteps)
+        fid, leak = ZhouCoupler._iswap_fidelity_from_U(U, True)
+        score = abs(U[2, 1]) ** 2 if metric == "transfer" else fid   # swap pop / F
+        return i, j, float(score), float(leak)
+
+    grid = [(i, j, a, o) for i, a in enumerate(amps) for j, o in enumerate(offsets)]
+    if jobs and jobs > 1:
+        from joblib import Parallel, delayed
+        out = Parallel(n_jobs=jobs, verbose=5)(
+            delayed(one)(i, j, a, o) for (i, j, a, o) in grid)
+    else:
+        out = []
+        for k, (i, j, a, o) in enumerate(grid):
+            out.append(one(i, j, a, o))
+            if (k + 1) % wp_points == 0:
+                print(f"  row {k // wp_points + 1}/{amp_points} "
+                      f"(amp_scale={a:.3f})")
+
+    Z = np.full((amp_points, wp_points), np.nan)
+    L = np.full((amp_points, wp_points), np.nan)
+    for i, j, s, l in out:
+        Z[i, j], L[i, j] = s, l
+
+    bi, bj = np.unravel_index(np.nanargmax(Z), Z.shape)
+    best = dict(amp_scale=float(amps[bi]), wp_offset_MHz=float(offsets[bj]),
+                score=float(Z[bi, bj]), leakage=float(L[bi, bj]))
+    return dict(offsets_MHz=offsets, amps=amps, Z=Z, leakage=L, best=best,
+                metric=metric, peak_eta=float(eta_pk), engine="qutip")
 
 
 def plot_map(result: Dict[str, Any], out: str = "figs/calibration_map.png",
@@ -123,12 +189,35 @@ def plot_map(result: Dict[str, Any], out: str = "figs/calibration_map.png",
                 bbox=dict(boxstyle="round", fc="#00000088", ec="none"))
     ax.set_xlabel(r"pump frequency offset  $\delta\omega_p$  (MHz)")
     ax.set_ylabel(r"pump strength  (amp scale, $\times\,\eta_{\rm nom}$)")
-    ax.set_title(title or f"iSWAP calibration landscape  ({metric})")
+    eng = result.get("engine", "reduced")
+    ax.set_title(title or f"iSWAP calibration landscape  ({metric}, {eng})")
     fig.tight_layout()
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     fig.savefig(out, bbox_inches="tight", facecolor="white")
     fig.savefig(out.rsplit(".", 1)[0] + ".pdf", bbox_inches="tight", facecolor="white")
     print("wrote", out, "and", out.rsplit(".", 1)[0] + ".pdf")
+
+
+def save_npz(result: Dict[str, Any], path: str) -> None:
+    """Persist the full scan (arrays + optimum + context + operating point) so the
+    map can be re-plotted or post-processed without re-solving."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    payload: Dict[str, Any] = dict(
+        offsets_MHz=result["offsets_MHz"], amps=result["amps"], Z=result["Z"],
+        metric=str(result["metric"]), peak_eta=float(result["peak_eta"]),
+        engine=str(result.get("engine", "reduced")))
+    if "leakage" in result:
+        payload["leakage"] = result["leakage"]
+    if "w_p_GHz" in result:
+        payload["w_p_GHz"] = float(result["w_p_GHz"])
+    for k, v in result["best"].items():
+        payload[f"best_{k}"] = v
+    for group in ("operating_point", "context"):
+        if group in result:
+            for k, v in result[group].items():
+                payload[f"{group[:3]}_{k}"] = (np.nan if v is None else v)
+    np.savez_compressed(path, **payload)
+    print("saved", path)
 
 
 def build_system(config: Dict[str, Any], t_g: float, *,
@@ -199,18 +288,42 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         wp_offset_GHz: float = 0.0, spec_abs_GHz: Optional[float] = None,
         wa_GHz: Optional[float] = None, wb_GHz: Optional[float] = None,
         delta_GHz: Optional[float] = None, drag_beat_GHz: Optional[float] = None,
+        engine: str = "reduced", coupler_levels: Optional[int] = None,
+        atol: float = 1e-10, rtol: float = 1e-8, nsteps: int = 500000,
+        jobs: int = 1, save_npz_path: Optional[str] = None,
         out: Optional[str] = "figs/calibration_map.png", title: Optional[str] = None,
         **kw) -> Dict[str, Any]:
-    """Build the system for the given sweep context, scan, plot, and return results.
+    """Build the system for the given sweep context, scan (reduced or QuTiP), plot,
+    optionally persist, and return results.
 
     The returned dict includes ``context`` (where it was calibrated) and
     ``operating_point`` (a record ready for ``operating_points.save_point``).
+    ``engine='qutip'`` runs the exact solver; both engines share the grid, the
+    ``best``/``operating_point`` bookkeeping, and the plot.
     """
+    if coupler_levels is not None:                     # truncation override, reused
+        config = {**config, "coupler_levels": int(coupler_levels)}
+
     cpl, w_p, eta_pk, context = build_system(
         config, t_g, wa_GHz=wa_GHz, wb_GHz=wb_GHz, delta_GHz=delta_GHz,
         spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz,
         amp_scale=amp_scale, wp_offset_GHz=wp_offset_GHz)
-    result = scan(cpl, 0, 1, t_g, **kw)
+
+    if engine == "qutip":
+        # per-point rebuild through the SAME plumbing, grid folded onto the nominal
+        def build_fn(grid_amp: float, grid_off_MHz: float):
+            return build_system(
+                config, t_g, wa_GHz=wa_GHz, wb_GHz=wb_GHz, delta_GHz=delta_GHz,
+                spec_abs_GHz=spec_abs_GHz, drag_beat_GHz=drag_beat_GHz,
+                amp_scale=amp_scale * grid_amp,
+                wp_offset_GHz=wp_offset_GHz + grid_off_MHz * 1e-3)[:3]
+        qkeys = ("wp_span_MHz", "wp_points", "amp_lo", "amp_hi", "amp_points", "metric")
+        qkw = {k: v for k, v in kw.items() if k in qkeys}
+        result = scan_qutip(build_fn, t_g, atol=atol, rtol=rtol, nsteps=nsteps,
+                            jobs=jobs, **qkw)
+    else:
+        result = scan(cpl, 0, 1, t_g, **kw)
+
     result["w_p_GHz"] = w_p
     result["context"] = context
     best = result["best"]
@@ -221,6 +334,8 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         metric=result["metric"], score=best["score"], **context)
     if out:
         plot_map(result, out=out, title=title)
+    if save_npz_path:
+        save_npz(result, save_npz_path)
     return result
 
 
@@ -239,17 +354,31 @@ def main() -> None:
                     help="spectator-sweep detuning Delta = w_b - w_spec (GHz)")
     ap.add_argument("--drag-beat-GHz", type=float, default=None,
                     help="map the DRAG-on gate, with the quadrature at this beat")
+    ap.add_argument("--engine", choices=["reduced", "qutip"], default="reduced",
+                    help="reduced rotating-frame model (fast, CPU) or exact QuTiP "
+                         "sesolve (pass --engine qutip for the trustworthy map)")
+    ap.add_argument("--coupler-levels", type=int, default=None,
+                    help="override device coupler truncation; bump at strong drive")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="joblib workers over the grid (QuTiP engine)")
+    ap.add_argument("--atol", type=float, default=1e-10)
+    ap.add_argument("--rtol", type=float, default=1e-8)
+    ap.add_argument("--nsteps", type=int, default=500000)
     ap.add_argument("--save-point", default=None,
                     help="save the optimum into the device JSON under this name")
     ap.add_argument("--overwrite", action="store_true",
                     help="allow --save-point to replace an existing point")
+    ap.add_argument("--save-npz", default=None,
+                    help="write the full scan (arrays + optimum + context) to this .npz")
     ap.add_argument("--wp-span-MHz", type=float, default=40.0)
     ap.add_argument("--wp-points", type=int, default=41)
     ap.add_argument("--amp-lo", type=float, default=0.6)
     ap.add_argument("--amp-hi", type=float, default=1.4)
     ap.add_argument("--amp-points", type=int, default=41)
-    ap.add_argument("--cutoff-GHz", type=float, default=1.0)
-    ap.add_argument("--metric", choices=["fidelity", "transfer"], default="fidelity")
+    ap.add_argument("--cutoff-GHz", type=float, default=1.0,
+                    help="reduced-engine carrier cutoff (ignored by --engine qutip)")
+    ap.add_argument("--metric", choices=["fidelity", "transfer"], default="fidelity",
+                    help="'transfer' colours by the swap population P(|01>->|10>)")
     ap.add_argument("--out", default="figs/calibration_map.png")
     args = ap.parse_args()
 
@@ -259,22 +388,26 @@ def main() -> None:
     cfg = load_device(device_path)
     result = run(cfg, args.t_g_ns, wa_GHz=args.wa_GHz, wb_GHz=args.wb_GHz,
                  spec_abs_GHz=args.spec_abs_GHz, delta_GHz=args.delta_GHz,
-                 drag_beat_GHz=args.drag_beat_GHz,
+                 drag_beat_GHz=args.drag_beat_GHz, engine=args.engine,
+                 coupler_levels=args.coupler_levels, atol=args.atol, rtol=args.rtol,
+                 nsteps=args.nsteps, jobs=args.jobs, save_npz_path=args.save_npz,
                  wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
                  amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
                  cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out)
     b, ctx = result["best"], result["context"]
     print(f"context: w_a={ctx['wa_GHz']} w_b={ctx['wb_GHz']} t_g={ctx['t_g_ns']} ns "
-          f"spec={ctx['spec_abs_GHz']} drag_beat={ctx['drag_beat_GHz']}")
+          f"spec={ctx['spec_abs_GHz']} drag_beat={ctx['drag_beat_GHz']} engine={args.engine}")
     print(f"optimum: wp_offset = {b['wp_offset_MHz']:+.2f} MHz, "
-          f"amp_scale = {b['amp_scale']:.4f}, {args.metric} = {b['score']:.5f}")
+          f"amp_scale = {b['amp_scale']:.4f}, {args.metric} = {b['score']:.5f}"
+          + (f", leak = {b['leakage']:.4f}" if "leakage" in b else ""))
     if args.save_point:
         from operating_points import save_point
         rec = save_point(device_path, args.save_point, result["operating_point"],
                          overwrite=args.overwrite)
         print(f"saved operating point {args.save_point!r} to {device_path}: "
               f"amp_scale={rec['amp_scale']:.4f}, wp_offset={rec['wp_offset_GHz']:+.6f} GHz")
-    print("  (validate this (offset, amp) in the full QuTiP iswap_fidelity)")
+    if args.engine == "reduced":
+        print("  (reduced model -- validate this (offset, amp) with --engine qutip)")
 
 
 if __name__ == "__main__":

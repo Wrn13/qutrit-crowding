@@ -54,6 +54,16 @@ DEFAULT_CONFIG = {
                                      #   it inside ~a few x g_iswap of the collision blows the
                                      #   gate up (population dumped into the coupler). Set to a
                                      #   few x g_iswap for your device.
+    # GRAPE optimal-control add-on (--grape): per point, optimize the pump
+    # envelope (grape.optimize_pulse, reduced rotating-frame model) and record the
+    # optimized fidelity + headroom over the DRAG/raised-cosine baseline. Opt-in
+    # and costly (an L-BFGS-B run per point); validate the winning pulse in the
+    # full QuTiP iswap_fidelity separately. Scores use the SAME leakage-aware
+    # metric as the sweep, so grape_baseline_F tracks F_avg.
+    "grape":            False,       # run GRAPE at each integrated point
+    "grape_nctrl":      24,          # piecewise-constant control points
+    "grape_cutoff_GHz": 1.0,         # reduced-model carrier cutoff for the optimizer
+    "grape_maxiter":    200,         # L-BFGS-B iteration cap
     # pulse / solver
     "t_g_ns":   60.0,
     "envelope": "raised_cosine",
@@ -289,6 +299,42 @@ def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
         nearest = (0.0, 0.0, "none", "-", -1)
     return nearest
 
+def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
+                   config: Dict[str, Any], drag_beat_GHz: Optional[float] = None) -> None:
+    """Run GRAPE on the already-built point coupler and record the result in-place.
+
+    Optimizes the pump envelope with ``grape.optimize_pulse`` (reduced rotating-
+    frame model, QuTiP-free) against the SAME leakage-aware iSWAP metric the sweep
+    uses, so ``grape_baseline_F`` is comparable to the QuTiP ``F_avg``. The
+    baseline is the DRAG/raised-cosine gate actually applied at this point
+    (``drag_beat_GHz`` = the applied beat, or None for the plain gate), so
+    ``dF_grape`` is the optimal-control headroom over that gate.
+
+    Writes ``F_grape``, ``leak_grape``, ``dF_grape`` (F_grape - grape_baseline_F),
+    ``grape_baseline_F``, ``grape_nfev``; stashes the optimized envelope under
+    ``out["_grape"]`` for ``save_point`` to persist for later QuTiP validation.
+    The optimized pulse is a reduced-model result -- validate it in the full
+    ``iswap_fidelity`` before trusting the absolute number.
+    """
+    import grape
+    res = grape.optimize_pulse(
+        cpl, a, b, float(config["t_g_ns"]),
+        n_ctrl=int(config.get("grape_nctrl", 24)),
+        cutoff_GHz=float(config.get("grape_cutoff_GHz", 1.0)),
+        drag_beat_GHz=drag_beat_GHz,
+        maxiter=int(config.get("grape_maxiter", 200)))
+    out["grape_baseline_F"] = round(float(res["F_baseline"]), 6)
+    out["F_grape"] = round(float(res["F_grape"]), 6)
+    out["leak_grape"] = round(float(res["leak_grape"]), 6)
+    out["dF_grape"] = round(float(res["F_grape"] - res["F_baseline"]), 6)
+    out["grape_nfev"] = int(res["nfev"])
+    eta = np.asarray(res["eta_opt"], dtype=complex)
+    out["_grape"] = dict(eta_opt=eta, n_ctrl=int(res["n_ctrl"]),
+                         cutoff_GHz=float(res["cutoff_GHz"]),
+                         drag_beat_GHz=(np.nan if drag_beat_GHz is None
+                                        else float(drag_beat_GHz)))
+
+
 def save_point(result: Dict[str, Any], outdir: str) -> str:
     """Persist one result row to ``<outdir>/points/point_XXXXX.npz``.
 
@@ -310,7 +356,14 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
     if U is None:
         U = np.zeros((4, 4), dtype=complex)
     chev = result.pop("_chevron", None)        # popped before JSON so meta stays scalar
+    grp = result.pop("_grape", None)           # GRAPE optimized envelope (array) -> extra
     extra: Dict[str, Any] = {}
+    if grp is not None:
+        eta = np.asarray(grp["eta_opt"], dtype=complex)
+        extra.update(grape_eta_real=np.real(eta), grape_eta_imag=np.imag(eta),
+                     grape_n_ctrl=np.asarray(grp["n_ctrl"], dtype=int),
+                     grape_cutoff_GHz=np.asarray(grp["cutoff_GHz"], dtype=float),
+                     grape_drag_beat_GHz=np.asarray(grp["drag_beat_GHz"], dtype=float))
     if chev is not None:
         extra = {"chev_offsets_GHz": np.asarray(chev["offsets_GHz"], dtype=float),
                  "chev_times_ns": np.asarray(chev["times_ns"], dtype=float),
@@ -359,6 +412,7 @@ def collect(outdir: str) -> None:
                  "beat_GHz", "nearest_kind", "nearest_target",
                  "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
+                 "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
                  "w_p_GHz", "stark_offset_MHz", "amp_scale_used", "wp_offset_used_MHz",
                  "w_spec_GHz", "t_g_ns", "wall_s"]
     target_cols = ["index", "kind", "wa_GHz", "wb_GHz", "w_snail_GHz",
@@ -367,7 +421,9 @@ def collect(outdir: str) -> None:
                    "drag_applied", "drag_compare_window", "eta_peak",
                    "g_iswap_eff_MHz", "nearest_beat_GHz", "nearest_kind",
                    "nearest_target", "g_collision_MHz", "status", "F_avg", "leakage",
-                   "F_avg_drag", "leakage_drag", "dF_drag", "n_spec", "n_coupler",
+                   "F_avg_drag", "leakage_drag", "dF_drag",
+                   "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
+                   "n_spec", "n_coupler",
                    "p_transfer", "t_g_ns", "wall_s"]
     is_target = bool(rows) and rows[0].get("kind") == "target"
     cols = target_cols if is_target else spec_cols
@@ -519,17 +575,20 @@ def _bool_list(s: Optional[str]) -> Optional[List[bool]]:
 def _log_line(res: Dict[str, Any]) -> str:
     """One-line human summary for a result row (both sweep kinds)."""
     f_str = res["F_avg"] if res.get("F_avg", "") != "" else "  --  "
+    grape_tail = (f" F_grape={res['F_grape']:.4f}(dF={res['dF_grape']:+.4f})"
+                  if isinstance(res.get("F_grape"), (int, float)) else "")
     if res.get("kind") == "target":
         tail = ""
         if isinstance(res.get("dF_drag"), (int, float)):
             tail = f" dF_drag={res['dF_drag']:+.4f}"
+        tail += grape_tail
         _ws = res.get("spec_GHz", "")
         wspec_str = f"{_ws:.3f}" if isinstance(_ws, (int, float)) else "bare"
         return (f"wb={res['wb_GHz']:.3f} wspec={wspec_str} wp={res['w_p_GHz']:.3f} "
                 f"nearest={res['nearest_beat_GHz']:+.3f}GHz({res['nearest_kind']}) "
                 f"g_coll={res['g_collision_MHz']}MHz F={f_str}{tail}")
     return (f"beat={res['beat_GHz']:+.3f}GHz drag={res['drag_applied']} "
-            f"eta={res['eta_peak']:.3f} g_spec={res['g_spec_eff_MHz']:.3f}MHz F={f_str}")
+            f"eta={res['eta_peak']:.3f} g_spec={res['g_spec_eff_MHz']:.3f}MHz F={f_str}{grape_tail}")
 
 def _print_submit_hint(outdir: str, m: int, max_array: int = 1000) -> None:
     """Print the sbatch submission line, chunking the array when the point count would

@@ -11,7 +11,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from sweep_common import (Point, TWO_PI, DEFAULT_CONFIG, _drag_skip_GHz,
-                          _nearest_collision, _stark_offset_GHz)
+                          _nearest_collision, _stark_offset_GHz,
+                          _grape_augment)
 
 
 def build_target_grid(wa_GHz: float, wb_list: Sequence[float], spec_list: Sequence[float],
@@ -240,6 +241,8 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "status": status_drag if status_drag != "ok" else "analytic",
         "F_avg": "", "leakage": "", "n_spec": "", "n_coupler": "", "p_transfer": "",
         "F_avg_drag": "", "leakage_drag": "", "dF_drag": "",
+        "grape_baseline_F": "", "F_grape": "", "leak_grape": "", "dF_grape": "",
+        "grape_nfev": "",
         "U_proj": None,
     }
     if _chevron is not None:
@@ -279,6 +282,12 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         if F_d >= F_avg:                       # keep the better propagator + flag
             out["U_proj"] = U_d
             out["drag_applied"] = True
+
+    # (c) GRAPE optimal control on this exact point (opt-in). Baseline = the gate
+    # actually applied here, so dF_grape is the headroom over DRAG/raised-cosine.
+    if config.get("grape"):
+        _grape_augment(out, cpl, a, b, config,
+                       drag_beat_GHz=(drag_beat if out["drag_applied"] else None))
 
     out["wall_s"] = time.time() - t0
     return out

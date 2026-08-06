@@ -12,7 +12,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import numpy as np
 
 from sweep_common import (Point, TWO_PI, DEFAULT_CONFIG, _drag_skip_GHz,
-                          _nearest_collision, _stark_offset_GHz)
+                          _nearest_collision, _stark_offset_GHz,
+                          _grape_augment)
 
 
 def build_grid(specfreqs: Sequence[float], drags: Sequence[bool]) -> List[Point]:
@@ -208,6 +209,8 @@ def run_spectator_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "t_g_ns": float(config["t_g_ns"]),
         "status": status_drag if status_drag != "ok" else "analytic",
         "F_avg": "", "leakage": "", "n_spec": "", "n_coupler": "", "p_transfer": "",
+        "grape_baseline_F": "", "F_grape": "", "leak_grape": "", "dF_grape": "",
+        "grape_nfev": "",
         "U_proj": None,
     }
     if _chevron is not None:
@@ -237,5 +240,11 @@ def run_spectator_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     out["leakage"] = float(leakage)
     out["U_proj"] = U_proj
     out["status"] = status_drag        # "ok", or the drag-skip note if it fired
+
+    # GRAPE optimal control on this point (opt-in); baseline = the applied gate.
+    if config.get("grape"):
+        _grape_augment(out, cpl, a, b, config,
+                       drag_beat_GHz=(beat_GHz if use_drag else None))
+
     out["wall_s"] = time.time() - t0
     return out
