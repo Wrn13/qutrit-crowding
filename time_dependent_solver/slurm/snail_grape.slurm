@@ -4,15 +4,23 @@
 # reference $DEVICE, and any directory in --output must pre-exist.
 #SBATCH --output=snail_grape_%j.out
 #SBATCH --error=snail_grape_%j.err
+# NOTE: #SBATCH directives are parsed before any shell runs, so they cannot
+# reference $DEVICE, and any directory in --output must pre-exist.
+#SBATCH --output=snail_grape_%j.out
+#SBATCH --error=snail_grape_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8        # single optimization process; the cores help via
                                  # BLAS on the propagator/gradient matrix products.
 #SBATCH --mem=16G
-#SBATCH --time=06:00:00          # BACKEND=reduced : minutes.
-                                 # BACKEND=qutip   : GOAT integrates the augmented
-                                 #   gradient system through the FULL Hamiltonian
-                                 #   every iteration -> ~10 min to hours depending on
-                                 #   dim, N_BASIS and MAXITER. Start with MAXITER=30.
+#SBATCH --time=06:00:00          # BACKEND=reduced      : minutes.
+                                 # ALG=GOAT/JOPT        : integrates the augmented
+                                 #   gradient system through the FULL Hamiltonian every
+                                 #   iteration -> ~10 min to hours (dim, N_BASIS,
+                                 #   MAXITER). Start with MAXITER=30.
+                                 # ALG=CRAB CRAB_SCORE=qutip : gradient-free, so
+                                 #   hundreds of evaluations x 4 exact sesolve each ->
+                                 #   HOURS. Start with N_BASIS=3 MAXITER=60, or use
+                                 #   CRAB_SCORE=reduced to explore in minutes.
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=wcalphon@syr.edu
 # #SBATCH --partition=cpu
@@ -34,11 +42,22 @@
 # Both backends here handle the nonlinearity exactly, via the chain rule through
 # d(eta^p conj(eta)^q)/d(eta):
 #
-#   BACKEND=qutip    QuTiP's optimal-control package (qutip-qoc) with an ANALYTIC
-#                    control ansatz: ALG=GOAT differentiates the exact propagator
-#                    by integrating the gradient equations of motion; ALG=JOPT does
-#                    it by JAX auto-differentiation. Propagation is QuTiP's.
-#                    Needs:  pip install qutip-qoc      (+ qutip-jax jax for JOPT)
+#   BACKEND=qutip    Three optimizers, selected with ALG:
+#                    ALG=GOAT  qutip-qoc, gradient-based: differentiates the exact
+#                              propagator by integrating the gradient equations of
+#                              motion. Needs: pip install qutip-qoc
+#                    ALG=JOPT  same gradients by JAX auto-differentiation.
+#                              Needs: pip install qutip-qoc qutip-jax jax
+#                    ALG=CRAB  Chopped RAndom Basis, GRADIENT-FREE: expands the
+#                              pulse in a truncated randomized Fourier basis over a
+#                              Hann shape function and minimizes the infidelity with
+#                              Nelder-Mead (as qutip-qtrl does). CRAB treats the
+#                              evolution as a black box, so the black box here is
+#                              ZhouCoupler.propagator_columns -- the exact compiled
+#                              qt.sesolve -- and F_baseline/F_grape are FULL-QuTiP
+#                              numbers directly comparable to the sweep's F_avg.
+#                              Needs only qutip (NOT qutip-qoc). Use it when a
+#                              gradient method stalls or qutip-qoc is unavailable.
 #   BACKEND=reduced  in-house scipy L-BFGS-B over the rotating-frame reduced model
 #                    (no QuTiP). Fast; validate its winner with BACKEND=qutip.
 #
@@ -56,7 +75,15 @@
 #   DEVICE=evan_device.json T_G=154.3 SPEC_ABS=4.6 WARMSTART_BEAT=-0.04 \
 #       sbatch slurm/snail_grape.slurm
 #
-#   # cheap first pass (no QuTiP; fine on a login node)
+#   # gradient-free CRAB, exact QuTiP objective, 3 DCRAB super-iterations
+#   DEVICE=evan_device.json T_G=154.3 ALG=CRAB N_BASIS=3 CRAB_RESTARTS=3 \
+#       CRAB_SEED=1 MAXITER=60 sbatch slurm/snail_grape.slurm
+#
+#   # CRAB exploration in minutes (reduced objective), then re-score the winner
+#   DEVICE=evan_device.json T_G=154.3 ALG=CRAB CRAB_SCORE=reduced \
+#       bash slurm/snail_grape.slurm
+#
+#   # cheap first pass (no QuTiP at all; fine on a login node)
 #   DEVICE=evan_device.json T_G=154.3 BACKEND=reduced \
 #       bash slurm/snail_grape.slurm
 #
@@ -75,8 +102,14 @@
 #   DEVICE   (required) device JSON (bare name resolves under devices/)
 #   T_G      (required) gate duration in ns
 #   BACKEND  qutip | reduced                                      [qutip]
-#   ALG      GOAT | JOPT   (BACKEND=qutip; JOPT needs JAX)        [GOAT]
-#   N_BASIS  sin() basis functions per quadrature (qutip)         [6]
+#   ALG      GOAT | JOPT | CRAB   (BACKEND=qutip)                  [GOAT]
+#   N_BASIS  basis size: sin() functions per quadrature (GOAT/JOPT) or randomized
+#            harmonics (CRAB; 4 real coefficients each)            [6]
+#   CRAB_RESTARTS  [CRAB] DCRAB super-iterations (monotone; params grow by
+#                  4*N_BASIS each)                                 [1]
+#   CRAB_SCORE     [CRAB] qutip (exact) | reduced (fast)           [qutip]
+#   CRAB_SEED      [CRAB] RNG seed for the random basis            [random]
+#   CRAB_METHOD    [CRAB] gradient-free scipy method          [Nelder-Mead]
 #   N_CTRL   control points (reduced) / tlist resolution (qutip)  [24]
 #   CUTOFF   rotating-frame carrier cutoff in GHz                 [1.0]
 #   MAXITER  optimizer iteration cap                              [200]
@@ -102,9 +135,13 @@ set -euo pipefail
 
 DEVICE="${DEVICE:?set DEVICE=<device>.json}"
 T_G="${T_G:?set T_G=<gate length in ns>}"
+T_G="${T_G:?set T_G=<gate length in ns>}"
 LAUNCHER="${LAUNCHER:-uv run python}"
 BACKEND="${BACKEND:-qutip}"
 ALG="${ALG:-GOAT}"
+CRAB_RESTARTS="${CRAB_RESTARTS:-1}"
+CRAB_SCORE="${CRAB_SCORE:-qutip}"
+CRAB_METHOD="${CRAB_METHOD:-Nelder-Mead}"
 N_BASIS="${N_BASIS:-6}"
 N_CTRL="${N_CTRL:-24}"
 CUTOFF="${CUTOFF:-1.0}"
@@ -116,6 +153,11 @@ OPTS=""
 [ -n "${SPEC_ABS:-}"       ] && OPTS="${OPTS} --spec-abs-GHz ${SPEC_ABS}"
 [ -n "${DRAG_BEAT:-}"      ] && OPTS="${OPTS} --drag-beat-GHz ${DRAG_BEAT}"
 [ -n "${WARMSTART_BEAT:-}" ] && OPTS="${OPTS} --warmstart-drag-beat-GHz ${WARMSTART_BEAT}"
+[ -n "${CRAB_SEED:-}"      ] && OPTS="${OPTS} --crab-seed ${CRAB_SEED}"
+if [ "${ALG}" = "CRAB" ]; then
+    OPTS="${OPTS} --crab-restarts ${CRAB_RESTARTS} --crab-score ${CRAB_SCORE}"
+    OPTS="${OPTS} --crab-method ${CRAB_METHOD}"
+fi
 
 # single optimization process -> let BLAS use the allocation
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-1}"
@@ -124,11 +166,13 @@ export MPLBACKEND=Agg
 
 # module load python/3.12      # or: conda activate qsim
 # source .venv/bin/activate    # (then set LAUNCHER=python)
-# BACKEND=qutip needs: pip install qutip-qoc   (ALG=JOPT also needs qutip-jax jax)
+# ALG=GOAT/JOPT need: pip install qutip-qoc  (JOPT also needs qutip-jax jax).
+# ALG=CRAB needs only qutip itself.
 cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} device=${DEVICE} t_g=${T_G}"
 echo "backend=${BACKEND} alg=${ALG} n_basis=${N_BASIS} n_ctrl=${N_CTRL} maxiter=${MAXITER}"
+[ "${ALG}" = "CRAB" ] && echo "crab: restarts=${CRAB_RESTARTS} score=${CRAB_SCORE} method=${CRAB_METHOD} seed=${CRAB_SEED:-<random>}"
 echo "amp_scale=${AMP_SCALE} wp_offset=${WP_OFFSET} GHz opts=${OPTS:-<bare gate>}"
 echo "start=$(date -Is)"
 
@@ -136,7 +180,12 @@ srun ${LAUNCHER} grape.py \
     --device "${DEVICE}" --t-g-ns "${T_G}" \
     --amp-scale "${AMP_SCALE}" --wp-offset-GHz "${WP_OFFSET}" \
     --backend "${BACKEND}" --alg "${ALG}" --n-basis "${N_BASIS}" \
+    --device "${DEVICE}" --t-g-ns "${T_G}" \
+    --amp-scale "${AMP_SCALE}" --wp-offset-GHz "${WP_OFFSET}" \
+    --backend "${BACKEND}" --alg "${ALG}" --n-basis "${N_BASIS}" \
     --n-ctrl "${N_CTRL}" --cutoff-GHz "${CUTOFF}" --maxiter "${MAXITER}" \
     ${OPTS}
+    ${OPTS}
 
+echo "done end=$(date -Is)"
 echo "done end=$(date -Is)"

@@ -6,12 +6,12 @@
 #SBATCH --output=snail_sweep_%A_%a.out
 #SBATCH --error=snail_sweep_%A_%a.err
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12        # one point per task. Cores are used by (a) the
+#SBATCH --cpus-per-task=4        # one point per task. Cores are used by (a) the
                                  # per-point --stark chevron when STARK=1
                                  # (stark_jobs = cpus-per-task), else (b) BLAS on
                                  # small matrices (dim 45-135), where gains are modest.
 #SBATCH --mem=8G
-#SBATCH --time=12:00:00          # PER TASK, and with CHUNK>1 one task runs CHUNK
+#SBATCH --time=02:00:00          # PER TASK, and with CHUNK>1 one task runs CHUNK
                                  # points IN SERIES -- scale this up accordingly.
                                  # Rough per-point cost (integrate=true):
                                  #   plain iSWAP fidelity ...... seconds to ~1 min
@@ -113,7 +113,22 @@
 #   GRAPE_BACKEND     qutip (qutip-qoc GOAT/JOPT, exact propagation, SLOW) |
 #                     reduced (in-house scipy over the rotating-frame model, fast)
 #                                                        [qutip]
-#   GRAPE_ALG         GOAT | JOPT   (qutip backend; JOPT needs qutip-jax + jax) [GOAT]
+#   GRAPE_ALG         GOAT | JOPT | CRAB   (qutip backend)                     [GOAT]
+#                     GOAT/JOPT are qutip-qoc GRADIENT methods (JOPT needs
+#                       qutip-jax + jax); both need `pip install qutip-qoc`.
+#                     CRAB is GRADIENT-FREE over a randomized Fourier basis and
+#                       needs only qutip -- no qutip-qoc. Use it when a gradient
+#                       method stalls, when qutip-qoc is unavailable, or when you
+#                       want the objective to be the exact QuTiP propagator.
+#   CRAB_RESTARTS     [CRAB] DCRAB super-iterations; each appends a fresh random
+#                     basis and warm-starts from the previous optimum, so the
+#                     fidelity is monotone. Params grow by 4*GRAPE_NBASIS each
+#                     time and Nelder-Mead degrades in high dimension -- a few
+#                     harmonics and 1-3 restarts is the sweet spot.            [1]
+#   CRAB_SCORE        [CRAB] qutip (exact propagator_columns per evaluation) |
+#                     reduced (fast rotating-frame model, for exploration) [qutip]
+#   CRAB_SEED         [CRAB] RNG seed for the random basis (reproducible)  [random]
+#   CRAB_METHOD       [CRAB] gradient-free scipy method                [Nelder-Mead]
 #   GRAPE_NBASIS      sin() basis functions per quadrature (qutip backend)      [6]
 #   GRAPE_NCTRL       control points (reduced) / tlist resolution (qutip)       [24]
 #   GRAPE_CUTOFF      rotating-frame carrier cutoff in GHz                      [1.0]
@@ -122,12 +137,20 @@
 #                     beat (better start near a collision; auto-skipped inside the
 #                     drag-skip window, where the 1/beat quadrature blows up)
 #
-# RECOMMENDED GRAPE STRATEGY: the qutip backend integrates the exact gradient
-# system every iteration, so it is minutes-to-hours PER POINT. Sweep broadly with
-# GRAPE_BACKEND=reduced, then re-run the interesting rows with GRAPE_BACKEND=qutip
-# as the exact cross-check:
+# RECOMMENDED GRAPE STRATEGY: every qutip-backend optimizer is minutes-to-hours
+# PER POINT (GOAT integrates the exact gradient system each iteration; CRAB is
+# gradient-free and so needs many exact propagations). So sweep broadly with the
+# cheap optimizer and escalate only on the interesting rows:
+#   # 1. broad pass, fast reduced optimizer
 #   GRAPE=1 GRAPE_BACKEND=reduced OUTDIR=... sbatch --array=0-269 slurm/snail_sweep.slurm
-#   GRAPE=1 GRAPE_BACKEND=qutip RESUME=picked.txt OUTDIR=... sbatch --array=0-9 ...
+#   # 2. exact cross-check on a hand-picked subset (gradient method)
+#   GRAPE=1 GRAPE_BACKEND=qutip GRAPE_ALG=GOAT RESUME=picked.txt OUTDIR=... \
+#       sbatch --array=0-9 slurm/snail_sweep.slurm
+#   # 3. where GOAT stalls (dF ~ 0 but you expect headroom), retry gradient-free
+#   GRAPE=1 GRAPE_BACKEND=qutip GRAPE_ALG=CRAB CRAB_RESTARTS=3 \
+#       RESUME=stalled.txt OUTDIR=... sbatch --array=0-3 slurm/snail_sweep.slurm
+# (`picked.txt`/`stalled.txt` are hand-written lists of point indices, one per line
+#  -- the RESUME mechanism does not care that they came from `missing`.)
 # (`picked.txt` is just a hand-written list of point indices, one per line -- the
 #  RESUME mechanism does not care that it came from `missing`.)
 # =============================================================================
@@ -170,6 +193,10 @@ OPTS=""
 [ -n "${GRAPE_NCTRL:-}"     ] && OPTS="${OPTS} --grape-nctrl ${GRAPE_NCTRL}"
 [ -n "${GRAPE_CUTOFF:-}"    ] && OPTS="${OPTS} --grape-cutoff-GHz ${GRAPE_CUTOFF}"
 [ -n "${GRAPE_MAXITER:-}"   ] && OPTS="${OPTS} --grape-maxiter ${GRAPE_MAXITER}"
+[ -n "${CRAB_RESTARTS:-}"   ] && OPTS="${OPTS} --grape-crab-restarts ${CRAB_RESTARTS}"
+[ -n "${CRAB_SEED:-}"       ] && OPTS="${OPTS} --grape-crab-seed ${CRAB_SEED}"
+[ -n "${CRAB_SCORE:-}"      ] && OPTS="${OPTS} --grape-crab-score ${CRAB_SCORE}"
+[ -n "${CRAB_METHOD:-}"     ] && OPTS="${OPTS} --grape-crab-method ${CRAB_METHOD}"
 [ -n "${GRID:-}"            ] && OPTS="${OPTS} --grid ${GRID}"
 
 # ---- threads: avoid oversubscription when the job forks worker processes ------
@@ -184,7 +211,8 @@ export MPLBACKEND=Agg
 
 # module load python/3.12      # or: conda activate qsim
 # source .venv/bin/activate    # (then set LAUNCHER=python)
-# GRAPE_BACKEND=qutip additionally needs: pip install qutip-qoc  (+ qutip-jax jax for JOPT)
+# GRAPE_BACKEND=qutip with GRAPE_ALG=GOAT/JOPT needs: pip install qutip-qoc
+#   (+ qutip-jax jax for JOPT).  GRAPE_ALG=CRAB needs only qutip itself.
 
 mkdir -p "${OUTDIR}/points"
 

@@ -62,7 +62,13 @@ DEFAULT_CONFIG = {
     # metric as the sweep, so grape_baseline_F tracks F_avg.
     "grape":            False,       # run GRAPE at each integrated point
     "grape_backend":    "qutip",     # "qutip" (qutip-qoc optimal control) | "reduced"
-    "grape_alg":        "GOAT",      # qutip-qoc analytic-control algorithm (or "JOPT")
+    "grape_alg":        "GOAT",      # qutip optimizer: "GOAT"/"JOPT" (qutip-qoc
+                                     #   gradient methods) or "CRAB" (gradient-free
+                                     #   over a randomized basis; needs only qutip)
+    "grape_crab_restarts": 1,        # [CRAB] DCRAB super-iterations (monotone)
+    "grape_crab_seed":  None,        # [CRAB] RNG seed for the random basis
+    "grape_crab_score": "qutip",     # [CRAB] objective: "qutip" (exact) | "reduced"
+    "grape_crab_method": "Nelder-Mead",   # [CRAB] gradient-free scipy method
     "grape_nbasis":     6,           # sin() basis functions per quadrature (qutip backend)
     "grape_nctrl":      24,          # piecewise-constant control points (reduced) / tlist
     "grape_cutoff_GHz": 1.0,         # reduced-model carrier cutoff for the optimizer
@@ -345,6 +351,11 @@ def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
         backend=str(config.get("grape_backend", "qutip")),
         alg=str(config.get("grape_alg", "GOAT")),
         n_basis=int(config.get("grape_nbasis", 6)),
+        crab_restarts=int(config.get("grape_crab_restarts", 1)),
+        crab_seed=(None if config.get("grape_crab_seed") is None
+                   else int(config["grape_crab_seed"])),
+        crab_score=str(config.get("grape_crab_score", "qutip")),
+        crab_method=str(config.get("grape_crab_method", "Nelder-Mead")),
         maxiter=int(config.get("grape_maxiter", 200)))
     out["grape_baseline_F"] = round(float(res["F_baseline"]), 6)
     out["F_grape"] = round(float(res["F_grape"]), 6)
@@ -358,6 +369,9 @@ def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
                          drag_beat_GHz=(np.nan if drag_beat_GHz is None
                                         else float(drag_beat_GHz)),
                          warmstart_beat_GHz=res["warmstart_beat_GHz"])
+    if res.get("alg") == "CRAB":          # basis + coefficients reproduce the pulse
+        out["_grape"]["crab_freqs"] = np.asarray(res["crab_freqs"], dtype=float)
+        out["_grape"]["crab_params"] = np.asarray(res["crab_params"], dtype=float)
 
 
 def save_point(result: Dict[str, Any], outdir: str) -> str:
@@ -391,6 +405,9 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
                      grape_drag_beat_GHz=np.asarray(grp["drag_beat_GHz"], dtype=float),
                      grape_warmstart_beat_GHz=np.asarray(
                          grp.get("warmstart_beat_GHz", np.nan), dtype=float))
+        if "crab_freqs" in grp:
+            extra.update(grape_crab_freqs=np.asarray(grp["crab_freqs"], dtype=float),
+                         grape_crab_params=np.asarray(grp["crab_params"], dtype=float))
     if chev is not None:
         extra = {"chev_offsets_GHz": np.asarray(chev["offsets_GHz"], dtype=float),
                  "chev_times_ns": np.asarray(chev["times_ns"], dtype=float),

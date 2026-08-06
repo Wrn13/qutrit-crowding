@@ -233,8 +233,20 @@ def main() -> None:
     ap.add_argument("--grape-backend", choices=["qutip", "reduced"], default=None,
                     help="GRAPE engine: 'qutip' (qutip-qoc optimal control, default) "
                          "or 'reduced' (in-house scipy over the reduced model)")
-    ap.add_argument("--grape-alg", choices=["GOAT", "JOPT"], default=None,
-                    help="qutip-qoc analytic-control algorithm (JOPT needs JAX)")
+    ap.add_argument("--grape-alg", choices=["GOAT", "JOPT", "CRAB"], default=None,
+                    help="qutip GRAPE optimizer: GOAT/JOPT are qutip-qoc gradient "
+                         "methods (JOPT needs JAX); CRAB is gradient-free over a "
+                         "randomized basis and needs only qutip, no qutip-qoc")
+    ap.add_argument("--grape-crab-restarts", type=int, default=None,
+                    help="[CRAB] DCRAB super-iterations; each appends a fresh random "
+                         "basis and warm-starts from the previous optimum (monotone)")
+    ap.add_argument("--grape-crab-seed", type=int, default=None,
+                    help="[CRAB] RNG seed for the random basis (reproducible pulses)")
+    ap.add_argument("--grape-crab-score", choices=["qutip", "reduced"], default=None,
+                    help="[CRAB] objective: exact QuTiP propagator (default) or the "
+                         "fast reduced model for exploration")
+    ap.add_argument("--grape-crab-method", default=None,
+                    help="[CRAB] gradient-free scipy method (Nelder-Mead, Powell, ...)")
     ap.add_argument("--grape-nbasis", type=int, default=None,
                     help="sin() basis functions per quadrature (qutip GRAPE backend)")
     ap.add_argument("--grape-nctrl", type=int, default=None,
@@ -362,6 +374,14 @@ def main() -> None:
         config["grape_alg"] = args.grape_alg
     if args.grape_nbasis is not None:
         config["grape_nbasis"] = int(args.grape_nbasis)
+    if args.grape_crab_restarts is not None:
+        config["grape_crab_restarts"] = int(args.grape_crab_restarts)
+    if args.grape_crab_seed is not None:
+        config["grape_crab_seed"] = int(args.grape_crab_seed)
+    if args.grape_crab_score is not None:
+        config["grape_crab_score"] = args.grape_crab_score
+    if args.grape_crab_method is not None:
+        config["grape_crab_method"] = args.grape_crab_method
     if args.grape_cutoff_GHz is not None:
         config["grape_cutoff_GHz"] = float(args.grape_cutoff_GHz)
     if args.grape_maxiter is not None:
@@ -530,12 +550,24 @@ def main() -> None:
         config["grape_alg"] = args.grape_alg
     if args.grape_nbasis is not None:
         config["grape_nbasis"] = int(args.grape_nbasis)
+    if args.grape_crab_restarts is not None:
+        config["grape_crab_restarts"] = int(args.grape_crab_restarts)
+    if args.grape_crab_seed is not None:
+        config["grape_crab_seed"] = int(args.grape_crab_seed)
+    if args.grape_crab_score is not None:
+        config["grape_crab_score"] = args.grape_crab_score
+    if args.grape_crab_method is not None:
+        config["grape_crab_method"] = args.grape_crab_method
     if args.grape_nctrl is not None:
         config["grape_nctrl"] = int(args.grape_nctrl)
     if args.grape_cutoff_GHz is not None:
         config["grape_cutoff_GHz"] = float(args.grape_cutoff_GHz)
     if args.grape_maxiter is not None:
         config["grape_maxiter"] = int(args.grape_maxiter)
+    if (config.get("grape") and str(config.get("grape_alg", "")).upper() == "CRAB"
+            and str(config.get("grape_crab_score", "qutip")) == "qutip"):
+        print("note: CRAB with crab_score=qutip runs MANY exact propagations per point "
+              "(gradient-free); use --grape-crab-score reduced to explore cheaply.")
     if config.get("grape") and not config.get("integrate", True):
         print("note: grape needs the integrated run; it has no effect with integrate=false.")
     if config.get("grape_warmstart_drag") and not config.get("grape"):
