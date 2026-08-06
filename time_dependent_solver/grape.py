@@ -480,8 +480,6 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
                    cutoff_GHz: float = 1.0, drag_beat_GHz: Optional[float] = None,
                    warmstart_beat_GHz: Optional[float] = None,
                    backend: str = "qutip", alg: str = "GOAT", n_basis: int = 6,
-                   warmstart_beat_GHz: Optional[float] = None,
-                   backend: str = "qutip", alg: str = "GOAT", n_basis: int = 6,
                    maxiter: int = 200, carrier_resolution: float = 0.3,
                    crab_restarts: int = 1, crab_seed: Optional[int] = None,
                    crab_score: str = "qutip", crab_method: str = "Nelder-Mead",
@@ -597,10 +595,6 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
 
     return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
                 eta_opt=eta_opt, F_grape=Fg, leak_grape=leakg,
-                n_ctrl=n_ctrl, n_sub=n_sub, cutoff_GHz=cutoff_GHz, nfev=res.nfev,
-                warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
-                                    else float(warmstart_beat_GHz)),
-                backend="reduced")
                 n_ctrl=n_ctrl, n_sub=n_sub, cutoff_GHz=cutoff_GHz, nfev=res.nfev,
                 warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
                                     else float(warmstart_beat_GHz)),
