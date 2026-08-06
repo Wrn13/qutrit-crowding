@@ -1,0 +1,30 @@
+{
+  "qubit_freqs_GHz": [
+    4.7,
+    5.7
+  ],
+  "qubit_levels": 3,
+  "lam_a": 0.1,
+  "lam_b": 0.1,
+  "coupler_freq_GHz": 4.2,
+  "coupler_levels": 5,
+  "g3_GHz": 0.06,
+  "g4_GHz": 0.0,  
+  "anchor": 1,
+  "anharm_qubit_GHz": -0.12,
+  "anharm_spec_GHz":  -0.12,
+  "min_detuning_GHz": 0.05,
+  "drag_compare": false,
+  "drag_compare_below_MHz": 100.0, 
+  "t_g_ns":   77.2,
+  "envelope": "raised_cosine",
+  "amp_scale": 1.0,
+  "wp_offset_GHz": 0,
+  "stark_drive": true,
+  "stark_span_MHz": 200.0,
+  "stark_points":   150,
+  "stark_window_factor": 2.0,
+  "stark_time_points": 120,
+  "integrate": true,
+  "rtol": 1e-6, "atol": 1e-8
+}
