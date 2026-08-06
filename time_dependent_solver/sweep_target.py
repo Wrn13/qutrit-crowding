@@ -242,7 +242,7 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "F_avg": "", "leakage": "", "n_spec": "", "n_coupler": "", "p_transfer": "",
         "F_avg_drag": "", "leakage_drag": "", "dF_drag": "",
         "grape_baseline_F": "", "F_grape": "", "leak_grape": "", "dF_grape": "",
-        "grape_nfev": "",
+        "grape_nfev": "", "grape_warmstart_GHz": "",
         "U_proj": None,
     }
     if _chevron is not None:
@@ -284,10 +284,12 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
             out["drag_applied"] = True
 
     # (c) GRAPE optimal control on this exact point (opt-in). Baseline = the gate
-    # actually applied here, so dF_grape is the headroom over DRAG/raised-cosine.
+    # actually applied here (base_drag), so dF_grape is the headroom over it; with
+    # --grape-warmstart-drag a DRAG-off point is seeded from DRAG at the nearest beat.
     if config.get("grape"):
         _grape_augment(out, cpl, a, b, config,
-                       drag_beat_GHz=(drag_beat if out["drag_applied"] else None))
+                       drag_beat_GHz=(drag_beat if base_drag else None),
+                       nearest_beat_GHz=drag_beat)
 
     out["wall_s"] = time.time() - t0
     return out

@@ -230,12 +230,23 @@ def main() -> None:
                          "top of the integrated gate; records grape_baseline_F / F_grape / "
                          "dF_grape / leak_grape and stores the optimized envelope. Opt-in "
                          "and costly (an L-BFGS-B optimization per point); needs --integrate")
+    ap.add_argument("--grape-backend", choices=["qutip", "reduced"], default=None,
+                    help="GRAPE engine: 'qutip' (qutip-qoc optimal control, default) "
+                         "or 'reduced' (in-house scipy over the reduced model)")
+    ap.add_argument("--grape-alg", choices=["GOAT", "JOPT"], default=None,
+                    help="qutip-qoc analytic-control algorithm (JOPT needs JAX)")
+    ap.add_argument("--grape-nbasis", type=int, default=None,
+                    help="sin() basis functions per quadrature (qutip GRAPE backend)")
     ap.add_argument("--grape-nctrl", type=int, default=None,
                     help="GRAPE piecewise-constant control points (default 24)")
     ap.add_argument("--grape-cutoff-GHz", type=float, default=None,
                     help="GRAPE reduced-model carrier cutoff (default 1.0 GHz)")
     ap.add_argument("--grape-maxiter", type=int, default=None,
                     help="GRAPE L-BFGS-B iteration cap (default 200)")
+    ap.add_argument("--grape-warmstart-drag", action="store_true",
+                    help="on DRAG-off points, seed GRAPE from a DRAG raised cosine at the "
+                         "nearest beat (better start near a collision; baseline/dF "
+                         "unchanged; skipped inside the drag-skip window)")
     ap.add_argument("--drag", action="store_true",
                     help="force DRAG on for every allocation point (tuned to the nearest beat)")
     ap.add_argument("--operating-point", default=None,
@@ -345,10 +356,20 @@ def main() -> None:
                   "--no-integrate (nothing to optimize against).")
     if args.grape_nctrl is not None:
         config["grape_nctrl"] = int(args.grape_nctrl)
+    if args.grape_backend is not None:
+        config["grape_backend"] = args.grape_backend
+    if args.grape_alg is not None:
+        config["grape_alg"] = args.grape_alg
+    if args.grape_nbasis is not None:
+        config["grape_nbasis"] = int(args.grape_nbasis)
     if args.grape_cutoff_GHz is not None:
         config["grape_cutoff_GHz"] = float(args.grape_cutoff_GHz)
     if args.grape_maxiter is not None:
         config["grape_maxiter"] = int(args.grape_maxiter)
+    if args.grape_warmstart_drag:
+        config["grape_warmstart_drag"] = True
+        if not args.grape:
+            print("note: --grape-warmstart-drag has no effect without --grape.")
     if args.no_spectator:
         config["no_spectator"] = True
 

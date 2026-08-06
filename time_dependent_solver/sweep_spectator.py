@@ -210,7 +210,7 @@ def run_spectator_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
         "status": status_drag if status_drag != "ok" else "analytic",
         "F_avg": "", "leakage": "", "n_spec": "", "n_coupler": "", "p_transfer": "",
         "grape_baseline_F": "", "F_grape": "", "leak_grape": "", "dF_grape": "",
-        "grape_nfev": "",
+        "grape_nfev": "", "grape_warmstart_GHz": "",
         "U_proj": None,
     }
     if _chevron is not None:
@@ -244,7 +244,8 @@ def run_spectator_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     # GRAPE optimal control on this point (opt-in); baseline = the applied gate.
     if config.get("grape"):
         _grape_augment(out, cpl, a, b, config,
-                       drag_beat_GHz=(beat_GHz if use_drag else None))
+                       drag_beat_GHz=(beat_GHz if use_drag else None),
+                       nearest_beat_GHz=beat_GHz)
 
     out["wall_s"] = time.time() - t0
     return out

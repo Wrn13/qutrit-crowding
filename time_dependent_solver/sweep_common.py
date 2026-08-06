@@ -61,9 +61,17 @@ DEFAULT_CONFIG = {
     # full QuTiP iswap_fidelity separately. Scores use the SAME leakage-aware
     # metric as the sweep, so grape_baseline_F tracks F_avg.
     "grape":            False,       # run GRAPE at each integrated point
-    "grape_nctrl":      24,          # piecewise-constant control points
+    "grape_backend":    "qutip",     # "qutip" (qutip-qoc optimal control) | "reduced"
+    "grape_alg":        "GOAT",      # qutip-qoc analytic-control algorithm (or "JOPT")
+    "grape_nbasis":     6,           # sin() basis functions per quadrature (qutip backend)
+    "grape_nctrl":      24,          # piecewise-constant control points (reduced) / tlist
     "grape_cutoff_GHz": 1.0,         # reduced-model carrier cutoff for the optimizer
     "grape_maxiter":    200,         # L-BFGS-B iteration cap
+    "grape_warmstart_drag": False,   # on DRAG-off points, seed GRAPE from a DRAG
+                                     #   raised cosine at the nearest beat (better
+                                     #   L-BFGS-B start near a collision; baseline
+                                     #   unchanged). Skipped where |beat| is below
+                                     #   drag_skip_below_MHz (the 1/beat blow-up).
     # pulse / solver
     "t_g_ns":   60.0,
     "envelope": "raised_cosine",
@@ -300,7 +308,8 @@ def _nearest_collision(config: Dict[str, Any], wa_GHz: float, wb_GHz: float,
     return nearest
 
 def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
-                   config: Dict[str, Any], drag_beat_GHz: Optional[float] = None) -> None:
+                   config: Dict[str, Any], drag_beat_GHz: Optional[float] = None,
+                   nearest_beat_GHz: Optional[float] = None) -> None:
     """Run GRAPE on the already-built point coupler and record the result in-place.
 
     Optimizes the pump envelope with ``grape.optimize_pulse`` (reduced rotating-
@@ -310,29 +319,45 @@ def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
     (``drag_beat_GHz`` = the applied beat, or None for the plain gate), so
     ``dF_grape`` is the optimal-control headroom over that gate.
 
+    With ``config['grape_warmstart_drag']`` and a DRAG-off baseline, the optimizer
+    is seeded from a DRAG raised cosine at ``nearest_beat_GHz`` (a better L-BFGS-B
+    start for a near-collision point) -- but only when the beat is outside the
+    ``drag_skip_below_MHz`` window, since the DRAG quadrature ~ 1/beat blows up on
+    resonance. The baseline and ``dF_grape`` are unchanged; only the seed moves.
+
     Writes ``F_grape``, ``leak_grape``, ``dF_grape`` (F_grape - grape_baseline_F),
-    ``grape_baseline_F``, ``grape_nfev``; stashes the optimized envelope under
-    ``out["_grape"]`` for ``save_point`` to persist for later QuTiP validation.
-    The optimized pulse is a reduced-model result -- validate it in the full
-    ``iswap_fidelity`` before trusting the absolute number.
+    ``grape_baseline_F``, ``grape_nfev``, ``grape_warmstart_GHz``; stashes the
+    optimized envelope under ``out["_grape"]`` for ``save_point`` to persist for
+    later QuTiP validation. The optimized pulse is a reduced-model result --
+    validate it in the full ``iswap_fidelity`` before trusting the absolute number.
     """
     import grape
+    warmstart = None
+    if (config.get("grape_warmstart_drag") and drag_beat_GHz is None
+            and nearest_beat_GHz is not None
+            and abs(float(nearest_beat_GHz)) >= _drag_skip_GHz(config)):
+        warmstart = float(nearest_beat_GHz)
     res = grape.optimize_pulse(
         cpl, a, b, float(config["t_g_ns"]),
         n_ctrl=int(config.get("grape_nctrl", 24)),
         cutoff_GHz=float(config.get("grape_cutoff_GHz", 1.0)),
-        drag_beat_GHz=drag_beat_GHz,
+        drag_beat_GHz=drag_beat_GHz, warmstart_beat_GHz=warmstart,
+        backend=str(config.get("grape_backend", "qutip")),
+        alg=str(config.get("grape_alg", "GOAT")),
+        n_basis=int(config.get("grape_nbasis", 6)),
         maxiter=int(config.get("grape_maxiter", 200)))
     out["grape_baseline_F"] = round(float(res["F_baseline"]), 6)
     out["F_grape"] = round(float(res["F_grape"]), 6)
     out["leak_grape"] = round(float(res["leak_grape"]), 6)
     out["dF_grape"] = round(float(res["F_grape"] - res["F_baseline"]), 6)
     out["grape_nfev"] = int(res["nfev"])
+    out["grape_warmstart_GHz"] = (np.nan if warmstart is None else round(warmstart, 6))
     eta = np.asarray(res["eta_opt"], dtype=complex)
     out["_grape"] = dict(eta_opt=eta, n_ctrl=int(res["n_ctrl"]),
                          cutoff_GHz=float(res["cutoff_GHz"]),
                          drag_beat_GHz=(np.nan if drag_beat_GHz is None
-                                        else float(drag_beat_GHz)))
+                                        else float(drag_beat_GHz)),
+                         warmstart_beat_GHz=res["warmstart_beat_GHz"])
 
 
 def save_point(result: Dict[str, Any], outdir: str) -> str:
@@ -363,7 +388,9 @@ def save_point(result: Dict[str, Any], outdir: str) -> str:
         extra.update(grape_eta_real=np.real(eta), grape_eta_imag=np.imag(eta),
                      grape_n_ctrl=np.asarray(grp["n_ctrl"], dtype=int),
                      grape_cutoff_GHz=np.asarray(grp["cutoff_GHz"], dtype=float),
-                     grape_drag_beat_GHz=np.asarray(grp["drag_beat_GHz"], dtype=float))
+                     grape_drag_beat_GHz=np.asarray(grp["drag_beat_GHz"], dtype=float),
+                     grape_warmstart_beat_GHz=np.asarray(
+                         grp.get("warmstart_beat_GHz", np.nan), dtype=float))
     if chev is not None:
         extra = {"chev_offsets_GHz": np.asarray(chev["offsets_GHz"], dtype=float),
                  "chev_times_ns": np.asarray(chev["times_ns"], dtype=float),
@@ -413,6 +440,7 @@ def collect(outdir: str) -> None:
                  "eta_peak", "g_iswap_eff_MHz", "g_spec_eff_MHz",
                  "status", "F_avg", "leakage", "n_spec", "n_coupler", "p_transfer",
                  "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
+                 "grape_warmstart_GHz",
                  "w_p_GHz", "stark_offset_MHz", "amp_scale_used", "wp_offset_used_MHz",
                  "w_spec_GHz", "t_g_ns", "wall_s"]
     target_cols = ["index", "kind", "wa_GHz", "wb_GHz", "w_snail_GHz",
@@ -423,6 +451,7 @@ def collect(outdir: str) -> None:
                    "nearest_target", "g_collision_MHz", "status", "F_avg", "leakage",
                    "F_avg_drag", "leakage_drag", "dF_drag",
                    "grape_baseline_F", "F_grape", "leak_grape", "dF_grape", "grape_nfev",
+                   "grape_warmstart_GHz",
                    "n_spec", "n_coupler",
                    "p_transfer", "t_g_ns", "wall_s"]
     is_target = bool(rows) and rows[0].get("kind") == "target"
