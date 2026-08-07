@@ -182,6 +182,346 @@ class TestRateCombinatorics(unittest.TestCase):
         self.assertAlmostEqual(val / TWO_PI, 6 * g3 * lam, places=9)
 
 
+class TestChirp(unittest.TestCase):
+    """A chirp must be a pure carrier rotation -- nothing more, nothing less.
+
+    The whole design rests on one identity: a pump letter enters X(t) as
+    ``eta e^{-i w_p t}``, so chirping the carrier is the same thing as putting the
+    phase ``e^{-i Phi(t)}`` on the envelope. If that identity ever breaks, a
+    constant chirp stops agreeing with a retuned carrier and these fail.
+    """
+
+    T_G = 77.2
+
+    def _build(self, w_p_GHz, chirp):
+        from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[3, 3, 4], anharmonicities_GHz={0: -0.12, 1: -0.12})
+        cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, is_eta=True, chirp=chirp,
+                              envelope=RaisedCosine(amp=0.05, t_g=self.T_G)))
+        return cpl
+
+    def _max_dH(self, c1, c2):
+        ts = np.linspace(0.0, self.T_G, 11)
+        return max(np.max(np.abs(c1.hamiltonian_matrix(t) - c2.hamiltonian_matrix(t)))
+                   for t in ts)
+
+    def test_constant_chirp_equals_retuned_carrier(self):
+        """delta(t) = c0 must be EXACTLY a pump at w_p + c0 (the design identity)."""
+        from zhou_coupler import Chirp
+        c0 = 0.037
+        self.assertLess(self._max_dH(self._build(1.7, Chirp([c0], self.T_G)),
+                                     self._build(1.7 + c0, None)), 1e-12)
+
+    def test_constant_chirp_sign(self):
+        """+c0 shifts the carrier UP. A sign slip here would silently detune the gate."""
+        from zhou_coupler import Chirp
+        c0 = 0.037
+        self.assertGreater(self._max_dH(self._build(1.7, Chirp([c0], self.T_G)),
+                                        self._build(1.7 - c0, None)), 1e-6)
+
+    def test_zero_chirp_is_inert(self):
+        """All-zero coefficients must reproduce the un-chirped Hamiltonian exactly."""
+        from zhou_coupler import Chirp
+        self.assertEqual(self._max_dH(self._build(1.7, None),
+                                      self._build(1.7, Chirp([0.0, 0.0], self.T_G))), 0.0)
+
+    def test_linear_chirp_changes_the_dynamics(self):
+        """Guards against a chirp that is silently dropped somewhere in _eta."""
+        from zhou_coupler import Chirp
+        self.assertGreater(self._max_dH(self._build(1.7, None),
+                                        self._build(1.7, Chirp([0.0, 0.05], self.T_G))), 1e-3)
+
+    def test_chirp_does_not_touch_the_amplitude_calibration(self):
+        """A chirp is a phase: |eta|, area() and peak_eta must be untouched.
+
+        `set_pump(normalize_iswap=...)` divides by `area()`, so if a chirp ever
+        leaked into it the pi/2 amplitude calibration would silently drift.
+        """
+        from zhou_coupler import Chirp
+        plain = self._build(1.7, None)
+        chirped = self._build(1.7, Chirp([0.02, 0.05, -0.01], self.T_G))
+        self.assertEqual(plain.peak_eta(), chirped.peak_eta())
+        self.assertEqual(plain._pump_tones[0].envelope.area(),
+                         chirped._pump_tones[0].envelope.area())
+
+    def test_phase_is_the_integral_of_the_detuning(self):
+        """Phi(0) = 0 and dPhi/dt = delta(t); the closed form must match quadrature."""
+        from zhou_coupler import Chirp
+        ch = Chirp([0.01, 0.05, -0.02], self.T_G)
+        self.assertAlmostEqual(float(ch.phase(0.0)), 0.0, places=12)
+        h = 1e-6
+        for t in (12.0, 38.6, 70.0):
+            fd = (float(ch.phase(t + h)) - float(ch.phase(t - h))) / (2 * h)
+            self.assertAlmostEqual(fd, float(ch.detuning(t)), places=6)
+
+    def test_make_chirp_returns_none_when_trivial(self):
+        """An absent/zero chirp must yield None so the solver path stays untouched."""
+        from zhou_coupler import make_chirp
+        self.assertIsNone(make_chirp(None, self.T_G))
+        self.assertIsNone(make_chirp([], self.T_G))
+        self.assertIsNone(make_chirp([0.0, 0.0], self.T_G))
+        self.assertIsNotNone(make_chirp([0.0, 0.01], self.T_G))
+
+
+class TestEnvelopeArrayAPI(unittest.TestCase):
+    """`value_at`/`deriv_at` must agree with the scalar path and be branch-free.
+
+    The batched/GPU engine evaluates envelopes on arrays of times and under a JAX
+    trace; the per-time QuTiP callbacks still use the scalar wrappers. If the two
+    ever disagree, the fast engine silently solves a different pulse.
+    """
+
+    T_G = 77.2
+
+    def _envelopes(self):
+        from envelope import ConstantPulse, IQFourierEnvelope, RaisedCosine
+        rng = np.random.default_rng(0)
+        freqs = TWO_PI * np.arange(1, 5) / self.T_G
+        return [
+            ConstantPulse(amp=0.05, t_g=self.T_G),
+            RaisedCosine(amp=0.05, t_g=self.T_G),
+            IQFourierEnvelope(amp=0.05, t_g=self.T_G),
+            IQFourierEnvelope(amp=0.05, t_g=self.T_G, freqs=freqs,
+                              sin_I=rng.normal(size=4), sin_Q=rng.normal(size=4),
+                              cos_I=rng.normal(size=4), cos_Q=rng.normal(size=4)),
+        ]
+
+    def test_vectorized_matches_scalar(self):
+        # deliberately overruns [0, t_g] so the support mask is exercised
+        ts = np.linspace(-5.0, self.T_G + 5.0, 37)
+        for env in self._envelopes():
+            with self.subTest(env=type(env).__name__, n=env.n_params):
+                self.assertEqual(np.max(np.abs(
+                    np.array([env.value(float(t)) for t in ts])
+                    - np.asarray(env.value_at(ts, np)))), 0.0)
+                self.assertEqual(np.max(np.abs(
+                    np.array([env.deriv(float(t)) for t in ts])
+                    - np.asarray(env.deriv_at(ts, np)))), 0.0)
+
+    def test_analytic_derivative_matches_finite_difference(self):
+        ts, h = np.linspace(2.0, self.T_G - 2.0, 13), 1e-6
+        for env in self._envelopes():
+            with self.subTest(env=type(env).__name__, n=env.n_params):
+                fd = np.array([(env.value(float(t) + h) - env.value(float(t) - h)) / (2 * h)
+                               for t in ts])
+                self.assertLess(np.max(np.abs(fd - np.asarray(env.deriv_at(ts, np)))), 1e-8)
+
+    def test_envelope_is_zero_outside_the_gate(self):
+        for env in self._envelopes():
+            with self.subTest(env=type(env).__name__, n=env.n_params):
+                for t in (-1e-9, -3.0, self.T_G + 1e-9, self.T_G + 3.0):
+                    self.assertEqual(env.value(t), 0.0)
+
+    def test_zero_coefficient_iq_reduces_to_raised_cosine(self):
+        """The CRAB ansatz must start exactly at the sweep's baseline pulse."""
+        from envelope import IQFourierEnvelope, RaisedCosine
+        ts = np.linspace(0.0, self.T_G, 25)
+        rc = RaisedCosine(amp=0.05, t_g=self.T_G)
+        iq = IQFourierEnvelope(amp=0.05, t_g=self.T_G,
+                               freqs=TWO_PI * np.arange(1, 5) / self.T_G)
+        self.assertLess(np.max(np.abs(np.asarray(iq.value_at(ts, np))
+                                      - np.asarray(rc.value_at(ts, np)))), 1e-15)
+        self.assertAlmostEqual(iq.area(), rc.area(), places=12)
+
+
+class TestSymbolicExpansion(unittest.TestCase):
+    """`expand_terms_symbolic` must be `expand_terms` with the frequencies pulled out.
+
+    The batched engine depends on the operator structure being independent of every
+    mode and pump frequency -- that is what lets a whole sweep share one operator
+    stack. If a frequency ever leaks into the structure, the engine silently solves
+    the wrong Hamiltonian for every grid point but the first.
+    """
+
+    def _build(self, wb=5.5):
+        from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, wb, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[2, 2, 3], anharmonicities_GHz={0: -0.12})
+        cpl.set_pump(PumpTone(w_p_GHz=1.7, is_eta=True,
+                              envelope=RaisedCosine(amp=0.3, t_g=40.0)))
+        return cpl
+
+    def _grouped(self, cpl):
+        """Both expansions, folded onto the same (Omega, signature) keys."""
+        from collections import defaultdict
+        S = cpl.expand_terms_symbolic()
+        Om = S["M"] @ cpl.frequency_vector()
+        sym = defaultdict(lambda: np.zeros((cpl.dim, cpl.dim), dtype=complex))
+        for j in range(S["n_terms"]):
+            m = S["term"] == j
+            O = np.zeros((cpl.dim, cpl.dim), dtype=complex)
+            O[S["row"][m], S["col"][m]] = S["val"][m]
+            sym[(round(float(Om[j]), 6), S["signatures"][j])] += O
+        ref = defaultdict(lambda: np.zeros((cpl.dim, cpl.dim), dtype=complex))
+        for omega, sig, O in cpl.expand_terms(cutoff_GHz=np.inf):
+            ref[(round(float(omega), 6), sig)] += O
+        return sym, ref
+
+    def test_matches_expand_terms(self):
+        sym, ref = self._grouped(self._build())
+        self.assertEqual(set(sym), set(ref))
+        self.assertEqual(max(np.max(np.abs(sym[k] - ref[k])) for k in ref), 0.0)
+
+    def test_structure_is_frequency_independent(self):
+        """Move w_b; M/operators must not budge, only `frequency_vector` does."""
+        a, b = self._build(5.5), self._build(5.9)
+        Sa, Sb = a.expand_terms_symbolic(), b.expand_terms_symbolic()
+        for key in ("M", "n_pos", "n_neg", "term", "row", "col"):
+            np.testing.assert_array_equal(Sa[key], Sb[key], err_msg=key)
+        np.testing.assert_allclose(Sa["val"], Sb["val"], rtol=0, atol=0)
+        self.assertGreater(np.max(np.abs(Sa["M"] @ a.frequency_vector()
+                                         - Sb["M"] @ b.frequency_vector())), 1.0)
+
+    def test_operators_are_sparse(self):
+        """The COO stack must be far smaller than a dense (n_terms, dim, dim)."""
+        cpl = self._build()
+        S = cpl.expand_terms_symbolic()
+        self.assertLess(S["val"].size, 0.2 * S["n_terms"] * cpl.dim ** 2)
+
+
+class TestBatchedEngine(unittest.TestCase):
+    """The batched engine must reproduce the dense Hamiltonian and the scalar pump.
+
+    QuTiP-free: both checks are against `hamiltonian_matrix` / `_eta`, which are the
+    same oracles the rest of this suite uses. The end-to-end engine-vs-sesolve
+    comparison lives in `validate_engines.py` (it needs QuTiP and is slow).
+    """
+
+    T_G = 40.0
+
+    def _build(self, chirp=None, drag=False):
+        from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[2, 2, 3], anharmonicities_GHz={0: -0.12})
+        cpl.set_pump(PumpTone(w_p_GHz=1.7, is_eta=True, drag=drag,
+                              delta_drag_GHz=(0.3 if drag else 0.0), chirp=chirp,
+                              envelope=RaisedCosine(amp=0.3, t_g=self.T_G)))
+        return cpl
+
+    def _cases(self):
+        from zhou_coupler import Chirp
+        return [("plain", self._build()),
+                ("drag", self._build(drag=True)),
+                ("chirp", self._build(chirp=Chirp([0.01, 0.03], self.T_G))),
+                ("chirp+drag", self._build(chirp=Chirp([0.01, 0.03], self.T_G), drag=True))]
+
+    def test_sparse_H_matches_dense_hamiltonian(self):
+        """The exact (cutoff=inf) engine must reproduce `hamiltonian_matrix`."""
+        import jax_engine as JE
+        rng = np.random.default_rng(0)
+        for label, cpl in self._cases():
+            with self.subTest(case=label):
+                eng = JE.build_engine(cpl, cutoff_GHz=np.inf)
+                params = JE.pulse_params(cpl)
+                Psi = (rng.normal(size=(cpl.dim, 4)) + 1j * rng.normal(size=(cpl.dim, 4)))
+                for t in (0.0, 13.7, 29.1, self.T_G):
+                    got = eng.H_apply(t, Psi, eng.omega_vec0, params, np)
+                    want = cpl.hamiltonian_matrix(t) @ Psi
+                    self.assertLess(np.max(np.abs(got - want)), 1e-10, f"{label} t={t}")
+
+    def test_engine_eta_matches_coupler_eta(self):
+        """`jax_engine.eta_at` is a separate implementation of `_eta_at`; pin them."""
+        import jax_engine as JE
+        for label, cpl in self._cases():
+            with self.subTest(case=label):
+                eng = JE.build_engine(cpl, cutoff_GHz=1.0)
+                params = JE.pulse_params(cpl)
+                for t in np.linspace(0.0, self.T_G, 9):
+                    got = complex(JE.eta_at(eng.spec, params, float(t), 0, np))
+                    want = cpl._eta(cpl._pump_tones[0], float(t))
+                    self.assertAlmostEqual(got, want, places=12, msg=f"{label} t={t}")
+
+    def test_cutoff_prunes_and_inf_keeps_everything(self):
+        import jax_engine as JE
+        cpl = self._build()
+        self.assertEqual(JE.build_engine(cpl, cutoff_GHz=np.inf).n_dropped, 0)
+        self.assertGreater(JE.build_engine(cpl, cutoff_GHz=1.0).n_dropped, 0)
+
+    def test_propagator_is_unitary_on_the_full_space(self):
+        """A sanity check that needs no reference: the full propagator is unitary.
+
+        (The 4x4 projection is not, because of leakage, so this checks the block
+        columns keep unit norm only in the no-leakage 2-level limit.)
+        """
+        import jax_engine as JE
+        cpl = self._build()
+        eng = JE.build_engine(cpl, cutoff_GHz=np.inf)
+        U = np.asarray(JE.propagator_columns(eng, self.T_G, carrier_resolution=0.2))
+        self.assertLessEqual(float(np.max(np.abs(U))), 1.0 + 1e-9)
+
+    def test_short_gate_does_not_diverge(self):
+        """A short gate forces a LARGE |eta|; the expm bound must follow it.
+
+        `normalize_iswap` scales the pump as ~1/t_g, so at t_g = 20 ns the peak
+        |eta| is ~7, not ~1. A fixed eta_max ceiling under-bounds ||H||, the
+        scaling-and-squaring count comes out too small, and the Taylor series
+        diverges SILENTLY -- observed as a reported "fidelity" of 1e290.
+        """
+        import jax_engine as JE
+        from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+        for t_g in (20.0, 77.2):
+            with self.subTest(t_g=t_g):
+                cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                                  participations={0: 0.1, 1: 0.1},
+                                  nonlinearities={3: 0.06}, levels=[2, 2, 3],
+                                  anharmonicities_GHz={})
+                cpl.set_pump(PumpTone(w_p_GHz=1.7, is_eta=True,
+                                      envelope=RaisedCosine(amp=1.0, t_g=t_g)),
+                             normalize_iswap=(0, 1))
+                eng = JE.build_engine(cpl, cutoff_GHz=2.0)
+                U = np.asarray(JE.propagator_columns(eng, t_g, carrier_resolution=0.1))
+                JE.check_propagator(U)          # must not raise
+                self.assertLessEqual(float(np.max(np.abs(U))), 1.0 + 1e-6)
+
+    def test_divergence_guard_fires(self):
+        """The guard must actually catch an under-bounded propagator."""
+        import jax_engine as JE
+        from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine
+        cpl = ZhouCoupler(mode_freqs_GHz=[3.8, 5.5, 4.9], coupler_index=2,
+                          participations={0: 0.1, 1: 0.1}, nonlinearities={3: 0.06},
+                          levels=[2, 2, 3], anharmonicities_GHz={})
+        cpl.set_pump(PumpTone(w_p_GHz=1.7, is_eta=True,
+                              envelope=RaisedCosine(amp=1.0, t_g=20.0)),
+                     normalize_iswap=(0, 1))
+        eng = JE.build_engine(cpl, cutoff_GHz=2.0)
+        bad = JE.propagator_columns(eng, 20.0, eta_max=2.0, carrier_resolution=0.1)
+        with self.assertRaises(FloatingPointError):
+            JE.check_propagator(np.asarray(bad))
+
+    def test_cf4_converges_fourth_order(self):
+        """Halving the step must cut the error ~16x -- the integrator's contract.
+
+        A regression here means the Magnus weights or the node placement broke, which
+        would otherwise show up only as a slightly-wrong fidelity.
+        """
+        import jax_engine as JE
+        eng = JE.build_engine(self._build(), cutoff_GHz=2.0)
+        ref = np.asarray(JE.propagator_columns(eng, self.T_G, carrier_resolution=0.0125))
+        errs = [np.max(np.abs(np.asarray(
+            JE.propagator_columns(eng, self.T_G, carrier_resolution=cr)) - ref))
+            for cr in (0.4, 0.2)]
+        self.assertGreater(errs[0] / errs[1], 8.0)
+
+
+class TestEnvelopeSingleSourceOfTruth(unittest.TestCase):
+    """zhou_coupler must RE-EXPORT the envelope classes, not redefine them.
+
+    They were duplicated verbatim in both modules; the copies would have diverged
+    the moment either was touched.
+    """
+
+    def test_reexported_classes_are_identical_objects(self):
+        import envelope
+        import zhou_coupler
+        for name in ("Envelope", "ConstantPulse", "RaisedCosine",
+                     "IQFourierEnvelope", "PumpTone", "Chirp"):
+            self.assertIs(getattr(zhou_coupler, name), getattr(envelope, name), name)
+
+
 class TestThreeModeReduction(unittest.TestCase):
     """The bare 3-mode gate must equal the decoupled 4-mode one on n_spec = 0."""
 

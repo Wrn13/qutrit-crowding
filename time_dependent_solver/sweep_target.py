@@ -188,11 +188,18 @@ def _run_target_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
     def _configure(use_drag: bool) -> None:
         """(Re)set the pump with DRAG on/off (tuned to the nearest beat) and
         renormalize the iSWAP. A fresh unit-amplitude envelope each call means the
-        normalization is not applied cumulatively."""
+        normalization is not applied cumulatively.
+
+        The chirp is rebuilt here too: this re-sets the tone from scratch, so a
+        configured chirp would otherwise be silently dropped for the whole sweep.
+        """
+        from zhou_coupler import make_chirp
         cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz,
                               envelope=EnvCls(amp=1.0, t_g=float(config["t_g_ns"])),
                               is_eta=True, drag=use_drag,
-                              delta_drag_GHz=(drag_beat if use_drag else None)),
+                              delta_drag_GHz=(drag_beat if use_drag else None),
+                              chirp=make_chirp(config.get("chirp_coeffs_GHz") or None,
+                                               float(config["t_g_ns"]))),
                      normalize_iswap=(a, b))
         cpl.scale_pump_amplitude(amp_scale)
 

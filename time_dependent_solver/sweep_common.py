@@ -62,9 +62,14 @@ DEFAULT_CONFIG = {
     # metric as the sweep, so grape_baseline_F tracks F_avg.
     "grape":            False,       # run GRAPE at each integrated point
     "grape_backend":    "qutip",     # "qutip" (qutip-qoc optimal control) | "reduced"
-    "grape_alg":        "GOAT",      # qutip optimizer: "GOAT"/"JOPT" (qutip-qoc
-                                     #   gradient methods) or "CRAB" (gradient-free
-                                     #   over a randomized basis; needs only qutip)
+    "grape_alg":        "CRAB",      # qutip optimizer. "CRAB" (default): gradient-free
+                                     #   over a randomized basis, needs only qutip, and
+                                     #   optimizes the SAME leakage-aware virtual-Z-fitted
+                                     #   metric the sweeps report. "JOPT": JAX-autodiff
+                                     #   gradient method on that same metric -- correct
+                                     #   but currently far slower per point (see
+                                     #   grape._jax_pipeline_infidelity), so opt in
+                                     #   deliberately rather than inheriting it.
     "grape_crab_restarts": 1,        # [CRAB] DCRAB super-iterations (monotone)
     "grape_crab_seed":  None,        # [CRAB] RNG seed for the random basis
     "grape_crab_score": "qutip",     # [CRAB] objective: "qutip" (exact) | "reduced"
@@ -83,6 +88,30 @@ DEFAULT_CONFIG = {
     "envelope": "raised_cosine",
     "amp_scale":      1.0,           # calibrated pump-amplitude correction (see calibrate_gate.py)
     "wp_offset_GHz":  0.0,           # calibrated pump-frequency offset from w_b - w_a
+    # propagation engine. "qutip" is the exact per-point reference (4 sesolve calls
+    # per point). "jax" is the batched engine in jax_engine.py: one sparse operator
+    # stack shared across the grid, all 4 columns in one block, vmapped over points.
+    # It is a rotating-wave REDUCTION at any finite engine_cutoff_GHz -- run
+    # `validate_engines.py --cutoff-scan` on the device before trusting a number.
+    "engine": "qutip",
+    "engine_cutoff_GHz": float("inf"),  # carrier cutoff for engine="jax". DEFAULT inf
+                                     #   (exact) ON PURPOSE: validate_engines shows a
+                                     #   finite cutoff is only safe at weak drive. At
+                                     #   |eta| ~ 9 (short gate) cutoff=3 GHz gave
+                                     #   max|dU| ~ 0.9 -- useless. The engine's speed
+                                     #   comes from the CF4 integrator + sparse ops +
+                                     #   batching, NOT from pruning, so inf costs
+                                     #   little: 0.56s vs 97s of QuTiP on that point.
+                                     #   Lower it only with a cutoff-scan to back it.
+    "engine_carrier_resolution": 0.1,  # max |Omega|*dt; the CF4 integrator is 4th
+                                     #   order, so halving this cuts the error ~16x
+    "engine_batch": 64,              # grid points per vmapped call
+    "engine_precision": "f64",       # f32 is MIXED (f64 phases, complex64 state)
+    "chirp_coeffs_GHz": [],          # time-dependent pump-frequency offset delta(t), as Legendre
+                                     #   coefficients in u = 2t/t_g - 1 (GHz). [] = no chirp.
+                                     #   [c0] is a CONSTANT offset and is exactly equivalent to
+                                     #   adding c0 to wp_offset_GHz; [c0, c1] is a linear chirp
+                                     #   sweeping c0-c1 -> c0+c1 across the gate. See envelope.Chirp.
     "stark_drive":    False,         # drive each point at its AC-Stark-shifted resonance (spectator-aware chevron)
     "stark_span_MHz": 60.0,          # per-point chevron scan width (see find_stark_resonance.py)
     "stark_points":   21,            # per-point chevron offset samples
@@ -349,7 +378,7 @@ def _grape_augment(out: Dict[str, Any], cpl, a: int, b: int,
         cutoff_GHz=float(config.get("grape_cutoff_GHz", 1.0)),
         drag_beat_GHz=drag_beat_GHz, warmstart_beat_GHz=warmstart,
         backend=str(config.get("grape_backend", "qutip")),
-        alg=str(config.get("grape_alg", "GOAT")),
+        alg=str(config.get("grape_alg", "CRAB")),
         n_basis=int(config.get("grape_nbasis", 6)),
         crab_restarts=int(config.get("grape_crab_restarts", 1)),
         crab_seed=(None if config.get("grape_crab_seed") is None

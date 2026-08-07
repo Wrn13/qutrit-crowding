@@ -16,7 +16,7 @@ deterministic grid+zoom optimizer (numpy only, unit-testable without QuTiP).
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -88,7 +88,8 @@ def auto_t_g(g3_GHz: float, lam_a: float, lam_b: float, target_eta: float) -> fl
 
 def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
                   wp_offset_GHz: float, spec_abs_GHz: Optional[float] = None,
-                  drag_beat_GHz: Optional[float] = None):
+                  drag_beat_GHz: Optional[float] = None,
+                  chirp_coeffs_GHz: Optional[Sequence[float]] = None):
     """Build the (qubit a, qubit b, coupler[, spectator]) gate with the pump
     normalized to a full iSWAP and scaled by amp_scale (anharmonicity included).
 
@@ -109,13 +110,18 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
     drag_beat_GHz : float, optional
         If given, apply a DRAG quadrature tuned to this beat (GHz) on the pump, so the
         calibration matches a DRAG-on gate. None -> no DRAG.
+    chirp_coeffs_GHz : sequence of float, optional
+        Legendre coefficients of a time-dependent pump-frequency offset delta(t)
+        (GHz), applied ON TOP of the constant `wp_offset_GHz`. None or all-zero
+        leaves the tone un-chirped and the solver path unchanged. Defaults to
+        ``config["chirp_coeffs_GHz"]``. See :class:`envelope.Chirp`.
 
     Returns
     -------
     (ZhouCoupler, float, float)
         The coupler, its pump frequency w_p (GHz), and the resulting peak |eta|.
     """
-    from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse
+    from zhou_coupler import ZhouCoupler, PumpTone, RaisedCosine, ConstantPulse, make_chirp
 
     wa, wb = (np.array(config["qubit_freqs_GHz"], dtype=float))
     ws = float(config["coupler_freq_GHz"])
@@ -139,9 +145,12 @@ def build_coupler(config: Dict[str, Any], t_g: float, amp_scale: float,
                       participations=participations, nonlinearities=nonlin, levels=levels,
                       anharmonicities_GHz=anharm)
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
+    if chirp_coeffs_GHz is None:
+        chirp_coeffs_GHz = config.get("chirp_coeffs_GHz") or None
     cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=EnvCls(amp=1.0, t_g=t_g), is_eta=True,
                           drag=(drag_beat_GHz is not None),
-                          delta_drag_GHz=(drag_beat_GHz if drag_beat_GHz is not None else 0.0)),
+                          delta_drag_GHz=(drag_beat_GHz if drag_beat_GHz is not None else 0.0),
+                          chirp=make_chirp(chirp_coeffs_GHz, t_g)),
                  normalize_iswap=(0, 1))
     cpl.scale_pump_amplitude(amp_scale)
     return cpl, w_p_GHz, cpl.peak_eta()

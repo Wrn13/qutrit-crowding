@@ -4,17 +4,13 @@
 # reference $DEVICE, and any directory in --output must pre-exist.
 #SBATCH --output=snail_grape_%j.out
 #SBATCH --error=snail_grape_%j.err
-# NOTE: #SBATCH directives are parsed before any shell runs, so they cannot
-# reference $DEVICE, and any directory in --output must pre-exist.
-#SBATCH --output=snail_grape_%j.out
-#SBATCH --error=snail_grape_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8        # single optimization process; the cores help via
                                  # BLAS on the propagator/gradient matrix products.
 #SBATCH --mem=16G
 #SBATCH --time=06:00:00          # BACKEND=reduced      : minutes.
-                                 # ALG=GOAT/JOPT        : integrates the augmented
-                                 #   gradient system through the FULL Hamiltonian every
+                                 # ALG=JOPT             : differentiates the FULL
+                                 #   Hamiltonian propagator by JAX autodiff every
                                  #   iteration -> ~10 min to hours (dim, N_BASIS,
                                  #   MAXITER). Start with MAXITER=30.
                                  # ALG=CRAB CRAB_SCORE=qutip : gradient-free, so
@@ -42,11 +38,9 @@
 # Both backends here handle the nonlinearity exactly, via the chain rule through
 # d(eta^p conj(eta)^q)/d(eta):
 #
-#   BACKEND=qutip    Three optimizers, selected with ALG:
-#                    ALG=GOAT  qutip-qoc, gradient-based: differentiates the exact
-#                              propagator by integrating the gradient equations of
-#                              motion. Needs: pip install qutip-qoc
-#                    ALG=JOPT  same gradients by JAX auto-differentiation.
+#   BACKEND=qutip    Two optimizers, selected with ALG:
+#                    ALG=JOPT  qutip-qoc, gradient-based: differentiates the exact
+#                              propagator by JAX auto-differentiation.
 #                              Needs: pip install qutip-qoc qutip-jax jax
 #                    ALG=CRAB  Chopped RAndom Basis, GRADIENT-FREE: expands the
 #                              pulse in a truncated randomized Fourier basis over a
@@ -102,8 +96,8 @@
 #   DEVICE   (required) device JSON (bare name resolves under devices/)
 #   T_G      (required) gate duration in ns
 #   BACKEND  qutip | reduced                                      [qutip]
-#   ALG      GOAT | JOPT | CRAB   (BACKEND=qutip)                  [GOAT]
-#   N_BASIS  basis size: sin() functions per quadrature (GOAT/JOPT) or randomized
+#   ALG      JOPT | CRAB   (BACKEND=qutip)                         [JOPT]
+#   N_BASIS  basis size: sin() functions per quadrature (JOPT) or randomized
 #            harmonics (CRAB; 4 real coefficients each)            [6]
 #   CRAB_RESTARTS  [CRAB] DCRAB super-iterations (monotone; params grow by
 #                  4*N_BASIS each)                                 [1]
@@ -135,10 +129,9 @@ set -euo pipefail
 
 DEVICE="${DEVICE:?set DEVICE=<device>.json}"
 T_G="${T_G:?set T_G=<gate length in ns>}"
-T_G="${T_G:?set T_G=<gate length in ns>}"
 LAUNCHER="${LAUNCHER:-uv run python}"
 BACKEND="${BACKEND:-qutip}"
-ALG="${ALG:-GOAT}"
+ALG="${ALG:-JOPT}"
 CRAB_RESTARTS="${CRAB_RESTARTS:-1}"
 CRAB_SCORE="${CRAB_SCORE:-qutip}"
 CRAB_METHOD="${CRAB_METHOD:-Nelder-Mead}"
@@ -166,7 +159,7 @@ export MPLBACKEND=Agg
 
 # module load python/3.12      # or: conda activate qsim
 # source .venv/bin/activate    # (then set LAUNCHER=python)
-# ALG=GOAT/JOPT need: pip install qutip-qoc  (JOPT also needs qutip-jax jax).
+# ALG=JOPT needs: pip install qutip-qoc qutip-jax jax
 # ALG=CRAB needs only qutip itself.
 cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 
@@ -180,12 +173,7 @@ srun ${LAUNCHER} grape.py \
     --device "${DEVICE}" --t-g-ns "${T_G}" \
     --amp-scale "${AMP_SCALE}" --wp-offset-GHz "${WP_OFFSET}" \
     --backend "${BACKEND}" --alg "${ALG}" --n-basis "${N_BASIS}" \
-    --device "${DEVICE}" --t-g-ns "${T_G}" \
-    --amp-scale "${AMP_SCALE}" --wp-offset-GHz "${WP_OFFSET}" \
-    --backend "${BACKEND}" --alg "${ALG}" --n-basis "${N_BASIS}" \
     --n-ctrl "${N_CTRL}" --cutoff-GHz "${CUTOFF}" --maxiter "${MAXITER}" \
     ${OPTS}
-    ${OPTS}
 
-echo "done end=$(date -Is)"
 echo "done end=$(date -Is)"

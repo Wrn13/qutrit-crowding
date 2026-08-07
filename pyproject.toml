@@ -24,9 +24,22 @@ dependencies = [
     "lovelyplots",
     "openfermion>=0.11.0",
     "joblib>=1.5.3",
+    "jax>=0.4.30",
+    "qutip-qoc>=0.2.0",
+    "qutip-jax>=0.0.1",
+    # used directly throughout time_dependent_solver (linalg.expm, optimize,
+    # sparse); it was arriving only transitively via qutip.
+    "scipy",
+    # zhou_coupler.use_gpu() imports it; it was arriving only transitively.
+    "diffrax>=0.6",
 ]
 
 [project.optional-dependencies]
+# CUDA build of jax for the batched engine (jax_engine.py). Install on the cluster
+# AFTER the base env, and match the CUDA module the node actually provides:
+#     module load cuda && uv pip install -e '.[gpu]'
+# Nothing else changes: the engine is xp-generic, so the same code runs on CPU.
+gpu = ["jax[cuda12]>=0.4.30"]
 dev = ["ipykernel", "pre-commit", "pylatexenc", "ipywidgets", "ipympl"]
 format = [
     "pre-commit",

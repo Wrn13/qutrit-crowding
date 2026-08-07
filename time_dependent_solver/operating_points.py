@@ -30,7 +30,9 @@ from typing import Any, Dict, List, Optional, Tuple
 #: keys that describe WHERE a point was calibrated (used for validation)
 CONTEXT_KEYS = ("wa_GHz", "wb_GHz", "t_g_ns", "spec_abs_GHz", "drag_beat_GHz")
 #: keys that the point actually SETS on a run
-SETTING_KEYS = ("amp_scale", "wp_offset_GHz", "t_g_ns")
+#: `chirp_coeffs_GHz` is a list, not a scalar -- a calibrated chirp is part of the
+#: operating point exactly like the constant pump offset it generalizes.
+SETTING_KEYS = ("amp_scale", "wp_offset_GHz", "t_g_ns", "chirp_coeffs_GHz")
 
 
 def list_points(config: Dict[str, Any]) -> List[str]:

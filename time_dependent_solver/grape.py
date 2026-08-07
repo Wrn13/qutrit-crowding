@@ -5,12 +5,21 @@ fidelity and compares it against the DRAG-shaped raised-cosine gate the sweeps
 use. The pump enters the Hamiltonian NONLINEARLY (eta, eta^2, eta^3 from g3 X^3),
 so control-linear GRAPE does not apply; two backends are provided:
 
-* backend='qutip', alg='GOAT' or 'JOPT': QuTiP's optimal-control package
-  ``qutip-qoc`` with an analytic-control GRADIENT method -- GOAT integrates the
-  propagator-gradient equations of motion, JOPT gets the same gradients by JAX
-  auto-differentiation. Both differentiate the EXACT propagator w.r.t. a shared
-  analytic-ansatz parameter vector through the nonlinearity, and QuTiP does the
-  propagation. Needs ``qutip`` + ``qutip-qoc`` (+ ``qutip-jax``/``jax`` for JOPT).
+* backend='qutip', alg='JOPT': JAX-autodiff GRADIENT method over the analytic I/Q
+  ansatz (``_iq_ansatz``), differentiating the reduced-model propagator exactly
+  with ``jax.grad`` and driving scipy L-BFGS-B. Needs only ``jax``.
+  NOT qutip-qoc's JOPT: that package scores the FULL-dimension propagator with no
+  virtual-Z freedom (its TRACEDIFF/PSU/SU objectives), whereas this pipeline
+  reports the 4x4 projection with single-qubit Z fitted out -- and on this gate the
+  Z fit is worth +0.76 of a fidelity of 0.95, so a phase-rigid objective spends
+  real fidelity chasing free phases and walks DOWNHILL from its own start. See
+  ``_jax_pipeline_infidelity``. Correct, but currently much slower per point than
+  CRAB (a ~600-step expm chain per objective), so it is opt-in, not the default.
+  Because the gradient comes from tracing, the ansatz and every pump-bearing
+  coefficient must be built with ``jax.numpy`` and stay free of
+  ``float()``/``np.asarray(..., dtype=...)`` on parameter-dependent values --
+  either one forces a tracer to a concrete value and raises. ``_iq_ansatz`` takes
+  the array module as ``xp`` for exactly this reason.
 * backend='qutip', alg='CRAB': Chopped RAndom Basis -- expand the pulse in a
   truncated RANDOMIZED Fourier basis over a fixed shape function and minimize the
   infidelity with a gradient-FREE optimizer (Nelder-Mead, as in qutip-qtrl).
@@ -32,9 +41,9 @@ validated in the full ``iswap_fidelity`` sim before use.
 CLI
 ---
     python grape.py --device warren_device.json --t-g-ns 92.6 \
-        --backend qutip --alg GOAT [--warmstart-drag-beat-GHz ...]
+        --backend qutip --alg JOPT [--warmstart-drag-beat-GHz ...]
     python grape.py --device warren_device.json --t-g-ns 92.6 \
-        --backend qutip --alg GOAT [--warmstart-drag-beat-GHz ...]
+        --backend qutip --alg CRAB [--warmstart-drag-beat-GHz ...]
 """
 from __future__ import annotations
 
@@ -73,7 +82,9 @@ def _prepare(cpl, a: int, b: int, cutoff_GHz: float):
     return terms, H_anh, idx, max_Omega
 
 
-def _H(t: float, eta: complex, terms, H_anh: np.ndarray,
+def _H(t: float, eta: complex,
+
+ terms, H_anh: np.ndarray,
        offset_rad: float = 0.0) -> np.ndarray:
     """Interaction-picture Hamiltonian at time t for pump amplitude eta.
 
@@ -142,23 +153,30 @@ def _raised_cosine_eta(t_g: float, peak: float, n_ctrl: int,
     return eta
 
 
-def _iq_ansatz(t_g: float, peak: float, n_basis: int):
-    """Analytic complex pump ansatz eta(t; p) for GOAT/JOPT.
+def _iq_ansatz(t_g: float, peak: float, n_basis: int, xp=np):
+    """Analytic complex pump ansatz eta(t; p) for the qutip-qoc gradient method.
 
     eta(t) = peak * env(t) * [ (1 + sum_k pI_k s_k(t)) + i * sum_k pQ_k s_k(t) ],
     env = raised cosine, s_k(t) = sin(k*pi*t/t_g) (zero-ended, so the pulse still
     turns on/off smoothly). p = [pI_1..K, pQ_1..K]; p = 0 -> plain raised cosine.
     Returned as a scalar-in-time function so it slots straight into a QobjEvo/qoc
-    coefficient. Kept in plain numpy; JOPT wraps it through JAX automatically.
-    """
-    ks = np.arange(1, n_basis + 1)
+    coefficient.
 
-    def eta(t: float, p) -> complex:
-        p = np.asarray(p, dtype=float)
-        env = 0.5 * (1.0 - np.cos(2.0 * np.pi * t / t_g))
-        s = np.sin(ks * np.pi * t / t_g)
-        amp_I = 1.0 + float(np.dot(p[:n_basis], s))
-        amp_Q = float(np.dot(p[n_basis:], s))
+    ``xp`` is the array module the body is built from: ``numpy`` for a plain
+    evaluation, ``jax.numpy`` under alg='JOPT'. JOPT obtains its gradient by
+    TRACING this function in ``p``, so under JAX the body has to stay trace-clean:
+    no ``asarray(p, dtype=float)`` and no ``float(...)`` of a p-dependent value,
+    since either forces a tracer to a concrete value and raises
+    (TracerArrayConversionError / ConcretizationTypeError).
+    """
+    ks = xp.arange(1, n_basis + 1)
+
+    def eta(t, p):
+        p = xp.asarray(p)                     # no dtype= : must not concretize a tracer
+        env = 0.5 * (1.0 - xp.cos(2.0 * xp.pi * t / t_g))
+        s = xp.sin(ks * xp.pi * t / t_g)
+        amp_I = 1.0 + xp.dot(p[:n_basis], s)
+        amp_Q = xp.dot(p[n_basis:], s)
         return peak * env * (amp_I + 1j * amp_Q)
 
     return eta
@@ -183,9 +201,15 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
 
     The SNAIL gate is control-NONLINEAR (the pump enters as eta, eta^2, eta^3 via
     g3 X^3), so classic control-linear GRAPE does not apply. We use qutip-qoc's
-    analytic-control gradient methods -- GOAT (propagator-gradient EOM) or JOPT
-    (JAX autodiff) -- which differentiate the exact propagator w.r.t. the shared
-    ansatz parameters through that nonlinearity.
+    JOPT analytic-control gradient method, which differentiates the exact
+    propagator w.r.t. the shared ansatz parameters through that nonlinearity by
+    JAX auto-differentiation.
+
+    Everything the gradient flows through -- the ansatz and every pump-bearing
+    coefficient -- is therefore built from ``jax.numpy`` (``xp`` below) rather than
+    numpy: JOPT traces these callables in ``p``, and a numpy ufunc applied to a
+    tracer raises instead of differentiating. x64 is enabled because the default
+    JAX float32/complex64 precision is far coarser than the 1e-4 fidelity target.
 
     Construction:
       * operator basis: ``ZhouCoupler.expand_terms(cutoff_GHz)`` gives the rotating-
@@ -202,15 +226,32 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
         so F_baseline/F_grape stay directly comparable to the rest of the pipeline,
         while the optimization itself ran on QuTiP.
 
-    Requires ``qutip`` and ``qutip-qoc`` (and ``qutip-jax``/``jax`` for alg='JOPT').
+    Requires ``qutip``, ``qutip-qoc``, ``qutip-jax`` and ``jax``.
     """
     import qutip as qt
-    import qutip_qoc as qoc
+
+    alg = str(alg).upper()
+    if alg != "JOPT":
+        raise ValueError(f"_optimize_qoc: unsupported alg {alg!r}; the qutip-qoc "
+                         f"gradient path is 'JOPT' (use alg='CRAB' for the "
+                         f"gradient-free optimizer, which needs only qutip)")
+    try:
+        import qutip_qoc as qoc
+        import jax
+        import jax.numpy as xp
+        import qutip_jax                      # noqa: F401  registers the jax data layer
+    except ImportError as exc:
+        raise ImportError(
+            f"alg='JOPT' needs qutip-qoc, qutip-jax and jax, but importing them "
+            f"failed ({exc}). Install them, or use alg='CRAB' -- the gradient-free "
+            f"optimizer, which requires only qutip.") from exc
+    # the fidelity target is 1e-4; JAX's default single precision cannot resolve it
+    jax.config.update("jax_enable_x64", True)
 
     terms, H_anh, idx, max_Omega = _prepare(cpl, a, b, cutoff_GHz)
     peak = float(cpl.peak_eta())
     dims = [list(cpl.dims), list(cpl.dims)]
-    eta = _iq_ansatz(t_g, peak, n_basis)
+    eta = _iq_ansatz(t_g, peak, n_basis, xp=xp)
 
     # split into (time-dependent) drift and pump-bearing controls
     drift_list: list = [qt.Qobj(np.asarray(H_anh), dims=dims)]
@@ -221,14 +262,16 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
             if Omega == 0.0:
                 drift_list.append(Oq)
             else:
-                drift_list.append([Oq, (lambda Om: (lambda t, _a=None: np.exp(-1j * Om * t)))(Omega)])
+                drift_list.append([Oq, (lambda Om: (lambda t, _a=None: xp.exp(-1j * Om * t)))(Omega)])
             continue
 
+        # carries the gradient: JOPT traces c() in p, so it must be built from xp
+        # (jax.numpy) end to end -- a numpy conj/exp applied to a tracer raises.
         def make_coeff(Om=Omega, npv=n_pos, nnv=n_neg):
             def c(t, p):
                 e = eta(t, p)
-                val = (e ** npv) * (np.conj(e) ** nnv)
-                return val * np.exp(-1j * Om * t) if Om != 0.0 else val
+                val = (e ** npv) * (xp.conj(e) ** nnv)
+                return val * xp.exp(-1j * Om * t) if Om != 0.0 else val
             return c
         control.append([Oq, make_coeff()])
 
@@ -244,7 +287,14 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     initial = qt.qeye(cpl.dims)
 
     p_guess = _drag_seed_params(t_g, peak, n_basis, warmstart_beat_GHz)
-    bound = 2.0                                  # |Fourier coeff| bound (dimensionless)
+    # Per-coefficient bound, chosen so the PULSE stays physical rather than the
+    # coefficient merely looking small. amp_I = 1 + sum_k p_k s_k with |s_k| <= 1,
+    # so |eta| <= peak * (1 + n_basis * bound): a fixed bound of 2.0 admitted
+    # (1 + 2*n_basis)x the calibrated peak, and the optimizer duly pinned every
+    # coefficient to it and returned a wildly over-driven, all-leakage pulse.
+    # bound = 1/n_basis caps the worst case at 2x peak, matching the 'reduced'
+    # backend's 2.0*peak bound in physical eta units.
+    bound = 1.0 / float(n_basis)
     result = qoc.optimize_pulses(
         objectives=[qoc.Objective(initial, H, target)],
         control_parameters={"p": {"guess": list(p_guess),
@@ -268,10 +318,13 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
 
     # RE-SCORE optimized and baseline pulses on the sweep's reduced propagator so the
     # reported F's line up with the rest of the pipeline (the OPTIMIZER used QuTiP).
+    # Rebuild the ansatz in numpy: `eta` above is JAX-backed, and the reduced
+    # propagator/scoring path downstream is plain numpy/scipy.
+    eta_np = _iq_ansatz(t_g, peak, n_basis, xp=np)
     dt_ctrl = t_g / max(int(n_time), 1)
     n_sub = max(1, int(np.ceil(max_Omega * dt_ctrl / 0.3)))
     ts = (np.arange(n_time) + 0.5) * (t_g / n_time)
-    eta_opt = np.array([eta(t, p_star) for t in ts], dtype=complex)
+    eta_opt = np.array([eta_np(t, p_star) for t in ts], dtype=complex)
     eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz)
     Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub), cpl)
     F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub), cpl)
@@ -279,10 +332,236 @@ def _optimize_qoc(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: 
     return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
                 eta_opt=eta_opt, F_grape=Fg, leak_grape=leakg,
                 n_ctrl=n_time, n_sub=n_sub, cutoff_GHz=cutoff_GHz,
-                nfev=int(getattr(result, "iters", getattr(result, "n_iters", -1))),
+                nfev=int(getattr(result, "num_iter",
+                                 getattr(result, "iters",
+                                         getattr(result, "n_iters", -1)))),
                 warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
                                     else float(warmstart_beat_GHz)),
                 backend="qutip", alg=alg, n_basis=n_basis, qoc_fid_err=qoc_fid_err)
+
+
+def _jax_pipeline_infidelity(terms, H_anh, idx, t_g: float, n_sub: int,
+                             n_ctrl: int, eta_max: float, z_grid: int = 1024):
+    """Build a JAX-traceable ``eta_ctrl -> 1 - F`` on the SWEEP's own metric.
+
+    This exists because qutip-qoc cannot express the metric the rest of the
+    pipeline reports. Its objectives (TRACEDIFF / PSU / SU) all score the
+    FULL-dimension propagator rigidly in phase, whereas the sweep scores the 4x4
+    projection with single-qubit virtual-Z phases fitted out -- and those phases
+    are not a detail here: on the raised-cosine baseline the Z fit is worth +0.76
+    of a fidelity of 0.95. Optimizing a phase-rigid objective therefore spends
+    real fidelity chasing phases that are free in software, which is exactly why
+    the qutip-qoc run came back BELOW its own starting point.
+
+    So the objective is rebuilt here in JAX, term for term the same computation as
+    ``_propagate`` + ``ZhouCoupler._iswap_fidelity_from_U(U, True)``:
+
+      * propagate the 4 computational columns through the same piecewise-constant
+        slices with ``jax.scipy.linalg.expm`` (differentiable),
+      * project onto the 4x4 computational block,
+      * fit the virtual Z, by the same 1-D reduction ``_fit_virtual_z`` uses (see
+        that docstring for the derivation): with c_k = (U U_ideal^dag)_kk the
+        overlap is A(pa) + e^{i pb} B(pa), so the maximum over pb is |A| + |B|
+        ANALYTICALLY and only pa is swept over ``z_grid`` points. Vectorized, and
+        differentiable through ``jnp.max`` (the gradient flows through the winning
+        grid point, as in max-pooling). The numpy version additionally ternary-
+        searches within the winning cell, so this stays marginally pessimistic --
+        the safe side, and now by ~(2 pi / z_grid)^2 in the merit rather than by a
+        two-axis grid error.
+      * Pedersen leakage-aware fidelity (overlap + Tr[U^dag U]) / 20.
+
+    Because the optimizer and the reporter now evaluate the SAME function, the
+    optimized F is directly comparable to F_baseline and to the sweep's F_avg --
+    no re-scoring disagreement is possible by construction.
+
+    Parameters
+    ----------
+    eta_max : float
+        Largest |eta| the caller can present. Only used to bound ||H|| when
+        choosing the propagator's squaring count (see below); pass the optimizer's
+        own amplitude ceiling, not the nominal peak.
+
+    Returns
+    -------
+    callable
+        ``infid(eta_ctrl)`` with ``eta_ctrl`` a length-``n_ctrl`` complex vector.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    dt_ctrl = t_g / n_ctrl
+    dt_fine = dt_ctrl / n_sub
+    dim = H_anh.shape[0]
+
+    # Scaling-and-squaring with the squaring count fixed at BUILD time rather than
+    # read off ||A|| at runtime. jax.scipy.linalg.expm does the latter, i.e. with
+    # data-dependent control flow, which cannot compile once inside lax.scan and
+    # made the reverse-mode compile of a ~600-step chain never finish.
+    #
+    # The count must still come from a real bound. It is NOT enough to lean on
+    # carrier_resolution: that caps max_Omega*dt_fine at ~0.3, but ||H|| also has
+    # H_anh and the operator norms in it, which it does not bound at all -- with a
+    # small n_sub (large dt_fine) a hardcoded 3 squarings silently returns a
+    # diverged Taylor series (observed: 0.798 vs a true 0.222). So bound
+    # ||H|| <= ||H_anh|| + sum_j ||O_j|| * eta_max^(n_pos+n_neg) in numpy here,
+    # where eta_max caps the pump the optimizer may request, and pick the squarings
+    # so the scaled argument is <= 1/2. Order 12 at 1/2 truncates at ~2e-14.
+    _op_norm = float(np.linalg.norm(np.asarray(H_anh), 2))
+    for _Om, _np_, _nn, _O in terms:
+        _op_norm += float(np.linalg.norm(np.asarray(_O), 2)) * eta_max ** (_np_ + _nn)
+    _SQ = int(max(0, np.ceil(np.log2(max(_op_norm * dt_fine, 1e-12) / 0.5))))
+    _ORDER = 12
+
+    def expm(A):
+        As = A / (2 ** _SQ)
+        eye = jnp.eye(As.shape[-1], dtype=As.dtype)
+        term, out = eye, eye
+        for k in range(1, _ORDER + 1):
+            term = term @ As / k
+            out = out + term
+        for _ in range(_SQ):
+            out = out @ out
+        return out
+
+    # static (traced-constant) pieces, promoted to JAX arrays once
+    H_anh_j = jnp.asarray(np.asarray(H_anh), dtype=jnp.complex128)
+    Om_j = jnp.asarray([Om for Om, _, _, _ in terms], dtype=jnp.float64)
+    npos = jnp.asarray([p for _, p, _, _ in terms], dtype=jnp.float64)
+    nneg = jnp.asarray([n for _, _, n, _ in terms], dtype=jnp.float64)
+    Ops = jnp.asarray(np.array([np.asarray(O) for _, _, _, O in terms]),
+                      dtype=jnp.complex128)                      # (n_terms, dim, dim)
+
+    Psi0 = jnp.asarray(np.eye(dim, dtype=complex)[:, list(idx)])  # (dim, 4)
+    U_ideal = jnp.asarray(_ideal_iswap_np(), dtype=jnp.complex128)
+    # 1-D phase sweep: phi_b is handled analytically (see below), so only phi_a is
+    # gridded. Same z_grid budget buys a far finer sweep than the old 2-D version.
+    phases = jnp.asarray(np.linspace(0.0, 2.0 * np.pi, z_grid, endpoint=False))
+
+    def H_at(t, eta):
+        f = (eta ** npos) * (jnp.conj(eta) ** nneg) * jnp.exp(-1j * Om_j * t)
+        return H_anh_j + jnp.tensordot(f.astype(jnp.complex128), Ops, axes=(0, 0))
+
+    # Fine-step schedule, flattened: step k sits at time t_all[k] and uses the
+    # control slice eta_ctrl[slice_of[k]]. Driving this with lax.scan rather than a
+    # Python loop matters a lot -- there are n_ctrl*n_sub (here ~600) expm calls per
+    # objective, and unrolling them builds a trace so large that compiling the
+    # reverse-mode gradient effectively never finishes. scan compiles ONE step.
+    n_steps = n_ctrl * n_sub
+    t_all = jnp.asarray(((np.arange(n_steps) % n_sub) + 0.5) * dt_fine
+                        + (np.arange(n_steps) // n_sub) * dt_ctrl)
+    slice_of = jnp.asarray(np.repeat(np.arange(n_ctrl), n_sub))
+
+    def infid(eta_ctrl):
+        eta_steps = eta_ctrl[slice_of]                            # (n_steps,)
+
+        def step(Psi, xs):
+            t, eta = xs
+            return expm(-1j * H_at(t, eta) * dt_fine) @ Psi, None
+
+        Psi, _ = jax.lax.scan(step, Psi0, (t_all, eta_steps))
+        U = Psi[jnp.asarray(list(idx)), :]                        # (4, 4)
+
+        # virtual-Z fit, matching zhou_coupler._fit_virtual_z: with
+        # c_k = (U U_ideal^dag)_kk the overlap is
+        #   sum_k z_k c_k = (c0 + e^{i pa} c2) + e^{i pb} (c1 + e^{i pa} c3) = A + e^{i pb} B,
+        # so max over pb is |A| + |B| ANALYTICALLY (rotate B onto A). Only pa is
+        # swept, which removes the pb grid error entirely and leaves the max over a
+        # 1-D grid -- still a subgradient through argmax, but on one axis, not two.
+        c = jnp.diag(U @ jnp.conj(U_ideal).T)                     # c_k, length 4
+        e = jnp.exp(1j * phases)
+        merit = jnp.abs(c[0] + e * c[2]) + jnp.abs(c[1] + e * c[3])
+        overlap = jnp.max(merit) ** 2                             # virtual-Z fitted
+        trace_UU = jnp.real(jnp.trace(jnp.conj(U).T @ U))
+        return 1.0 - (overlap + trace_UU) / 20.0                  # d*(d+1), d = 4
+
+    return infid
+
+
+def _ideal_iswap_np() -> np.ndarray:
+    """Local copy of the 4x4 target (avoids importing zhou_coupler at module import)."""
+    U = np.eye(4, dtype=complex)
+    U[1, 1] = U[2, 2] = 0.0
+    U[1, 2] = U[2, 1] = 1j
+    return U
+
+
+def _optimize_jax(cpl, a: int, b: int, t_g: float, *, n_basis: int, cutoff_GHz: float,
+                  drag_beat_GHz: Optional[float], warmstart_beat_GHz: Optional[float],
+                  maxiter: int, n_time: int, verbose: bool) -> Dict[str, Any]:
+    """JAX-autodiff gradient optimizer over the pipeline's OWN fidelity metric.
+
+    Same analytic I/Q ansatz as before (``_iq_ansatz``), but the objective is
+    ``_jax_pipeline_infidelity`` -- the leakage-aware, virtual-Z-fitted iSWAP
+    fidelity the sweeps report -- differentiated exactly by ``jax.grad`` and
+    handed to scipy L-BFGS-B with ``jac=True``.
+
+    This replaces the qutip-qoc route for the gradient method. qutip-qoc scores
+    the full-dimension propagator with no virtual-Z freedom, which on this gate
+    disagrees with the pipeline by ~0.13 in fidelity and sends the optimizer
+    downhill; see ``_jax_pipeline_infidelity`` for the measurement. Here the
+    optimizer and the reporter are the same function, so ``F_grape`` is exact
+    rather than re-scored, and ``dF_grape`` is a true improvement over
+    ``F_baseline``.
+
+    Requires ``jax``. Does NOT require qutip-qoc or qutip-jax.
+    """
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError(
+            f"alg='JOPT' needs jax ({exc}). Install it, or use alg='CRAB' -- the "
+            f"gradient-free optimizer, which requires only qutip.") from exc
+    jax.config.update("jax_enable_x64", True)     # 1e-4 fidelities need float64
+
+    terms, H_anh, idx, max_Omega = _prepare(cpl, a, b, cutoff_GHz)
+    peak = float(cpl.peak_eta())
+    dt_ctrl = t_g / max(int(n_time), 1)
+    n_sub = max(1, int(np.ceil(max_Omega * dt_ctrl / 0.3)))
+
+    eta_fn = _iq_ansatz(t_g, peak, n_basis, xp=jnp)
+    ts = (np.arange(n_time) + 0.5) * (t_g / n_time)
+    ts_j = jnp.asarray(ts)
+    # the L-BFGS-B box below caps amp_I/amp_Q at 1 + n_basis*bound = 2, so the
+    # optimizer can never present more than 2*peak; that is the bound the
+    # propagator sizes its scaling-and-squaring against.
+    infid_eta = _jax_pipeline_infidelity(terms, H_anh, idx, t_g, n_sub, n_time,
+                                         eta_max=2.0 * peak)
+
+    def objective(p):
+        eta_ctrl = jnp.stack([eta_fn(t, p) for t in ts_j])
+        return infid_eta(eta_ctrl)
+
+    obj_and_grad = jax.jit(jax.value_and_grad(objective))
+
+    def scipy_obj(x):
+        v, g = obj_and_grad(jnp.asarray(x))
+        return float(v), np.asarray(g, dtype=float)
+
+    p0 = _drag_seed_params(t_g, peak, n_basis, warmstart_beat_GHz)
+    # keep |eta| <= 2 * peak: amp_I = 1 + sum_k p_k s_k with |s_k| <= 1
+    bound = 1.0 / float(n_basis)
+    res = minimize(scipy_obj, p0, method="L-BFGS-B", jac=True,
+                   bounds=[(-bound, bound)] * (2 * n_basis),
+                   options=dict(maxiter=maxiter, ftol=1e-12, disp=verbose))
+    p_star = np.asarray(res.x, dtype=float)
+
+    # reconstruct + score in numpy on the identical model (agreement is a check,
+    # not a re-score: the optimizer minimized exactly this quantity)
+    eta_np = _iq_ansatz(t_g, peak, n_basis, xp=np)
+    eta_opt = np.array([eta_np(t, p_star) for t in ts], dtype=complex)
+    eta0 = _raised_cosine_eta(t_g, peak, n_time, drag_beat_GHz)
+    Fg, leakg = _score(_propagate(eta_opt, t_g, terms, H_anh, idx, n_sub), cpl)
+    F0, leak0 = _score(_propagate(eta0, t_g, terms, H_anh, idx, n_sub), cpl)
+
+    return dict(eta_baseline=eta0, F_baseline=F0, leak_baseline=leak0,
+                eta_opt=eta_opt, F_grape=Fg, leak_grape=leakg,
+                n_ctrl=n_time, n_sub=n_sub, cutoff_GHz=cutoff_GHz,
+                nfev=int(res.nfev),
+                warmstart_beat_GHz=(np.nan if warmstart_beat_GHz is None
+                                    else float(warmstart_beat_GHz)),
+                backend="qutip", alg="JOPT", n_basis=n_basis,
+                qoc_fid_err=float(res.fun))
 
 
 def _crab_frequencies(n_basis: int, t_g: float, rng, jitter: float = 0.5) -> np.ndarray:
@@ -479,7 +758,7 @@ def _optimize_crab(cpl, a: int, b: int, t_g: float, *, n_basis: int,
 def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
                    cutoff_GHz: float = 1.0, drag_beat_GHz: Optional[float] = None,
                    warmstart_beat_GHz: Optional[float] = None,
-                   backend: str = "qutip", alg: str = "GOAT", n_basis: int = 6,
+                   backend: str = "qutip", alg: str = "CRAB", n_basis: int = 6,
                    maxiter: int = 200, carrier_resolution: float = 0.3,
                    crab_restarts: int = 1, crab_seed: Optional[int] = None,
                    crab_score: str = "qutip", crab_method: str = "Nelder-Mead",
@@ -496,22 +775,22 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
     t_g : float
         Gate duration (ns).
     backend : {'qutip', 'reduced'}
-        'qutip' (default) optimizes with QuTiP: ``alg='GOAT'``/``'JOPT'`` go
-        through ``qutip-qoc``'s analytic-control gradient methods, ``alg='CRAB'``
+        'qutip' (default) optimizes with QuTiP: ``alg='JOPT'`` goes through
+        ``qutip-qoc``'s JAX analytic-control gradient method, ``alg='CRAB'``
         runs the Chopped RAndom Basis algorithm with QuTiP's compiled
-        ``sesolve`` as the black-box objective. All three handle the
+        ``sesolve`` as the black-box objective. Both handle the
         eta/eta^2/eta^3 control-nonlinearity of the SNAIL gate. 'reduced' is the
         in-house scipy L-BFGS-B optimizer over the rotating-frame reduced model
         (fast, no QuTiP).
-    alg : {'GOAT', 'JOPT', 'CRAB'}
-        Algorithm for ``backend='qutip'``. GOAT integrates the propagator-gradient
-        equations of motion; JOPT gets the same gradients by JAX autodiff (needs
-        ``qutip-jax``); CRAB is gradient-FREE over a randomized Fourier basis, so
-        it needs neither ``qutip-qoc`` nor gradients -- only ``qutip`` itself --
-        and is the most robust choice when a gradient method stalls or when
-        ``qutip-qoc`` is unavailable. It costs many exact propagations, though.
+    alg : {'JOPT', 'CRAB'}
+        Algorithm for ``backend='qutip'``. JOPT differentiates the exact
+        propagator by JAX autodiff (needs ``qutip-qoc`` + ``qutip-jax``/``jax``);
+        CRAB is gradient-FREE over a randomized Fourier basis, so it needs
+        neither ``qutip-qoc`` nor gradients -- only ``qutip`` itself -- and is the
+        most robust choice when the gradient method stalls or when the JAX stack
+        is unavailable. It costs many exact propagations, though.
     n_basis : int
-        Basis size: sin() functions per quadrature (GOAT/JOPT) or randomized
+        Basis size: sin() functions per quadrature (JOPT) or randomized
         harmonics (CRAB, 4 real coefficients each). ``n_ctrl`` is the
         piecewise-constant control count for the 'reduced' backend and the
         tlist/sample resolution otherwise.
@@ -557,10 +836,10 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
                               seed=crab_seed, score=crab_score, method=crab_method,
                               atol=atol, rtol=rtol, nsteps=nsteps, verbose=verbose)
     if backend == "qutip":
-        return _optimize_qoc(cpl, a, b, t_g, n_basis=n_basis, cutoff_GHz=cutoff_GHz,
+        return _optimize_jax(cpl, a, b, t_g, n_basis=n_basis, cutoff_GHz=cutoff_GHz,
                              drag_beat_GHz=drag_beat_GHz,
                              warmstart_beat_GHz=warmstart_beat_GHz,
-                             maxiter=maxiter, alg=alg, n_time=n_ctrl, verbose=verbose)
+                             maxiter=maxiter, n_time=n_ctrl, verbose=verbose)
     terms, H_anh, idx, max_Omega = _prepare(cpl, a, b, cutoff_GHz)
     dt_ctrl = t_g / n_ctrl
     n_sub = max(1, int(np.ceil(max_Omega * dt_ctrl / carrier_resolution)))
@@ -576,10 +855,6 @@ def optimize_pulse(cpl, a: int, b: int, t_g: float, *, n_ctrl: int = 24,
         F, _ = _score(U, cpl)
         return 1.0 - F
 
-    # optimizer seed: the baseline pulse, or a DRAG raised cosine at a supplied beat
-    eta_seed = (eta0 if warmstart_beat_GHz is None
-                else _raised_cosine_eta(t_g, peak, n_ctrl, warmstart_beat_GHz))
-    x0 = np.concatenate([eta_seed.real, eta_seed.imag])
     # optimizer seed: the baseline pulse, or a DRAG raised cosine at a supplied beat
     eta_seed = (eta0 if warmstart_beat_GHz is None
                 else _raised_cosine_eta(t_g, peak, n_ctrl, warmstart_beat_GHz))
@@ -628,18 +903,15 @@ def main() -> None:
     ap.add_argument("--warmstart-drag-beat-GHz", type=float, default=None,
                     help="seed the optimizer from a DRAG raised cosine at this beat "
                          "(baseline/dF unchanged); good start for a hard collision")
-    ap.add_argument("--warmstart-drag-beat-GHz", type=float, default=None,
-                    help="seed the optimizer from a DRAG raised cosine at this beat "
-                         "(baseline/dF unchanged); good start for a hard collision")
     ap.add_argument("--n-ctrl", type=int, default=24)
     ap.add_argument("--cutoff-GHz", type=float, default=1.0)
     ap.add_argument("--backend", choices=["qutip", "reduced"], default="qutip",
                     help="qutip = qutip-qoc optimal control (handles the control "
                          "nonlinearity; needs qutip-qoc); reduced = in-house scipy")
-    ap.add_argument("--alg", choices=["GOAT", "JOPT", "CRAB"], default="GOAT",
-                    help="qutip optimizer: GOAT/JOPT are qutip-qoc gradient methods; "
-                         "CRAB is gradient-free over a randomized basis and needs only "
-                         "qutip (no qutip-qoc)")
+    ap.add_argument("--alg", choices=["JOPT", "CRAB"], default="CRAB",
+                    help="qutip optimizer: JOPT is the qutip-qoc JAX gradient method "
+                         "(needs qutip-qoc + qutip-jax/jax); CRAB is gradient-free "
+                         "over a randomized basis and needs only qutip")
     ap.add_argument("--crab-restarts", type=int, default=1,
                     help="[CRAB] DCRAB super-iterations; each appends a fresh random "
                          "basis and warm-starts from the previous optimum (monotone)")
@@ -671,7 +943,7 @@ def main() -> None:
                f"{out.get('crab_freqs', np.zeros(0)).size} harmonics x "
                f"{out.get('crab_restarts')} super-iteration(s)")
     elif out.get("backend") == "qutip":
-        tag = (f"qutip-qoc/{out.get('alg','GOAT')} "
+        tag = (f"qutip-qoc/{out.get('alg','JOPT')} "
                f"(fid_err={out.get('qoc_fid_err', float('nan')):.2e})")
     else:
         tag = f"reduced (cutoff={out['cutoff_GHz']} GHz)"

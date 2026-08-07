@@ -55,6 +55,17 @@ Conventions
 * The coupler S is kept as a dynamical mode, so the qubit-coupler spectator
   channel is automatic.
 
+Chirped pumps
+-------------
+A pump letter enters X(t) as eta_p(t) e^{-i w_p t}, so chirping the carrier,
+w_p -> w_p + delta(t), is ALGEBRAICALLY IDENTICAL to putting the phase e^{-i Phi(t)}
+(Phi = integral delta) on the complex envelope. The fixed w_p therefore remains
+the expansion reference and NOTHING in `_flux_letters` / `expand_terms` /
+`to_qutip_hamiltonian` changes; a term carrying k net pump quanta picks up
+e^{-i k Phi(t)} on its own, which is exactly the k-quanta carrier shift. Attach a
+`Chirp` to the `PumpTone` (see envelope.py). A CONSTANT chirp c0 is exactly a
+retune to w_p + c0 -- asserted in test_physics.
+
 Time evolution
 --------------
 Gate dynamics are integrated with QuTiP's compiled solver on the EXACT
@@ -66,16 +77,36 @@ analytic estimators stay importable and testable without QuTiP. The dense
 `hamiltonian_matrix` is retained only as a lightweight correctness oracle (the
 self-test below, and a one-point cross-check against `iswap_fidelity` on a QuTiP
 node); it is not part of the production solve path.
+
+For grids rather than single points, `expand_terms_symbolic` gives the same
+expansion with the frequencies factored out (Omega = M @ frequency_vector()), so a
+whole sweep shares one sparse operator stack. That is the structure `jax_engine.py`
+batches and runs on GPU; it is ~300x smaller than the dense equivalent and is
+validated against `hamiltonian_matrix` and against `qt.sesolve`
+(`validate_engines.py`).
 """
 
 from __future__ import annotations
 
+import cmath
 import itertools
-from dataclasses import dataclass
 from math import factorial
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+
+# Envelopes, chirps and the pump-tone container live in envelope.py (the single
+# source of truth) and are re-exported below, so the established
+# `from zhou_coupler import RaisedCosine, PumpTone, ...` call sites keep working.
+from envelope import (  # noqa: F401
+    Chirp,
+    ConstantPulse,
+    Envelope,
+    IQFourierEnvelope,
+    PumpTone,
+    RaisedCosine,
+    make_chirp,
+)
 
 TWO_PI: float = 2.0 * np.pi
 
@@ -126,9 +157,6 @@ def gpu_enabled() -> bool:
     return bool(_SOLVER_BACKEND["gpu"])
 
 
-# numpy>=2 renamed trapz -> trapezoid; fall back only if needed (trapz is gone in 2.x).
-_trapezoid: Callable[..., float] = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
-
 # --- type aliases (documented shapes used throughout) ----------------------
 # A "letter" of X(t): (operator, signed_frequency_rad, constant_amplitude,
 # pump_key). The term's time factor is exp(-i * signed_frequency * t). pump_key
@@ -143,123 +171,6 @@ HamiltonianTerm = Tuple[float, Tuple[Tuple[int, bool], ...], np.ndarray]
 
 
 # ===========================================================================
-# Pump envelopes  (real shape eps(t) on [0, t_g]; peak scale carried in `amp`)
-# ===========================================================================
-class Envelope:
-    """Base class for a real pump-amplitude envelope eps(t) on [0, t_g].
-
-    Subclasses implement `value` and `deriv`; `area` integrates eps over the gate
-    (subclasses with closed forms override it).
-
-    Parameters
-    ----------
-    amp : float
-        Peak amplitude. Carries |eps| in rad/ns, or directly |eta| when the
-        owning PumpTone has ``is_eta=True``.
-    t_g : float
-        Gate duration in ns; the envelope is supported on [0, t_g].
-    """
-
-    def __init__(self, amp: float, t_g: float) -> None:
-        self.amp: float = float(amp)
-        self.t_g: float = float(t_g)
-
-    def value(self, t: float) -> float:
-        """Envelope amplitude at time `t` (ns). Subclasses must implement."""
-        raise NotImplementedError
-
-    def deriv(self, t: float) -> float:
-        """Time derivative d eps/dt at time `t` (ns). Subclasses must implement."""
-        raise NotImplementedError
-
-    def area(self) -> float:
-        """Return integral_0^{t_g} value(t) dt by quadrature (override if a closed
-        form exists)."""
-        ts = np.linspace(0.0, self.t_g, 4001)
-        return float(_trapezoid([self.value(t) for t in ts], ts))
-
-
-class ConstantPulse(Envelope):
-    """Flat pump with instantaneous on/off; handy for steady-state rate checks."""
-
-    def value(self, t: float) -> float:
-        """Amplitude `amp` for t in [0, t_g], else 0."""
-        return self.amp if 0.0 <= t <= self.t_g else 0.0
-
-    def deriv(self, t: float) -> float:
-        """Zero everywhere (flat pulse)."""
-        return 0.0
-
-    def area(self) -> float:
-        """Closed form: amp * t_g."""
-        return self.amp * self.t_g
-
-
-class RaisedCosine(Envelope):
-    """Hann (raised-cosine) envelope: smooth turn-on/off, vanishing endpoints,
-
-        value(t) = amp/2 [1 - cos(2 pi t / t_g)] ,  t in [0, t_g] .
-    """
-
-    def value(self, t: float) -> float:
-        """Hann amplitude at `t` (ns); 0 outside [0, t_g]."""
-        if not (0.0 <= t <= self.t_g):
-            return 0.0
-        return self.amp * 0.5 * (1.0 - np.cos(TWO_PI * t / self.t_g))
-
-    def deriv(self, t: float) -> float:
-        """Analytic derivative of the Hann window at `t` (ns); 0 outside [0, t_g]."""
-        if not (0.0 <= t <= self.t_g):
-            return 0.0
-        return self.amp * 0.5 * (TWO_PI / self.t_g) * np.sin(TWO_PI * t / self.t_g)
-
-    def area(self) -> float:
-        """Closed form: amp * t_g / 2 (exact integral of the Hann window)."""
-        return self.amp * self.t_g / 2.0
-
-
-# ===========================================================================
-# Pump tone
-# ===========================================================================
-@dataclass
-class PumpTone:
-    """One pump tone applied to the coupler.
-
-    Parameters
-    ----------
-    w_p_GHz : float
-        Pump frequency f_p (GHz); the dressed amplitude oscillates at this rate
-        inside X(t).
-    envelope : Envelope
-        Real shape eps_p(t). Its `amp` carries |eps_p| (rad/ns), or directly the
-        dimensionless displaced amplitude |eta_p| when `is_eta` is True.
-    phi_p : float, default 0.0
-        Pump phase (rad); enters as eta_p -> |eta_p| e^{i phi_p}.
-    is_eta : bool, default True
-        If True the envelope amplitude is already eta_p; if False it is the bare
-        pump eps_p and eta_p is computed from eta = 2 w_p/(w_p^2 - w_s^2) eps
-        (Eq. 50).
-    drag : bool, default False
-        If True, add the first-order DRAG quadrature (Motzoi et al., PRL 103,
-        110501 (2009)): eta(t) -> eta(t) - i d/dt[eta(t)] / delta. The derivative
-        quadrature cancels, to leading order, the adiabatic excitation of a
-        process detuned by `delta_drag_GHz`. It suppresses an OFF-resonant
-        spectator and is singular as the detuning -> 0 (an on-resonant collision
-        needs frequency allocation, not DRAG).
-    delta_drag_GHz : float, optional
-        Detuning delta_s (GHz) of the targeted off-resonant process; the
-        quadrature is -d eta/dt / (2 pi delta_drag_GHz). Required if `drag`.
-    """
-
-    w_p_GHz: float
-    envelope: Envelope
-    phi_p: float = 0.0
-    is_eta: bool = True
-    drag: bool = False
-    delta_drag_GHz: Optional[float] = None
-
-
-# ===========================================================================
 # Gate-metric helpers (pure numpy)
 # ===========================================================================
 def _ideal_iswap() -> np.ndarray:
@@ -271,9 +182,37 @@ def _ideal_iswap() -> np.ndarray:
 
 
 def _fit_virtual_z(U: np.ndarray, U_ideal: np.ndarray) -> np.ndarray:
-    """Apply the single-qubit virtual-Z rotation that best aligns `U` with the
+    r"""Apply the single-qubit virtual-Z rotation that best aligns `U` with the
     target. Virtual-Z phases are free in software (McKay et al., PRA 96, 022330
     (2017)) and should not be charged as gate error.
+
+    The maximisation is 1-D and EXACT in the second phase, rather than a 2-D grid.
+    Writing :math:`Z = \mathrm{diag}(1, e^{i\varphi_b}, e^{i\varphi_a},
+    e^{i(\varphi_a+\varphi_b)})` and using that Z is diagonal,
+
+    .. math::
+        \mathrm{Tr}(U_{\rm ideal}^\dagger Z U)
+          = \sum_k Z_{kk} (U U_{\rm ideal}^\dagger)_{kk}
+          = \sum_k z_k c_k , \qquad c_k \equiv (U U_{\rm ideal}^\dagger)_{kk} .
+
+    Grouping the two terms that carry :math:`e^{i\varphi_b}`,
+
+    .. math::
+        \sum_k z_k c_k = \underbrace{(c_0 + e^{i\varphi_a} c_2)}_{A(\varphi_a)}
+                       + e^{i\varphi_b}\underbrace{(c_1 + e^{i\varphi_a} c_3)}_{B(\varphi_a)} ,
+
+    so at fixed :math:`\varphi_a` the modulus is maximised by simply rotating
+    :math:`B` onto :math:`A` -- two phasors, no search:
+
+    .. math::
+        \max_{\varphi_b} |A + e^{i\varphi_b} B| = |A| + |B| ,
+        \qquad \varphi_b^\star = \arg A - \arg B .
+
+    What remains is the 1-D maximisation of :math:`|A(\varphi_a)| + |B(\varphi_a)|`,
+    done here as a vectorised sweep plus a ternary search (the objective is smooth
+    and unimodal inside one coarse cell). This is exact in :math:`\varphi_b` --
+    the old 48x48 grid + refinement left a residual in BOTH phases -- and costs
+    ~1e3 scalar evaluations instead of ~3.6e3 4x4 matrix products.
 
     Parameters
     ----------
@@ -285,8 +224,7 @@ def _fit_virtual_z(U: np.ndarray, U_ideal: np.ndarray) -> np.ndarray:
     Returns
     -------
     ndarray, shape (4, 4)
-        Z(pa*, pb*) U, with the phases maximising |Tr(U_ideal^dag Z U)|^2 (coarse
-        grid plus local refinement).
+        Z(pa*, pb*) U, with the phases maximising |Tr(U_ideal^dag Z U)|^2.
     """
     def z_rotation(phase_a: float, phase_b: float) -> np.ndarray:
         return np.diag([1.0,
@@ -294,27 +232,31 @@ def _fit_virtual_z(U: np.ndarray, U_ideal: np.ndarray) -> np.ndarray:
                         np.exp(1j * phase_a),
                         np.exp(1j * (phase_a + phase_b))])
 
-    def overlap(phase_a: float, phase_b: float) -> float:
-        return np.abs(np.trace(U_ideal.conj().T @ (z_rotation(phase_a, phase_b) @ U))) ** 2
+    c = np.diag(U @ U_ideal.conj().T)
 
-    best_phases, best_overlap = (0.0, 0.0), -1.0
-    coarse = np.linspace(0.0, TWO_PI, 48, endpoint=False)
-    for phase_a in coarse:
-        for phase_b in coarse:
-            score = overlap(phase_a, phase_b)
-            if score > best_overlap:
-                best_overlap, best_phases = score, (phase_a, phase_b)
+    def merit(phase_a):
+        """|A| + |B| -- the overlap already maximised over phase_b analytically."""
+        e = np.exp(1j * np.asarray(phase_a))
+        return np.abs(c[0] + e * c[2]) + np.abs(c[1] + e * c[3])
 
-    span = TWO_PI / 48
-    for _ in range(3):                      # local refinement around the best cell
-        for phase_a in np.linspace(best_phases[0] - span, best_phases[0] + span, 21):
-            for phase_b in np.linspace(best_phases[1] - span, best_phases[1] + span, 21):
-                score = overlap(phase_a, phase_b)
-                if score > best_overlap:
-                    best_overlap, best_phases = score, (phase_a, phase_b)
-        span /= 10.0
+    n_coarse = 1024
+    coarse = np.linspace(0.0, TWO_PI, n_coarse, endpoint=False)
+    pa = float(coarse[int(np.argmax(merit(coarse)))])       # vectorised, one pass
 
-    return z_rotation(*best_phases) @ U
+    lo, hi = pa - TWO_PI / n_coarse, pa + TWO_PI / n_coarse
+    for _ in range(60):                     # ternary search; (2/3)^60 -> ~1e-13 rad
+        m1, m2 = lo + (hi - lo) / 3.0, hi - (hi - lo) / 3.0
+        if merit(m1) < merit(m2):
+            lo = m1
+        else:
+            hi = m2
+    pa = 0.5 * (lo + hi)
+
+    e = np.exp(1j * pa)
+    A, B = c[0] + e * c[2], c[1] + e * c[3]
+    # phase_b that rotates B onto A; B == 0 leaves the overlap phase_b-independent
+    pb = float(np.angle(A) - np.angle(B)) if abs(B) > 0.0 else 0.0
+    return z_rotation(pa, pb) @ U
 
 
 # ===========================================================================
@@ -612,17 +554,41 @@ class ZhouCoupler:
         """
         self._pump_tones[tone_index].envelope.amp *= float(scale)
 
-    def _eta(self, tone: PumpTone, t: float) -> complex:
-        """Displaced pump amplitude eta_p(t), complex when DRAG is on (Eq. 50;
-        Motzoi PRL 103, 110501 (2009))."""
+    def _eta_at(self, tone: PumpTone, t: Any, xp: Any = np) -> Any:
+        """Displaced pump amplitude eta_p(t) for scalar OR array `t`, built from
+        `xp` primitives (Eq. 50; Motzoi PRL 103, 110501 (2009)).
+
+        This is the SINGLE definition of the pump amplitude. The per-time QuTiP
+        callback (`_eta`) and the batched engine both route through it, so the two
+        solve paths cannot drift apart.
+
+        Ordering is deliberate: DRAG is applied to the BASE envelope, and the
+        chirp phase multiplies the result. The chirp is a rotation of the pump
+        frame, not a feature of the pulse shape, so it must not be differentiated
+        by the DRAG quadrature -- doing so would inject a spurious
+        -i delta(t) eta / Delta term that grows with the chirp rate and has no
+        physical counterpart.
+        """
         omega_p = tone.w_p_GHz * TWO_PI
         omega_s = self.omega[self.coupler_index]
         prefactor = 1.0 if tone.is_eta else (2 * omega_p / (omega_p ** 2 - omega_s ** 2))
-        amplitude: complex = tone.envelope.value(t)
+        amplitude = tone.envelope.value_at(t, xp)
         if tone.drag and tone.delta_drag_GHz not in (None, 0.0):
             detuning = tone.delta_drag_GHz * TWO_PI            # rad/ns
-            amplitude = amplitude - 1j * tone.envelope.deriv(t) / detuning
-        return prefactor * amplitude * np.exp(1j * tone.phi_p)
+            amplitude = amplitude - 1j * tone.envelope.deriv_at(t, xp) / detuning
+        if tone.chirp is not None:
+            # A chirped carrier w_p + delta(t) is exactly the fixed carrier w_p
+            # times e^{-i Phi(t)} on the amplitude; the sign matches the
+            # e^{-i w_p t} convention of the pump letter in _flux_letters.
+            amplitude = amplitude * xp.exp(-1j * tone.chirp.phase(t, xp))
+        return prefactor * amplitude * xp.exp(1j * tone.phi_p)
+
+    def _eta(self, tone: PumpTone, t: float) -> complex:
+        """Scalar pump amplitude eta_p(t) -- the QuTiP coefficient callback.
+
+        Thin wrapper over :meth:`_eta_at`; see there for the physics.
+        """
+        return complex(self._eta_at(tone, float(t), np))
 
     def _flux_letters(self) -> List[FluxLetter]:
         """All letters of X(t): the static mode operators plus the current pump
@@ -744,6 +710,146 @@ class ZhouCoupler:
 
         return [(exact_omega, key[1], operator_sum)
                 for key, (operator_sum, exact_omega) in groups.items()]
+
+    # -- frequency-INDEPENDENT expansion (engine of the batched solver) ------
+    def _symbolic_letters(self) -> List[Tuple[np.ndarray, np.ndarray, float,
+                                              Optional[Tuple[int, bool]]]]:
+        """Letters of X(t) carrying an INTEGER carrier row instead of a float.
+
+        Identical to `_flux_letters` except that the carrier ``+/- w`` is recorded
+        as a unit row in Z^(n_modes + n_tones), so the frequencies can be supplied
+        later: ``Omega = m . [w_0 ... w_{n-1}, w_p0 ...]``.
+        """
+        n_freq = self.n_modes + len(self._pump_tones)
+        letters = []
+        for i in range(self.n_modes):
+            lam = self.participation[i]
+            if lam == 0.0:
+                continue
+            row = np.zeros(n_freq, dtype=np.int64)
+            row[i] = 1
+            # a_i ~ e^{-i w_i t} (row +e_i); a_i^dag ~ e^{+i w_i t} (row -e_i)
+            letters.append((self.a_ops[i], row, lam, None))
+            letters.append((self.ad_ops[i], -row, lam, None))
+        for tone_index in range(len(self._pump_tones)):
+            row = np.zeros(n_freq, dtype=np.int64)
+            row[self.n_modes + tone_index] = 1
+            letters.append((self.identity, row, 1.0, (tone_index, False)))
+            letters.append((self.identity, -row, 1.0, (tone_index, True)))
+        return letters
+
+    def frequency_vector(self) -> np.ndarray:
+        """The carrier vector [w_0 .. w_{n-1}, w_p0 ..] (rad/ns) that pairs with
+        the integer matrix `M` of :meth:`expand_terms_symbolic`."""
+        return np.concatenate([self.omega,
+                               [tone.w_p_GHz * TWO_PI for tone in self._pump_tones]])
+
+    def expand_terms_symbolic(self) -> Dict[str, Any]:
+        r"""Expand sum_n g_n X(t)^n into a FREQUENCY-INDEPENDENT term structure.
+
+        Same algebra as :meth:`expand_terms`, but grouped by the integer carrier
+        row rather than by the numerical Omega. The returned structure therefore
+        depends only on ``(dims, participation, g_n, n_tones)`` -- NOT on any mode
+        or pump frequency, and not on the envelope. That is what lets a whole
+        frequency sweep share one operator stack and vary only a vector::
+
+            Omega = M @ cpl.frequency_vector()          # (n_terms,)
+            H(t)  = sum_j e^{-i Omega_j t} prod_p eta_p^{n_pos} conj(eta_p)^{n_neg} O_j
+
+        `expand_terms` rebuilds an ``O(n_letters^order)`` product for every grid
+        point because its grouping key moves with the frequencies; this does not.
+
+        Operators are returned in COO form. Each raw letter product is a
+        generalized permutation matrix (at most one non-zero per column), so a
+        grouped operator stays extremely sparse -- typically O(dim) non-zeros
+        rather than dim^2. Applying ``sum_j c_j O_j`` to a state block via the COO
+        triplets is what makes the batched engine affordable; forming the dense
+        (n_terms, dim, dim) stack instead would cost ~dim times more memory and
+        arithmetic for no benefit.
+
+        Returns
+        -------
+        dict
+            ``M`` (n_terms, n_modes + n_tones) int64 -- carrier rows;
+            ``n_pos`` / ``n_neg`` (n_terms, n_tones) int64 -- eta exponents, i.e.
+            the term carries ``prod_p eta_p^{n_pos} conj(eta_p)^{n_neg}``;
+            ``term`` / ``row`` / ``col`` (nnz,) int64 and ``val`` (nnz,) complex --
+            the stacked COO triplets, sorted by term;
+            ``dim``, ``n_terms``, ``n_tones``, and ``signatures`` (the
+            `expand_terms`-style pump signature per term, for cross-checking).
+
+        See Also
+        --------
+        expand_terms : the frequency-SPECIFIC form consumed by the QuTiP export.
+        """
+        import scipy.sparse as sp
+
+        letters = self._symbolic_letters()
+        n_tones = len(self._pump_tones)
+
+        # Every letter operator is a ladder operator (or the identity), i.e. a
+        # generalized permutation matrix with <= 1 non-zero per column, and so is
+        # any product of them. Multiplying them as CSR costs O(dim) instead of the
+        # O(dim^3) of a dense matmul -- at dim = 135 that is the difference between
+        # a ~50 s build and a sub-second one, and this runs once per device.
+        sletters = [(sp.csr_matrix(op), row, amp, key) for op, row, amp, key in letters]
+
+        groups: Dict[Tuple[Tuple[int, ...], Tuple[Tuple[int, bool], ...]], List] = {}
+        for order, g in self.g_n.items():
+            for combo in itertools.product(sletters, repeat=order):
+                carrier = sum(letter[1] for letter in combo)
+                amplitude = 1.0
+                operator = None
+                pump_signature: List[Tuple[int, bool]] = []
+                for op, _row, amp, pump_key in combo:
+                    amplitude *= amp
+                    operator = op if operator is None else operator @ op
+                    if pump_key is not None:
+                        pump_signature.append(pump_key)
+                key = (tuple(int(v) for v in carrier), tuple(sorted(pump_signature)))
+                contribution = (g * amplitude) * operator
+                if key in groups:
+                    groups[key][0] = groups[key][0] + contribution
+                else:
+                    groups[key] = [contribution, carrier]
+
+        n_terms = len(groups)
+        M = np.zeros((n_terms, self.n_modes + n_tones), dtype=np.int64)
+        n_pos = np.zeros((n_terms, max(n_tones, 1)), dtype=np.int64)
+        n_neg = np.zeros((n_terms, max(n_tones, 1)), dtype=np.int64)
+        signatures: List[Tuple[Tuple[int, bool], ...]] = []
+        term_idx, rows, cols, vals = [], [], [], []
+        for j, (key, (operator_sum, carrier)) in enumerate(groups.items()):
+            M[j] = carrier
+            signatures.append(key[1])
+            for tone_index, is_conjugate in key[1]:
+                if is_conjugate:
+                    n_neg[j, tone_index] += 1
+                else:
+                    n_pos[j, tone_index] += 1
+            coo = operator_sum.tocoo()
+            # drop structural zeros left behind by cancelling contributions
+            keep = coo.data != 0
+            r, c, v = coo.row[keep], coo.col[keep], coo.data[keep]
+            term_idx.append(np.full(r.size, j, dtype=np.int64))
+            rows.append(r.astype(np.int64))
+            cols.append(c.astype(np.int64))
+            vals.append(v.astype(complex))
+
+        empty_i, empty_c = np.zeros(0, np.int64), np.zeros(0, complex)
+        return {
+            "M": M,
+            "n_pos": n_pos[:, :n_tones] if n_tones else n_pos[:, :0],
+            "n_neg": n_neg[:, :n_tones] if n_tones else n_neg[:, :0],
+            "term": np.concatenate(term_idx) if term_idx else empty_i,
+            "row": np.concatenate(rows) if rows else empty_i,
+            "col": np.concatenate(cols) if cols else empty_i,
+            "val": np.concatenate(vals) if vals else empty_c,
+            "dim": self.dim,
+            "n_terms": n_terms,
+            "n_tones": n_tones,
+            "signatures": signatures,
+        }
 
     # -- analytic effective-rate estimator (Eq. 62) -------------------------
     def effective_rate(self, modes: Sequence[int], n: int,

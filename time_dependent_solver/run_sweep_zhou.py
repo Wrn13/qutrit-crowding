@@ -193,6 +193,13 @@ def main() -> None:
                          "peak |eta| = TARGET_ETA (t_g = 2*area/eta; on this device "
                          "eta=1.2 -> ~115.7 ns, eta=1.5 -> ~92.6 ns); takes precedence "
                          "over --t-g-ns")
+    ap.add_argument("--chirp-GHz", default=None,
+                    help="comma list of Legendre coefficients for a time-dependent pump-"
+                         "frequency offset delta(t) in GHz, e.g. '0,0.05' for a linear chirp "
+                         "sweeping -50 -> +50 MHz across the gate. A single value is a "
+                         "CONSTANT offset, exactly equivalent to adding it to "
+                         "--wp-offset/wp_offset_GHz. Empty or all-zero leaves the pump "
+                         "un-chirped.")
     ap.add_argument("--wb-GHz", help="[target] comma list of partner (w_b) freqs (GHz)")
     ap.add_argument("--spec-GHz", help="[target] comma list of spectator ABSOLUTE freqs (GHz)")
     ap.add_argument("--spec-min-GHz", type=float, default=None,
@@ -234,10 +241,10 @@ def main() -> None:
     ap.add_argument("--grape-backend", choices=["qutip", "reduced"], default=None,
                     help="GRAPE engine: 'qutip' (qutip-qoc optimal control, default) "
                          "or 'reduced' (in-house scipy over the reduced model)")
-    ap.add_argument("--grape-alg", choices=["GOAT", "JOPT", "CRAB"], default=None,
-                    help="qutip GRAPE optimizer: GOAT/JOPT are qutip-qoc gradient "
-                         "methods (JOPT needs JAX); CRAB is gradient-free over a "
-                         "randomized basis and needs only qutip, no qutip-qoc")
+    ap.add_argument("--grape-alg", choices=["JOPT", "CRAB"], default=None,
+                    help="qutip GRAPE optimizer: JOPT is the qutip-qoc JAX gradient "
+                         "method (needs qutip-qoc + qutip-jax/jax); CRAB is "
+                         "gradient-free over a randomized basis and needs only qutip")
     ap.add_argument("--grape-crab-restarts", type=int, default=None,
                     help="[CRAB] DCRAB super-iterations; each appends a fresh random "
                          "basis and warm-starts from the previous optimum (monotone)")
@@ -331,6 +338,11 @@ def main() -> None:
         print(f"operating point '{args.operating_point}': amp_scale={config['amp_scale']}, "
               f"wp_offset={config['wp_offset_GHz']} GHz, t_g={config['t_g_ns']:.3f} ns"
               + ("  (t_g from CLI)" if _explicit_tg else ""))
+    if getattr(args, "chirp_GHz", None) is not None:
+        config["chirp_coeffs_GHz"] = [float(x) for x in args.chirp_GHz.split(",") if x.strip()]
+        if config["chirp_coeffs_GHz"]:
+            print(f"chirp: delta(t)/2pi = {config['chirp_coeffs_GHz']} GHz "
+                  f"(Legendre in u = 2t/t_g - 1)")
     if args.no_integrate:
         config["integrate"] = False
     if args.stark:

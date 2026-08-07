@@ -6,7 +6,7 @@ population), so the global optimum is read off directly instead of from
 alternating 1D amplitude/frequency scans (which rail when the AC-Stark shift and
 the Rabi amplitude feed back on each other).
 
-Two propagation engines, identical grid and output shape:
+Three propagation engines, identical grid and output shape:
   * engine='reduced' : the fast rotating-frame reduced model from ``grape.py``
     (scipy expm, no QuTiP); the pump offset shifts precomputed carriers so the
     operator basis is built once. Good for quick looks / weak-to-moderate drive.
@@ -16,6 +16,14 @@ Two propagation engines, identical grid and output shape:
     (``build_system``), so the grid is embarrassingly parallel (``--jobs``) and
     free of pump-mutation hazards, and DRAG / spectator context come along for
     free exactly as in the reduced map.
+  * engine='jax'     : the batched engine in ``jax_engine.py``. The whole grid is
+    ONE vmapped program -- the device is fixed, so every point shares a single
+    sparse operator stack while the amplitude rides in the pulse parameters and
+    the pump offset is just the last entry of the frequency vector. All four
+    computational columns propagate together as one (dim, 4) block, and it runs
+    unchanged on GPU. It is a rotating-wave REDUCTION at any finite
+    ``--engine-cutoff-GHz``: run ``validate_engines.py --cutoff-scan`` on the
+    device first, which reports fidelity and ``max|U - U_qutip|`` per cutoff.
 
 Results (offsets, amps, Z, leakage, optimum, operating point) are written to
 ``--save-npz``; the heatmap with the optimum marked goes to ``--out``. At strong
@@ -28,6 +36,12 @@ CLI
         --engine qutip --metric transfer --jobs 32 \
         --wp-span-MHz 40 --amp-lo 0.6 --amp-hi 1.6 \
         --save-npz figs/swap_map.npz --out figs/swap_map.png
+
+    # batched engine (GPU-capable); validate the cutoff first
+    python validate_engines.py --device warren_device.json --cutoff-scan
+    python calibration_map.py --device warren_device.json --t-g-ns 92.6 \
+        --engine jax --engine-cutoff-GHz 3.0 --engine-batch 128 \
+        --out figs/swap_map.png
 """
 from __future__ import annotations
 
@@ -346,6 +360,8 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         delta_GHz: Optional[float] = None, drag_beat_GHz: Optional[float] = None,
         engine: str = "reduced", coupler_levels: Optional[int] = None,
         atol: float = 1e-10, rtol: float = 1e-8, nsteps: int = 500000,
+        engine_cutoff_GHz: float = float("inf"), engine_carrier_resolution: float = 0.1,
+        engine_batch: int = 64, engine_precision: str = "f64",
         jobs: int = 1, save_npz_path: Optional[str] = None,
         out: Optional[str] = "figs/calibration_map.png", title: Optional[str] = None,
         log_path: Optional[str] = None,
@@ -390,6 +406,26 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         qkw = {k: v for k, v in kw.items() if k in qkeys}
         result = scan_qutip(build_fn, t_g, atol=atol, rtol=rtol, nsteps=nsteps,
                             jobs=jobs, logger=logger, **qkw)
+    elif engine == "jax":
+        # The whole grid is ONE batched program: the device is fixed, the amplitude
+        # is a pulse parameter and the pump offset is just the last entry of the
+        # frequency vector, so nothing has to be rebuilt per point.
+        import jax_engine as JE
+        span = float(kw.get("wp_span_MHz", 40.0))
+        offsets = np.linspace(-span / 2.0, span / 2.0, int(kw.get("wp_points", 41)))
+        amps = np.linspace(float(kw.get("amp_lo", 0.6)), float(kw.get("amp_hi", 1.4)),
+                           int(kw.get("amp_points", 41)))
+        logger.info(f"  jax engine: cutoff={engine_cutoff_GHz} GHz, "
+                    f"carrier_resolution={engine_carrier_resolution}, batch={engine_batch}, "
+                    f"precision={engine_precision}")
+        result = JE.scan_amp_offset(cpl, t_g, amps, offsets,
+                                    cutoff_GHz=engine_cutoff_GHz,
+                                    carrier_resolution=engine_carrier_resolution,
+                                    precision=engine_precision, batch=engine_batch,
+                                    metric=str(kw.get("metric", "fidelity")))
+        result["peak_eta"] = float(eta_pk)
+        logger.info(f"  jax engine kept {result['n_terms']} terms "
+                    f"(dropped {result['n_dropped']} above the cutoff)")
     else:
         result = scan(cpl, 0, 1, t_g, logger=logger, **kw)
 
@@ -427,9 +463,26 @@ def main() -> None:
                     help="spectator-sweep detuning Delta = w_b - w_spec (GHz)")
     ap.add_argument("--drag-beat-GHz", type=float, default=None,
                     help="map the DRAG-on gate, with the quadrature at this beat")
-    ap.add_argument("--engine", choices=["reduced", "qutip"], default="reduced",
-                    help="reduced rotating-frame model (fast, CPU) or exact QuTiP "
-                         "sesolve (pass --engine qutip for the trustworthy map)")
+    ap.add_argument("--engine", choices=["reduced", "qutip", "jax"], default="reduced",
+                    help="reduced rotating-frame model (fast, CPU), exact QuTiP "
+                         "sesolve (--engine qutip for the trustworthy map), or the "
+                         "batched jax engine (--engine jax: the whole grid in one "
+                         "vmapped program, GPU-capable; validate the cutoff first "
+                         "with validate_engines.py --cutoff-scan)")
+    ap.add_argument("--engine-cutoff-GHz", type=float, default=float("inf"),
+                    help="[jax] carrier cutoff. Defaults to inf (EXACT). A finite "
+                         "cutoff is only safe at weak drive -- at |eta|~9 a 3 GHz "
+                         "cutoff was off by max|dU|~0.9. The engine's speed comes "
+                         "from the integrator and batching, not pruning, so inf is "
+                         "cheap; lower it only with a --cutoff-scan to justify it")
+    ap.add_argument("--engine-carrier-resolution", type=float, default=0.1,
+                    help="[jax] max |Omega|*dt for the CF4 propagator (4th order, so "
+                         "halving this cuts the error ~16x)")
+    ap.add_argument("--engine-batch", type=int, default=64,
+                    help="[jax] grid points per vmapped call")
+    ap.add_argument("--engine-precision", choices=["f64", "f32"], default="f64",
+                    help="[jax] f32 is MIXED (f64 phases, complex64 state); measure it "
+                         "with validate_engines.py --precision-scan before trusting it")
     ap.add_argument("--coupler-levels", type=int, default=None,
                     help="override device coupler truncation; bump at strong drive")
     ap.add_argument("--jobs", type=int, default=1,
@@ -468,6 +521,9 @@ def main() -> None:
                  drag_beat_GHz=args.drag_beat_GHz, engine=args.engine,
                  coupler_levels=args.coupler_levels, atol=args.atol, rtol=args.rtol,
                  nsteps=args.nsteps, jobs=args.jobs, save_npz_path=args.save_npz,
+                 engine_cutoff_GHz=args.engine_cutoff_GHz,
+                 engine_carrier_resolution=args.engine_carrier_resolution,
+                 engine_batch=args.engine_batch, engine_precision=args.engine_precision,
                  wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
                  amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
                  cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out,

@@ -172,10 +172,13 @@ def run_spectator_point(pt: Point, config: Dict[str, Any]) -> Dict[str, Any]:
 
     # pump at w_b - w_a, amplitude normalized to a full iSWAP on (a,b)
     EnvCls = RaisedCosine if config["envelope"] == "raised_cosine" else ConstantPulse
+    from zhou_coupler import make_chirp
     env = EnvCls(amp=1.0, t_g=float(config["t_g_ns"]))
     cpl.set_pump(PumpTone(w_p_GHz=w_p_GHz, envelope=env, is_eta=True,
                           drag=use_drag,
-                          delta_drag_GHz=(beat_GHz if use_drag else None)),
+                          delta_drag_GHz=(beat_GHz if use_drag else None),
+                          chirp=make_chirp(config.get("chirp_coeffs_GHz") or None,
+                                           float(config["t_g_ns"]))),
                  normalize_iswap=(a, b))
     # calibrated amplitude correction (1.0 = raw analytic pi/2 normalization)
     cpl.scale_pump_amplitude(amp_scale_used)

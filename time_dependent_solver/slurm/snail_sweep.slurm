@@ -20,7 +20,7 @@
                                  #                               (stark_points x t)
                                  #   + --calibrate ............. x(3-10), the tune-up
                                  #   + GRAPE reduced ........... + ~1-5 min
-                                 #   + GRAPE qutip (GOAT/JOPT) . + ~10 min to hours
+                                 #   + GRAPE qutip (JOPT) ..... + ~10 min to hours
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=wcalphon@syr.edu
 # #SBATCH --partition=cpu        # set to your partition
@@ -115,11 +115,11 @@
 #   GRAPE=1           per-point optimal control; adds grape_baseline_F / F_grape /
 #                     dF_grape / leak_grape to summary.csv and stores the optimized
 #                     envelope in the point .npz. Needs the integrated run.
-#   GRAPE_BACKEND     qutip (qutip-qoc GOAT/JOPT, exact propagation, SLOW) |
+#   GRAPE_BACKEND     qutip (qutip-qoc JOPT, exact propagation, SLOW) |
 #                     reduced (in-house scipy over the rotating-frame model, fast)
 #                                                        [qutip]
-#   GRAPE_ALG         GOAT | JOPT | CRAB   (qutip backend)                     [GOAT]
-#                     GOAT/JOPT are qutip-qoc GRADIENT methods (JOPT needs
+#   GRAPE_ALG         JOPT | CRAB   (qutip backend)                            [JOPT]
+#                     JOPT is the qutip-qoc JAX GRADIENT method (needs
 #                       qutip-jax + jax); both need `pip install qutip-qoc`.
 #                     CRAB is GRADIENT-FREE over a randomized Fourier basis and
 #                       needs only qutip -- no qutip-qoc. Use it when a gradient
@@ -143,15 +143,15 @@
 #                     drag-skip window, where the 1/beat quadrature blows up)
 #
 # RECOMMENDED GRAPE STRATEGY: every qutip-backend optimizer is minutes-to-hours
-# PER POINT (GOAT integrates the exact gradient system each iteration; CRAB is
+# PER POINT (JOPT differentiates the exact propagator each iteration; CRAB is
 # gradient-free and so needs many exact propagations). So sweep broadly with the
 # cheap optimizer and escalate only on the interesting rows:
 #   # 1. broad pass, fast reduced optimizer
 #   GRAPE=1 GRAPE_BACKEND=reduced OUTDIR=... sbatch --array=0-269 slurm/snail_sweep.slurm
 #   # 2. exact cross-check on a hand-picked subset (gradient method)
-#   GRAPE=1 GRAPE_BACKEND=qutip GRAPE_ALG=GOAT RESUME=picked.txt OUTDIR=... \
+#   GRAPE=1 GRAPE_BACKEND=qutip GRAPE_ALG=JOPT RESUME=picked.txt OUTDIR=... \
 #       sbatch --array=0-9 slurm/snail_sweep.slurm
-#   # 3. where GOAT stalls (dF ~ 0 but you expect headroom), retry gradient-free
+#   # 3. where JOPT stalls (dF ~ 0 but you expect headroom), retry gradient-free
 #   GRAPE=1 GRAPE_BACKEND=qutip GRAPE_ALG=CRAB CRAB_RESTARTS=3 \
 #       RESUME=stalled.txt OUTDIR=... sbatch --array=0-3 slurm/snail_sweep.slurm
 # (`picked.txt`/`stalled.txt` are hand-written lists of point indices, one per line
@@ -217,7 +217,7 @@ export PYTHONUNBUFFERED=1    # flush prints immediately -- lets the progress log
 
 # module load python/3.12      # or: conda activate qsim
 # source .venv/bin/activate    # (then set LAUNCHER=python)
-# GRAPE_BACKEND=qutip with GRAPE_ALG=GOAT/JOPT needs: pip install qutip-qoc
+# GRAPE_BACKEND=qutip with GRAPE_ALG=JOPT needs: pip install qutip-qoc qutip-jax jax
 #   (+ qutip-jax jax for JOPT).  GRAPE_ALG=CRAB needs only qutip itself.
 
 mkdir -p "${OUTDIR}/points"
