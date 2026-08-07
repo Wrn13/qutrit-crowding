@@ -32,15 +32,19 @@ CLI
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import grape
+from log_utils import setup_run_logger
 
 TWO_PI = 2.0 * np.pi
 
@@ -49,7 +53,8 @@ def scan(cpl, a: int, b: int, t_g: float, *,
          wp_span_MHz: float = 40.0, wp_points: int = 41,
          amp_lo: float = 0.6, amp_hi: float = 1.4, amp_points: int = 41,
          cutoff_GHz: float = 1.0, n_ctrl: int = 32, metric: str = "fidelity",
-         carrier_resolution: float = 0.3) -> Dict[str, Any]:
+         carrier_resolution: float = 0.3,
+         logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """Scan (pump offset, amplitude) and score each point with the REDUCED model.
 
     Parameters
@@ -72,6 +77,9 @@ def scan(cpl, a: int, b: int, t_g: float, *,
         Piecewise-constant slices approximating the raised cosine.
     metric : {'fidelity', 'transfer'}
         Score per point: leakage-aware iSWAP fidelity, or P(|01>->|10>).
+    logger : logging.Logger, optional
+        If given, one line per completed row is logged (in addition to the
+        interactive ``tqdm`` bar, which isn't a good fit for a plain log file).
 
     Returns
     -------
@@ -94,7 +102,7 @@ def scan(cpl, a: int, b: int, t_g: float, *,
     Z = np.full((amp_points, wp_points), np.nan)
 
     # |01> is column 1 of the propagator basis (|00>,|01>,|10>,|11>); |10> is row 2
-    for i, amp in enumerate(amps):
+    for i, amp in enumerate(tqdm(amps, desc="calibration scan (reduced)", unit="row")):
         eta_ctrl = (amp * base).astype(complex)
         for j, off_MHz in enumerate(offsets):
             U = grape._propagate(eta_ctrl, t_g, terms, H_anh, idx, n_sub,
@@ -104,6 +112,8 @@ def scan(cpl, a: int, b: int, t_g: float, *,
             else:
                 F, _ = ZhouCoupler._iswap_fidelity_from_U(U, True)
                 Z[i, j] = F
+        if logger:
+            logger.info(f"row {i + 1}/{len(amps)} amp_scale={amp:.3f}")
 
     bi, bj = np.unravel_index(np.nanargmax(Z), Z.shape)
     best = dict(amp_scale=float(amps[bi]), wp_offset_MHz=float(offsets[bj]),
@@ -116,7 +126,8 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
                t_g: float, *, wp_span_MHz: float = 40.0, wp_points: int = 41,
                amp_lo: float = 0.6, amp_hi: float = 1.4, amp_points: int = 41,
                metric: str = "transfer", atol: float = 1e-10, rtol: float = 1e-8,
-               nsteps: int = 500000, jobs: int = 1) -> Dict[str, Any]:
+               nsteps: int = 500000, jobs: int = 1,
+               logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
     """QuTiP-exact analogue of ``scan``: identical grid and return shape, but every
     point is a compiled ``qt.sesolve`` on the FULL Hamiltonian via
     ``ZhouCoupler.propagator_columns`` -- no reduced model, no pruned terms.
@@ -141,17 +152,28 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
         return i, j, float(score), float(leak)
 
     grid = [(i, j, a, o) for i, a in enumerate(amps) for j, o in enumerate(offsets)]
+    t0 = time.time()
     if jobs and jobs > 1:
         from joblib import Parallel, delayed
-        out = Parallel(n_jobs=jobs, verbose=5)(
+        # return_as="generator_unordered" streams results back as they finish, so
+        # progress can be logged as it happens instead of only after the whole
+        # grid returns (joblib's own verbose=5 prints straight to stdout and
+        # can't be redirected into `logger`'s file).
+        results = Parallel(n_jobs=jobs, return_as="generator_unordered")(
             delayed(one)(i, j, a, o) for (i, j, a, o) in grid)
+        out = []
+        for k, r in enumerate(results, start=1):
+            out.append(r)
+            if logger and (k % wp_points == 0 or k == len(grid)):
+                logger.info(f"  {k}/{len(grid)} points done "
+                            f"({100 * k / len(grid):.0f}%), elapsed={time.time() - t0:.0f}s")
     else:
         out = []
         for k, (i, j, a, o) in enumerate(grid):
             out.append(one(i, j, a, o))
             if (k + 1) % wp_points == 0:
-                print(f"  row {k // wp_points + 1}/{amp_points} "
-                      f"(amp_scale={a:.3f})")
+                msg = f"  row {k // wp_points + 1}/{amp_points} (amp_scale={a:.3f})"
+                (logger.info if logger else print)(msg)
 
     Z = np.full((amp_points, wp_points), np.nan)
     L = np.full((amp_points, wp_points), np.nan)
@@ -326,6 +348,7 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         atol: float = 1e-10, rtol: float = 1e-8, nsteps: int = 500000,
         jobs: int = 1, save_npz_path: Optional[str] = None,
         out: Optional[str] = "figs/calibration_map.png", title: Optional[str] = None,
+        log_path: Optional[str] = None,
         **kw) -> Dict[str, Any]:
     """Build the system for the given sweep context, scan (reduced or QuTiP), plot,
     optionally persist, and return results.
@@ -334,9 +357,21 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
     ``operating_point`` (a record ready for ``operating_points.save_point``).
     ``engine='qutip'`` runs the exact solver; both engines share the grid, the
     ``best``/``operating_point`` bookkeeping, and the plot.
+
+    Progress is logged (timestamped, to both stdout and ``log_path``) so a
+    long ``engine='qutip'`` run can be tailed while it's still going. Default
+    ``log_path`` sits next to ``out``/``save_npz_path`` (same basename, ``.log``).
     """
     if coupler_levels is not None:                     # truncation override, reused
         config = {**config, "coupler_levels": int(coupler_levels)}
+
+    log_path = log_path or os.path.splitext(
+        out or save_npz_path or "figs/calibration_map.png")[0] + ".log"
+    logger = setup_run_logger(log_path, f"calibration_map:{log_path}")
+    logger.info(f"start: engine={engine} metric={kw.get('metric', 'fidelity')} "
+                f"t_g={t_g}ns grid={kw.get('wp_points', 41)}x{kw.get('amp_points', 41)} "
+                f"jobs={jobs}")
+    t0 = time.time()
 
     cpl, w_p, eta_pk, context = build_system(
         config, t_g, wa_GHz=wa_GHz, wb_GHz=wb_GHz, delta_GHz=delta_GHz,
@@ -354,19 +389,22 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         qkeys = ("wp_span_MHz", "wp_points", "amp_lo", "amp_hi", "amp_points", "metric")
         qkw = {k: v for k, v in kw.items() if k in qkeys}
         result = scan_qutip(build_fn, t_g, atol=atol, rtol=rtol, nsteps=nsteps,
-                            jobs=jobs, **qkw)
+                            jobs=jobs, logger=logger, **qkw)
     else:
-        result = scan(cpl, 0, 1, t_g, **kw)
+        result = scan(cpl, 0, 1, t_g, logger=logger, **kw)
 
     result["w_p_GHz"] = w_p
     result["t_g_ns"] = t_g
     result["context"] = context
+    result["log_path"] = log_path
     best = result["best"]
     # the scan grid is relative to the nominal (amp_scale, wp_offset) it was built on
     result["operating_point"] = dict(
         amp_scale=amp_scale * best["amp_scale"],
         wp_offset_GHz=wp_offset_GHz + best["wp_offset_MHz"] * 1e-3,
         metric=result["metric"], score=best["score"], **context)
+    logger.info(f"done in {time.time() - t0:.0f}s: wp_offset={best['wp_offset_MHz']:+.2f}MHz "
+                f"amp_scale={best['amp_scale']:.4f} score={best['score']:.5f}")
     if out:
         plot_map(result, out=out, title=title)
     if save_npz_path:
@@ -415,6 +453,9 @@ def main() -> None:
     ap.add_argument("--metric", choices=["fidelity", "transfer"], default="fidelity",
                     help="'transfer' colours by the swap population P(|01>->|10>)")
     ap.add_argument("--out", default="figs/calibration_map.png")
+    ap.add_argument("--log", default=None,
+                    help="progress log file (default: alongside --out/--save-npz, "
+                         "same basename with a .log extension)")
     args = ap.parse_args()
 
     from paths import resolve_device
@@ -428,7 +469,9 @@ def main() -> None:
                  nsteps=args.nsteps, jobs=args.jobs, save_npz_path=args.save_npz,
                  wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
                  amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
-                 cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out)
+                 cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out,
+                 log_path=args.log)
+    print(f"log: {result['log_path']}")
     b, ctx = result["best"], result["context"]
     print(f"context: w_a={ctx['wa_GHz']} w_b={ctx['wb_GHz']} t_g={ctx['t_g_ns']} ns "
           f"spec={ctx['spec_abs_GHz']} drag_beat={ctx['drag_beat_GHz']} engine={args.engine}")
