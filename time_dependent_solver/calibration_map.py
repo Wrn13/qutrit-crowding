@@ -358,16 +358,16 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
     ``engine='qutip'`` runs the exact solver; both engines share the grid, the
     ``best``/``operating_point`` bookkeeping, and the plot.
 
-    Progress is logged (timestamped, to both stdout and ``log_path``) so a
-    long ``engine='qutip'`` run can be tailed while it's still going. Default
-    ``log_path`` sits next to ``out``/``save_npz_path`` (same basename, ``.log``).
+    Progress is logged (timestamped) to stdout so a long ``engine='qutip'`` run
+    can be tailed while it's still going -- under SLURM that lands in the job's
+    own ``slurm-<jobid>.out``, so concurrent jobs (e.g. one per device) don't
+    interleave into one shared file the way a colocated log file would. Pass
+    ``log_path`` explicitly to also mirror progress into a file.
     """
     if coupler_levels is not None:                     # truncation override, reused
         config = {**config, "coupler_levels": int(coupler_levels)}
 
-    log_path = log_path or os.path.splitext(
-        out or save_npz_path or "figs/calibration_map.png")[0] + ".log"
-    logger = setup_run_logger(log_path, f"calibration_map:{log_path}")
+    logger = setup_run_logger(log_path, f"calibration_map:{log_path or 'stdout'}")
     logger.info(f"start: engine={engine} metric={kw.get('metric', 'fidelity')} "
                 f"t_g={t_g}ns grid={kw.get('wp_points', 41)}x{kw.get('amp_points', 41)} "
                 f"jobs={jobs}")
@@ -454,8 +454,9 @@ def main() -> None:
                     help="'transfer' colours by the swap population P(|01>->|10>)")
     ap.add_argument("--out", default="figs/calibration_map.png")
     ap.add_argument("--log", default=None,
-                    help="progress log file (default: alongside --out/--save-npz, "
-                         "same basename with a .log extension)")
+                    help="optional progress log file; default is stdout only, so "
+                         "concurrent jobs (e.g. one per device) land in each "
+                         "job's own SLURM .out instead of one shared file")
     args = ap.parse_args()
 
     from paths import resolve_device
@@ -471,7 +472,7 @@ def main() -> None:
                  amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
                  cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out,
                  log_path=args.log)
-    print(f"log: {result['log_path']}")
+    print(f"log: {result['log_path'] or 'stdout (SLURM job output)'}")
     b, ctx = result["best"], result["context"]
     print(f"context: w_a={ctx['wa_GHz']} w_b={ctx['wb_GHz']} t_g={ctx['t_g_ns']} ns "
           f"spec={ctx['spec_abs_GHz']} drag_beat={ctx['drag_beat_GHz']} engine={args.engine}")
