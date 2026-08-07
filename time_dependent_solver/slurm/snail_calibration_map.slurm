@@ -93,6 +93,7 @@
 #   COUPLER_LEVELS  override the device coupler truncation      [device]
 #   ATOL / RTOL / NSTEPS     solver controls (ENGINE=qutip)     [1e-10/1e-8/500000]
 #   FIG / NPZ                output paths          [figs/calibration_map_<POINT>.*]
+#   LOG                      progress log (tail -f while the job runs)  [FIG's basename + .log]
 #   LAUNCHER / CODE_DIR      as in snail_sweep.slurm
 #
 # CONTEXT -- which gate the point is calibrated FOR. Set at most one spectator form:
@@ -133,6 +134,7 @@ NSTEPS="${NSTEPS:-500000}"
 if [ -n "${POINT}" ]; then TAG="_${POINT}"; else TAG=""; fi
 FIG="${FIG:-figs/calibration_map${TAG}.png}"
 NPZ="${NPZ:-figs/calibration_map${TAG}.npz}"
+LOG="${LOG:-${FIG%.*}.log}"          # progress log, colocated with FIG; tail -f it live
 
 # optional context / truncation flags
 CTX=""
@@ -158,17 +160,19 @@ else
 fi
 export MKL_NUM_THREADS="${OMP_NUM_THREADS}" OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
 export MPLBACKEND=Agg
+export PYTHONUNBUFFERED=1    # flush prints immediately -- lets ${LOG} be tailed live
 
 # module load python/3.12      # or: conda activate qsim
 # source .venv/bin/activate    # (then set LAUNCHER=python)
 # ENGINE=qutip needs QuTiP importable here; ENGINE=reduced does not.
 cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
-mkdir -p "$(dirname "${FIG}")" "$(dirname "${NPZ}")"
+mkdir -p "$(dirname "${FIG}")" "$(dirname "${NPZ}")" "$(dirname "${LOG}")"
 
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} device=${DEVICE} t_g=${T_G}"
 echo "engine=${ENGINE} metric=${METRIC} jobs=${JOBS} point=${POINT:-<none, not saving>}"
 echo "grid=${WP_POINTS}x${AMP_POINTS} span=${WP_SPAN}MHz amp=[${AMP_LO},${AMP_HI}]"
 echo "start=$(date -Is)"
+echo "progress log: ${LOG}   (tail -f ${LOG} to watch a running job)"
 
 srun ${LAUNCHER} calibration_map.py \
     --device "${DEVICE}" --t-g-ns "${T_G}" ${CTX} \
@@ -177,7 +181,7 @@ srun ${LAUNCHER} calibration_map.py \
     --amp-lo "${AMP_LO}" --amp-hi "${AMP_HI}" --amp-points "${AMP_POINTS}" \
     --cutoff-GHz "${CUTOFF}" --metric "${METRIC}" \
     --atol "${ATOL}" --rtol "${RTOL}" --nsteps "${NSTEPS}" \
-    --save-npz "${NPZ}" --out "${FIG}" ${SAVE}
+    --save-npz "${NPZ}" --out "${FIG}" --log "${LOG}" ${SAVE}
 
 echo "done end=$(date -Is)"
 echo

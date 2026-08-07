@@ -100,6 +100,11 @@
 #   CODE_DIR  where the .py files live                   [submit dir]
 #   GRID      explicit path to grid.json                 [OUTDIR/grid.json]
 #
+# PROGRESS: point/local write a timestamped, auto-flushed log per task under
+# OUTDIR/logs/ (point_<array-task>_<job>.log, or local_<job>.log) -- tail -f one
+# of those to watch a run live instead of digging through the submit dir's
+# snail_sweep_%A_%a.out.
+#
 #   STARK=1           per-point AC-Stark chevron (drive at the shifted resonance)
 #   STARK_MATCH=1     chevron uses the ACTUAL pulse (so DRAG-on points calibrate
 #                     onto the DRAG-on resonance); needs STARK=1
@@ -208,6 +213,7 @@ else
 fi
 export MKL_NUM_THREADS="${OMP_NUM_THREADS}" OPENBLAS_NUM_THREADS="${OMP_NUM_THREADS}"
 export MPLBACKEND=Agg
+export PYTHONUNBUFFERED=1    # flush prints immediately -- lets the progress log be tailed live
 
 # module load python/3.12      # or: conda activate qsim
 # source .venv/bin/activate    # (then set LAUNCHER=python)
@@ -219,6 +225,12 @@ mkdir -p "${OUTDIR}/points"
 echo "host=$(hostname) job=${SLURM_JOB_ID:-none} array=${SLURM_ARRAY_JOB_ID:-none}:${SLURM_ARRAY_TASK_ID:-none}"
 echo "mode=${MODE} outdir=${OUTDIR} grid=${GRID_PATH} chunk=${CHUNK} opts=${OPTS:-<none>}"
 echo "start=$(date -Is)"
+if [ "${MODE}" = "local" ]; then
+    echo "progress log: ${OUTDIR}/logs/local*.log   (tail -f it to watch this run)"
+else
+    echo "progress log: ${OUTDIR}/logs/point_${SLURM_ARRAY_TASK_ID:-task}*.log   " \
+         "(each array task writes its own; tail -f ${OUTDIR}/logs/*.log to watch them all)"
+fi
 
 if [ "${MODE}" = "local" ]; then
     # One node pools all points; no array needed.

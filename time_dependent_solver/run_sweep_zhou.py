@@ -118,6 +118,7 @@ from sweep_common import (_drag_skip_GHz, _nearest_collision, _stark_offset_GHz,
                           _compress_ranges)
 from sweep_spectator import build_grid, run_spectator_point
 from sweep_target import build_target_grid, _run_target_point
+from log_utils import setup_run_logger
 
 
 def run_point(pt: "Point", config: Dict[str, Any]) -> Dict[str, Any]:
@@ -585,6 +586,21 @@ def main() -> None:
             print("note: mode=local pools points; forcing stark_jobs=1 (no nested pools).")
         config["stark_jobs"] = 1
 
+    # These two modes actually run the (QuTiP) solver, so give them a durable,
+    # tailable log colocated with the sweep's own outdir -- SLURM's captured
+    # .out/.err files sit in the submit dir under SLURM's own naming, which is
+    # awkward to find/tail mid-run.
+    if args.mode in ("point", "local"):
+        job_id = os.environ.get("SLURM_JOB_ID", "")
+        if args.mode == "point":
+            tag = os.environ.get("SLURM_ARRAY_TASK_ID", "task")
+            log_name = f"point_{tag}" + (f"_{job_id}" if job_id else "")
+        else:
+            log_name = "local" + (f"_{job_id}" if job_id else "")
+        log_path = os.path.join(args.outdir, "logs", f"{log_name}.log")
+        logger = setup_run_logger(log_path, f"run_sweep_zhou:{log_path}")
+        logger.info(f"progress log: {log_path}")
+
     if args.mode == "point":
         if args.index is None:
             sys.exit("mode=point requires --index")
@@ -598,25 +614,26 @@ def main() -> None:
                 order = [int(x) for x in f.read().split()]
             lo, hi = args.index * chunk, min(args.index * chunk + chunk, len(order))
             if lo >= len(order):
-                print(f"[resume {args.index}] no entries in [{lo}, {hi}) of {len(order)}; "
-                      f"nothing to do.")
+                logger.info(f"[resume {args.index}] no entries in [{lo}, {hi}) of {len(order)}; "
+                            f"nothing to do.")
                 return
             todo = order[lo:hi]
         else:
             # array task K runs points [K*chunk, (K+1)*chunk); chunk=1 -> one point.
             lo, hi = args.index * chunk, min(args.index * chunk + chunk, len(points))
             if lo >= len(points):
-                print(f"[chunk {args.index}] no points in [{lo}, {hi}) (N={len(points)}); "
-                      f"nothing to do.")
+                logger.info(f"[chunk {args.index}] no points in [{lo}, {hi}) (N={len(points)}); "
+                            f"nothing to do.")
                 return
             todo = list(range(lo, hi))
+        logger.info(f"starting {len(todo)} point(s): {todo}")
         for i in todo:
             if not (0 <= i < len(points)):
-                print(f"[point {i}] out of range 0..{len(points)-1}; skipping.")
+                logger.info(f"[point {i}] out of range 0..{len(points)-1}; skipping.")
                 continue
             res = run_point(points[i], config)
             path = save_point(res, args.outdir)
-            print(f"[point {i}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
+            logger.info(f"[point {i}] {_log_line(res)} ({res['wall_s']:.1f}s) -> {path}")
         return
 
     if args.mode == "local":
@@ -625,13 +642,14 @@ def main() -> None:
         os.makedirs(os.path.join(args.outdir, "points"), exist_ok=True)
         ctx = mp.get_context("spawn")
         t0 = time.time()
+        logger.info(f"starting {len(points)} point(s) over {args.nproc} worker(s)")
         with ProcessPoolExecutor(max_workers=args.nproc, mp_context=ctx) as ex:
             futs = [ex.submit(run_point, pt, config) for pt in points]
             for done, fut in enumerate(as_completed(futs), start=1):
                 res = fut.result()
                 save_point(res, args.outdir)
-                print(f"[{done}/{len(points)}] idx={res['index']:>4} {_log_line(res)}")
-        print(f"Local sweep done: {len(points)} points in {time.time()-t0:.1f}s")
+                logger.info(f"[{done}/{len(points)}] idx={res['index']:>4} {_log_line(res)}")
+        logger.info(f"Local sweep done: {len(points)} points in {time.time()-t0:.1f}s")
         collect(args.outdir)
         return
 
