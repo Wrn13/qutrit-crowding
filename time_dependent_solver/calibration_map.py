@@ -32,19 +32,15 @@ CLI
 from __future__ import annotations
 
 import argparse
-import logging
 import os
-import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tqdm import tqdm
 
 import grape
-from log_utils import setup_run_logger
 
 TWO_PI = 2.0 * np.pi
 
@@ -53,8 +49,7 @@ def scan(cpl, a: int, b: int, t_g: float, *,
          wp_span_MHz: float = 40.0, wp_points: int = 41,
          amp_lo: float = 0.6, amp_hi: float = 1.4, amp_points: int = 41,
          cutoff_GHz: float = 1.0, n_ctrl: int = 32, metric: str = "fidelity",
-         carrier_resolution: float = 0.3,
-         logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+         carrier_resolution: float = 0.3) -> Dict[str, Any]:
     """Scan (pump offset, amplitude) and score each point with the REDUCED model.
 
     Parameters
@@ -77,9 +72,6 @@ def scan(cpl, a: int, b: int, t_g: float, *,
         Piecewise-constant slices approximating the raised cosine.
     metric : {'fidelity', 'transfer'}
         Score per point: leakage-aware iSWAP fidelity, or P(|01>->|10>).
-    logger : logging.Logger, optional
-        If given, one line per completed row is logged (in addition to the
-        interactive ``tqdm`` bar, which isn't a good fit for a plain log file).
 
     Returns
     -------
@@ -102,7 +94,7 @@ def scan(cpl, a: int, b: int, t_g: float, *,
     Z = np.full((amp_points, wp_points), np.nan)
 
     # |01> is column 1 of the propagator basis (|00>,|01>,|10>,|11>); |10> is row 2
-    for i, amp in enumerate(tqdm(amps, desc="calibration scan (reduced)", unit="row")):
+    for i, amp in enumerate(amps):
         eta_ctrl = (amp * base).astype(complex)
         for j, off_MHz in enumerate(offsets):
             U = grape._propagate(eta_ctrl, t_g, terms, H_anh, idx, n_sub,
@@ -112,8 +104,6 @@ def scan(cpl, a: int, b: int, t_g: float, *,
             else:
                 F, _ = ZhouCoupler._iswap_fidelity_from_U(U, True)
                 Z[i, j] = F
-        if logger:
-            logger.info(f"row {i + 1}/{len(amps)} amp_scale={amp:.3f}")
 
     bi, bj = np.unravel_index(np.nanargmax(Z), Z.shape)
     best = dict(amp_scale=float(amps[bi]), wp_offset_MHz=float(offsets[bj]),
@@ -126,8 +116,7 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
                t_g: float, *, wp_span_MHz: float = 40.0, wp_points: int = 41,
                amp_lo: float = 0.6, amp_hi: float = 1.4, amp_points: int = 41,
                metric: str = "transfer", atol: float = 1e-10, rtol: float = 1e-8,
-               nsteps: int = 500000, jobs: int = 1,
-               logger: Optional[logging.Logger] = None) -> Dict[str, Any]:
+               nsteps: int = 500000, jobs: int = 1) -> Dict[str, Any]:
     """QuTiP-exact analogue of ``scan``: identical grid and return shape, but every
     point is a compiled ``qt.sesolve`` on the FULL Hamiltonian via
     ``ZhouCoupler.propagator_columns`` -- no reduced model, no pruned terms.
@@ -152,28 +141,17 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
         return i, j, float(score), float(leak)
 
     grid = [(i, j, a, o) for i, a in enumerate(amps) for j, o in enumerate(offsets)]
-    t0 = time.time()
     if jobs and jobs > 1:
         from joblib import Parallel, delayed
-        # return_as="generator_unordered" streams results back as they finish, so
-        # progress can be logged as it happens instead of only after the whole
-        # grid returns (joblib's own verbose=5 prints straight to stdout and
-        # can't be redirected into `logger`'s file).
-        results = Parallel(n_jobs=jobs, return_as="generator_unordered")(
+        out = Parallel(n_jobs=jobs, verbose=5)(
             delayed(one)(i, j, a, o) for (i, j, a, o) in grid)
-        out = []
-        for k, r in enumerate(results, start=1):
-            out.append(r)
-            if logger and (k % wp_points == 0 or k == len(grid)):
-                logger.info(f"  {k}/{len(grid)} points done "
-                            f"({100 * k / len(grid):.0f}%), elapsed={time.time() - t0:.0f}s")
     else:
         out = []
         for k, (i, j, a, o) in enumerate(grid):
             out.append(one(i, j, a, o))
             if (k + 1) % wp_points == 0:
-                msg = f"  row {k // wp_points + 1}/{amp_points} (amp_scale={a:.3f})"
-                (logger.info if logger else print)(msg)
+                print(f"  row {k // wp_points + 1}/{amp_points} "
+                      f"(amp_scale={a:.3f})")
 
     Z = np.full((amp_points, wp_points), np.nan)
     L = np.full((amp_points, wp_points), np.nan)
@@ -189,30 +167,59 @@ def scan_qutip(build_fn: Callable[[float, float], Tuple[Any, float, float]],
 
 def plot_map(result: Dict[str, Any], out: str = "figs/calibration_map.png",
              title: Optional[str] = None) -> None:
-    """Render the 2D calibration landscape with the optimum marked."""
+    r"""Render the 2D calibration landscape with the optimum marked.
+
+    The y axis is the PHYSICAL drive, peak :math:`|\eta|`, with ``amp_scale`` on a
+    twin axis on the right. The two differ only by the constant
+    :math:`\eta_{\rm nom} = 1/(12 g_3 \lambda_a \lambda_b t_g)`, but they answer
+    different questions: :math:`|\eta|` says which drive REGIME the point is in (how
+    large the eta^2 / eta^3 terms are), and is therefore comparable between maps at
+    different ``t_g``, whereas ``amp_scale`` is what ``--save-point`` writes into the
+    device and is only meaningful at one ``t_g``. The dotted line marks
+    ``amp_scale = 1``, i.e. the amplitude at which the LEADING-ORDER pulse area is
+    exactly pi/2 -- so the distance of the optimum from that line is a direct read
+    on how far first-order theory is off at this operating point.
+    """
     offsets, amps, Z = result["offsets_MHz"], result["amps"], result["Z"]
     metric = result["metric"]
     best = result["best"]
-    zlabel = "iSWAP fidelity $F$" if metric == "fidelity" else r"transfer $P(|01\rangle\!\to\!|10\rangle)$"
+    eta_nom = float(result["peak_eta"])              # peak |eta| at amp_scale = 1
+    eta_axis = amps * eta_nom
+    eta_best = best["amp_scale"] * eta_nom
+    zlabel = ("iSWAP fidelity $F$" if metric == "fidelity"
+              else r"transfer $P(|01\rangle\!\to\!|10\rangle)$")
 
-    fig, ax = plt.subplots(figsize=(7.0, 5.2), dpi=200)
-    pcm = ax.pcolormesh(offsets, amps, Z, shading="nearest", cmap="viridis")
-    cb = fig.colorbar(pcm, ax=ax)
+    fig, ax = plt.subplots(figsize=(7.6, 5.3), dpi=200)
+    pcm = ax.pcolormesh(offsets, eta_axis, Z, shading="nearest", cmap="viridis")
+    cb = fig.colorbar(pcm, ax=ax, pad=0.12)
     cb.set_label(zlabel)
+    # the pi/2 (leading-order) amplitude
+    if eta_axis.min() <= eta_nom <= eta_axis.max():
+        ax.axhline(eta_nom, color="w", ls=":", lw=1.1, alpha=0.85)
+        ax.text(offsets[0], eta_nom, r"  $\pi/2$ normalisation (amp scale 1)",
+                color="w", va="bottom", ha="left", fontsize=7.5, alpha=0.9)
     # optimum
-    ax.plot(best["wp_offset_MHz"], best["amp_scale"], marker="*", ms=18,
+    ax.plot(best["wp_offset_MHz"], eta_best, marker="*", ms=18,
             mfc="#C0392B", mec="white", mew=1.2, zorder=5)
-    ax.annotate(f"opt: {best['wp_offset_MHz']:+.1f} MHz, "
-                f"amp {best['amp_scale']:.3f}\n{zlabel.split('$')[0].strip()} "
-                f"= {best['score']:.4f}",
-                xy=(best["wp_offset_MHz"], best["amp_scale"]),
+    lead = zlabel.split("$")[0].strip() or metric
+    ax.annotate(f"opt: {best['wp_offset_MHz']:+.1f} MHz\n"
+                f"$|\\eta|$ = {eta_best:.3f}  (amp scale {best['amp_scale']:.3f})\n"
+                f"{lead} = {best['score']:.4f}",
+                xy=(best["wp_offset_MHz"], eta_best),
                 xytext=(0.98, 0.02), textcoords="axes fraction",
-                ha="right", va="bottom", fontsize=9, color="white",
-                bbox=dict(boxstyle="round", fc="#00000088", ec="none"))
+                ha="right", va="bottom", fontsize=8.5, color="white",
+                bbox=dict(boxstyle="round", fc="#00000099", ec="none"))
     ax.set_xlabel(r"pump frequency offset  $\delta\omega_p$  (MHz)")
-    ax.set_ylabel(r"pump strength  (amp scale, $\times\,\eta_{\rm nom}$)")
+    ax.set_ylabel(r"pump strength   peak $|\eta|$")
+    # twin axis: the amp_scale that gets written to the device
+    sec = ax.secondary_yaxis("right",
+                             functions=(lambda e: e / eta_nom, lambda a: a * eta_nom))
+    sec.set_ylabel(r"amp scale  ($\times\,\eta_{\rm nom}$, written to the device)")
     eng = result.get("engine", "reduced")
-    ax.set_title(title or f"iSWAP calibration landscape  ({metric}, {eng})")
+    t_g = result.get("t_g_ns")
+    sub = f"({metric}, {eng}" + (f", $t_g$={t_g:.1f} ns, "
+                                 f"$\\eta_{{\\rm nom}}$={eta_nom:.3f})" if t_g else ")")
+    ax.set_title(title or f"iSWAP calibration landscape  {sub}", fontsize=10.5)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     fig.savefig(out, bbox_inches="tight", facecolor="white")
@@ -226,12 +233,17 @@ def save_npz(result: Dict[str, Any], path: str) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload: Dict[str, Any] = dict(
         offsets_MHz=result["offsets_MHz"], amps=result["amps"], Z=result["Z"],
+        peak_eta_axis=result["amps"] * float(result["peak_eta"]),
         metric=str(result["metric"]), peak_eta=float(result["peak_eta"]),
         engine=str(result.get("engine", "reduced")))
     if "leakage" in result:
         payload["leakage"] = result["leakage"]
     if "w_p_GHz" in result:
         payload["w_p_GHz"] = float(result["w_p_GHz"])
+    if "t_g_ns" in result:
+        payload["t_g_ns"] = float(result["t_g_ns"])
+        payload["best_peak_eta"] = float(result["best"]["amp_scale"]
+                                         * result["peak_eta"])
     for k, v in result["best"].items():
         payload[f"best_{k}"] = v
     for group in ("operating_point", "context"):
@@ -314,7 +326,6 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         atol: float = 1e-10, rtol: float = 1e-8, nsteps: int = 500000,
         jobs: int = 1, save_npz_path: Optional[str] = None,
         out: Optional[str] = "figs/calibration_map.png", title: Optional[str] = None,
-        log_path: Optional[str] = None,
         **kw) -> Dict[str, Any]:
     """Build the system for the given sweep context, scan (reduced or QuTiP), plot,
     optionally persist, and return results.
@@ -323,21 +334,9 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
     ``operating_point`` (a record ready for ``operating_points.save_point``).
     ``engine='qutip'`` runs the exact solver; both engines share the grid, the
     ``best``/``operating_point`` bookkeeping, and the plot.
-
-    Progress is logged (timestamped, to both stdout and ``log_path``) so a
-    long ``engine='qutip'`` run can be tailed while it's still going. Default
-    ``log_path`` sits next to ``out``/``save_npz_path`` (same basename, ``.log``).
     """
     if coupler_levels is not None:                     # truncation override, reused
         config = {**config, "coupler_levels": int(coupler_levels)}
-
-    log_path = log_path or os.path.splitext(
-        out or save_npz_path or "figs/calibration_map.png")[0] + ".log"
-    logger = setup_run_logger(log_path, f"calibration_map:{log_path}")
-    logger.info(f"start: engine={engine} metric={kw.get('metric', 'fidelity')} "
-                f"t_g={t_g}ns grid={kw.get('wp_points', 41)}x{kw.get('amp_points', 41)} "
-                f"jobs={jobs}")
-    t0 = time.time()
 
     cpl, w_p, eta_pk, context = build_system(
         config, t_g, wa_GHz=wa_GHz, wb_GHz=wb_GHz, delta_GHz=delta_GHz,
@@ -355,21 +354,19 @@ def run(config: Dict[str, Any], t_g: float, *, amp_scale: float = 1.0,
         qkeys = ("wp_span_MHz", "wp_points", "amp_lo", "amp_hi", "amp_points", "metric")
         qkw = {k: v for k, v in kw.items() if k in qkeys}
         result = scan_qutip(build_fn, t_g, atol=atol, rtol=rtol, nsteps=nsteps,
-                            jobs=jobs, logger=logger, **qkw)
+                            jobs=jobs, **qkw)
     else:
-        result = scan(cpl, 0, 1, t_g, logger=logger, **kw)
+        result = scan(cpl, 0, 1, t_g, **kw)
 
     result["w_p_GHz"] = w_p
+    result["t_g_ns"] = t_g
     result["context"] = context
-    result["log_path"] = log_path
     best = result["best"]
     # the scan grid is relative to the nominal (amp_scale, wp_offset) it was built on
     result["operating_point"] = dict(
         amp_scale=amp_scale * best["amp_scale"],
         wp_offset_GHz=wp_offset_GHz + best["wp_offset_MHz"] * 1e-3,
         metric=result["metric"], score=best["score"], **context)
-    logger.info(f"done in {time.time() - t0:.0f}s: wp_offset={best['wp_offset_MHz']:+.2f}MHz "
-                f"amp_scale={best['amp_scale']:.4f} score={best['score']:.5f}")
     if out:
         plot_map(result, out=out, title=title)
     if save_npz_path:
@@ -418,9 +415,6 @@ def main() -> None:
     ap.add_argument("--metric", choices=["fidelity", "transfer"], default="fidelity",
                     help="'transfer' colours by the swap population P(|01>->|10>)")
     ap.add_argument("--out", default="figs/calibration_map.png")
-    ap.add_argument("--log", default=None,
-                    help="progress log file (default: alongside --out/--save-npz, "
-                         "same basename with a .log extension)")
     args = ap.parse_args()
 
     from paths import resolve_device
@@ -434,9 +428,7 @@ def main() -> None:
                  nsteps=args.nsteps, jobs=args.jobs, save_npz_path=args.save_npz,
                  wp_span_MHz=args.wp_span_MHz, wp_points=args.wp_points,
                  amp_lo=args.amp_lo, amp_hi=args.amp_hi, amp_points=args.amp_points,
-                 cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out,
-                 log_path=args.log)
-    print(f"log: {result['log_path']}")
+                 cutoff_GHz=args.cutoff_GHz, metric=args.metric, out=args.out)
     b, ctx = result["best"], result["context"]
     print(f"context: w_a={ctx['wa_GHz']} w_b={ctx['wb_GHz']} t_g={ctx['t_g_ns']} ns "
           f"spec={ctx['spec_abs_GHz']} drag_beat={ctx['drag_beat_GHz']} engine={args.engine}")
