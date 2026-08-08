@@ -138,3 +138,6 @@ dmypy.json
 # Data files and results
 *results*/
 *.npz
+
+# Generated figures (run outputs, not source)
+time_dependent_solver/figs/

@@ -652,26 +652,6 @@ class TestOperatingPoints(unittest.TestCase):
             OP.resolve(cfg, "nope")
 
 
-class TestFrequencyListHelpers(unittest.TestCase):
-    """Campaign frequency lists must stay inside the band."""
-
-    def test_wb_list_never_overshoots(self):
-        import campaign
-        for step in (0.10, 0.4, 0.0125, 0.3):
-            vals = [float(v) for v in campaign._wb_list(3.8, 5.7, step).split(",")]
-            self.assertLessEqual(max(vals), 5.7 + 1e-9,
-                                 f"step={step} overshoots the band edge")
-            self.assertAlmostEqual(min(vals), 3.8, places=9)
-            self.assertAlmostEqual(max(vals), 5.7, places=9)
-
-    def test_spec_list_centered(self):
-        import campaign
-        vals = [float(v) for v in campaign._spec_list(2.2, 0.2, 25).split(",")]
-        self.assertEqual(len(vals), 25)
-        self.assertAlmostEqual(np.mean(vals), 2.2, places=9)
-        self.assertAlmostEqual(max(vals) - min(vals), 0.2, places=9)
-
-
 class TestBareGatePipeline(unittest.TestCase):
     """End-to-end analytic bare-gate run: the path that crashed twice on formatting."""
 

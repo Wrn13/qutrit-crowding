@@ -1,3 +1,0 @@
-evan_device.json
-evan_device_calibrated.json
-

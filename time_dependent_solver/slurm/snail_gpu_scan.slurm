@@ -16,7 +16,7 @@
 # #SBATCH --account=YOUR_ALLOC
 #
 # =============================================================================
-# Batched calibration / chirp scan on a GPU  (jax_engine.py via calibration_map.py)
+# Batched calibration scan on a GPU  (jax_engine.py via calibration_map.py)
 # =============================================================================
 # The whole (amp x pump-offset) grid runs as ONE vmapped program: the device is
 # fixed, so every grid point shares one sparse operator stack and varies only the
@@ -47,9 +47,6 @@
 #   # calibration map on GPU
 #   DEVICE=2Gate4.9SNAIL.json T_G=77.2 sbatch slurm/snail_gpu_scan.slurm
 #
-#   # same, but scanning a linear chirp instead of a constant offset
-#   DEVICE=2Gate4.9SNAIL.json T_G=77.2 CHIRP=0,0.05 sbatch slurm/snail_gpu_scan.slurm
-#
 #   # exact (no pruning) -- much slower, use to spot-check the cutoff choice
 #   DEVICE=2Gate4.9SNAIL.json T_G=77.2 ENGINE_CUTOFF=inf CARRIER_RES=0.05 \
 #       sbatch slurm/snail_gpu_scan.slurm
@@ -70,7 +67,6 @@
 #                   is saturated or memory complains                  [64]
 #   PRECISION       f64 | f32   (f32 is MIXED: f64 phases, c64 state)  [f64]
 #   WP_SPAN_MHZ / WP_POINTS / AMP_LO / AMP_HI / AMP_POINTS  grid
-#   CHIRP           comma list of Legendre chirp coefficients (GHz)   [none]
 #   SPEC_ABS        absolute spectator frequency                      [none]
 #   METRIC          fidelity | transfer                          [fidelity]
 #   LAUNCHER / CODE_DIR   as in snail_sweep.slurm
@@ -101,7 +97,6 @@ METRIC="${METRIC:-fidelity}"
 
 OPTS=""
 [ -n "${SPEC_ABS:-}" ] && OPTS="${OPTS} --spec-abs-GHz ${SPEC_ABS}"
-[ -n "${CHIRP:-}" ]    && OPTS="${OPTS} --chirp-GHz ${CHIRP}"
 
 cd "${CODE_DIR:-${SLURM_SUBMIT_DIR:-.}}"
 
