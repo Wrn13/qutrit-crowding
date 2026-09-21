@@ -1,3 +1,5 @@
+import warnings
+
 import matplotlib.pyplot as plt
 import numpy as np
 from qutip import average_gate_fidelity, destroy, qeye, tensor
@@ -90,22 +92,73 @@ def decay_fit(detuning, x0, x1):
     return x0 * ((2 / (detuning + x1)) ** 2)
 
 
-def fit_infidelity(detuning_list, infidelity_list):
-    """Fits the infidelity data to the modified power-law model with better convergence."""
+def fit_infidelity(detuning_list, infidelity_list, label=None):
+    """Fits the infidelity data to the modified power-law model with better convergence.
+
+    Warns if `decay_fit` cannot actually describe the data. The monotonic power law only
+    fits a perturbative spectator (g_s/Delta << 1); a strongly driven one saturates and
+    turns over in detuning, and curve_fit will still return *something*, so the residual
+    has to be checked rather than trusted.
+    """
     p0 = [1, 1]  # Improved initial guess
-    params, _ = curve_fit(decay_fit, detuning_list, infidelity_list, p0=p0)
+    # maxfev raised from the default 600: the stiffer spectators (e.g. a direct drive
+    # on the multi-level SNAIL mode) need more iterations to converge.
+    params, _ = curve_fit(
+        decay_fit, detuning_list, infidelity_list, p0=p0, maxfev=20000
+    )
+    fitted = decay_fit(np.asarray(detuning_list), *params)
+    residual = np.max(np.abs(fitted - infidelity_list))
+    scale = np.max(np.abs(infidelity_list))
+    if scale > 0 and residual / scale > 0.05:
+        warnings.warn(
+            f"decay_fit is a poor model for {label or 'this spectator'}: max residual "
+            f"{residual:.3e} is {residual / scale:.0%} of the peak infidelity "
+            f"{scale:.3e}. The spectator is likely non-perturbative (simulated "
+            f"infidelity saturating or non-monotonic in detuning), so these fit "
+            f"parameters should not be trusted.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     # print(params)
     return params
 
 
 # %%
-def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
-    """Generates (a, b, c) infidelity parameters dynamically from QuTiP simulations."""
+def compute_infidelity_parameters(
+    detuning_list, lambdaq, eta, alpha, g3, snail_sub_participation=None
+):
+    """Generates (a, b, c) infidelity parameters dynamically from QuTiP simulations.
+
+    Parameters
+    ----------
+    snail_sub_participation : float, optional
+        Mode participation for the "snail-sub" spectator -- a second-order
+        (two-pump-photon) direct drive on the SNAIL mode at f_SNAIL/2. Defaults to
+        `lambdaq`, which keeps the term perturbative and fittable by `decay_fit`.
+
+        Counting participations the way the other prefactors do (one factor of
+        `lambdaq` per *qubit* mode in the operator, 1 for the SNAIL mode) argues for
+        1.0 here. That is deliberately not the default: at 1.0 the prefactor is
+        3*eta**2*g3 ~ 583 MHz, so g_s/Delta ranges 0.6-3.7 over a 50-1000 MHz
+        detuning sweep. The dynamics are then far outside the perturbative regime
+        `simulate_infidelity` assumes -- the simulated infidelity runs 0.21-0.97 and is
+        *non-monotonic* in detuning, which the monotonic `decay_fit` power law cannot
+        represent (best-case residual ~0.26). Physically that says the SNAIL
+        subharmonic is not a perturbative spectator at all but a hard exclusion zone,
+        which is why `speedlimit_fit.py` handles it as a pump-power ceiling instead.
+        Pass 1.0 only if you also replace the fitting ansatz.
+    """
+    if snail_sub_participation is None:
+        snail_sub_participation = lambdaq
+
     # Compute prefactors
     intra_prefactors = {
         "snail-qubit": 6 * eta * lambdaq * g3,
         "qubit-sub": 3 * eta**2 * lambdaq * g3,
         "qubit-qubit": 6 * eta * lambdaq**2 * g3,
+        # SNAIL subharmonic: same second-order direct-drive structure as "qubit-sub",
+        # but the driven mode is the multi-level SNAIL rather than a qubit.
+        "snail-sub": 3 * eta**2 * snail_sub_participation * g3,
     }
 
     inter_prefactors = {
@@ -155,6 +208,9 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
     spectator_ops_snail = {
         "snail-qubit": (qs1dag * s1 + qs1 * s1dag, ideal_gate_snail),
         "snail-qubit (inter)": (qs1dag * s1 + qs1 * s1dag, ideal_gate_snail),
+        # Direct drive on the 8-level SNAIL mode: pumping at f_SNAIL/2 populates the
+        # SNAIL's higher levels, which is the leakage this term is meant to capture.
+        "snail-sub": (s1dag + s1, ideal_gate_snail),
     }
 
     # Compute infidelity curves and fit (a, b, c)
@@ -171,7 +227,9 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
             prefactors[key],
             spectator_term,
         )
-        infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
+        infidelity_params[key] = fit_infidelity(
+            detuning_list, fidelity_results[key], label=key
+        )
 
     # Compute for SNAIL-based spectators
     for key in spectator_ops_snail:
@@ -183,7 +241,9 @@ def compute_infidelity_parameters(detuning_list, lambdaq, eta, alpha, g3):
             prefactors[key],
             spectator_term,
         )
-        infidelity_params[key] = fit_infidelity(detuning_list, fidelity_results[key])
+        infidelity_params[key] = fit_infidelity(
+            detuning_list, fidelity_results[key], label=key
+        )
 
     return infidelity_params, fidelity_results
 

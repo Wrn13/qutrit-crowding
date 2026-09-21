@@ -31,6 +31,7 @@ class GateFidelityOptimizer:
         snail_bounds=(4.2, 4.7),
         drop_k=0,  # 0 for best, 1 to drop worst, 2 to drop 2 worst, etc
         use_lifetime=False,
+        snail_sub_participation=None,  # see compute_infidelity_parameters
     ):
         self.lambdaq = lambdaq
         self.eta = eta
@@ -46,7 +47,12 @@ class GateFidelityOptimizer:
 
         detuning_list = np.linspace(50, 1000, 64)
         self.infidelity_params, _ = compute_infidelity_parameters(
-            detuning_list, lambdaq=lambdaq, eta=eta, alpha=120e6, g3=g3
+            detuning_list,
+            lambdaq=lambdaq,
+            eta=eta,
+            alpha=120e6,
+            g3=g3,
+            snail_sub_participation=snail_sub_participation,
         )
         ###
         self.use_lifetime = use_lifetime
@@ -90,7 +96,12 @@ class GateFidelityOptimizer:
         driven_freq = interaction_data["qubit-qubit"][edge]
         gate_infidelity = sum(
             self._unit_crosstalk(driven_freq, interaction_type, spectator_freq)
-            for interaction_type in ["qubit-qubit", "snail-qubit", "qubit-sub"]
+            for interaction_type in [
+                "qubit-qubit",
+                "snail-qubit",
+                "qubit-sub",
+                "snail-sub",
+            ]
             for spectator_edge, spectator_freq in interaction_data[
                 interaction_type
             ].items()
@@ -99,6 +110,9 @@ class GateFidelityOptimizer:
         # to combine coherent and incoherent fidelities, multiply (ESP)
         # however our variables are infidelities, so take 1-term
         # multiply (1-infidelity)(1-lifetime loss)
+        # NOTE: "snail-sub" is now a coherent spectator above. _unit_decay models the
+        # same subharmonic as a pump-power speed limit, so use_lifetime=True counts it
+        # twice; use_lifetime=False for a purely coherent treatment.
         spectator_freq = interaction_data["snail-sub"]["SNAIL"]
         gate_infidelity_with_lifetime = 1 - (1 - gate_infidelity) * (
             1 - self._unit_decay(driven_freq, spectator_freq)
